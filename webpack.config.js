@@ -17,10 +17,12 @@ module.exports = {
             }
         ]
     },
-    plugins: [new HtmlWebpackPlugin()],
+    plugins: [new HtmlWebpackPlugin({
+        template: 'src/index.html'
+    })],
     devServer: {
         static: {
-            directory: path.join(__dirname, 'public'),
+            directory: path.join(__dirname, 'src'),
         },
         compress: true,
         port: 8000,

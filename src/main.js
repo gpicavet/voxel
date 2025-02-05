@@ -37,8 +37,6 @@ function init() {
     ///////////////////////////
 
     var vsSource = vshader.trim();
-    var fsSource = fshader.trim();
-
     var vertexShader = gl.createShader(gl.VERTEX_SHADER);
     gl.shaderSource(vertexShader, vsSource);
     gl.compileShader(vertexShader);
@@ -47,6 +45,7 @@ function init() {
         console.error(gl.getShaderInfoLog(vertexShader));
     }
 
+    var fsSource = fshader.trim();
     var fragment = gl.createShader(gl.FRAGMENT_SHADER);
     gl.shaderSource(fragment, fsSource);
     gl.compileShader(fragment);
@@ -66,10 +65,7 @@ function init() {
 
     gl.useProgram(program);
 
-    var projMatrix = mat4.create();
-    mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, 0.1, 1000.0);
 
-    var lightDirLocation = gl.getUniformLocation(program, "lightDir");
 
     const noise3D = createNoise3D(alea('0'));
 
@@ -127,10 +123,11 @@ function init() {
 
     console.log(terrainData.length);
 
+    var projMatrix = mat4.create();
+    mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, 0.1, 1000.0);
 
-    gl.enable(gl.DEPTH_TEST);
-    gl.enable(gl.CULL_FACE);
-    gl.cullFace(gl.BACK);
+    var lightDirLocation = gl.getUniformLocation(program, "lightDir");
+
 
 
     var viewMatrix = mat4.create();
@@ -142,6 +139,13 @@ function init() {
     const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
 
     var timer = Date.now();
+
+
+    gl.enable(gl.DEPTH_TEST);
+    gl.enable(gl.CULL_FACE);
+    gl.cullFace(gl.BACK);
+
+    //document.getElementById("loading").display = 'none';
 
     function draw() {
 

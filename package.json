@@ -9,6 +9,8 @@
     "webpack-dev-server": "^5.2.0"
   },
   "scripts": {
+    "dev": "npx webpack serve --mode=development",
+    "dist": "webpack --mode=production",
     "test": "make tests"
   },
   "devDependencies": {
