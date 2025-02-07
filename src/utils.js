@@ -1,46 +1,28 @@
 /**
- * return intersection of a ray with a axis aligned box [[minx,miny,minz],[maxx,maxy,maxz]]
- * @param {*} out 
+ * return distance to intersection of a ray with a axis aligned box [[minx,miny,minz],[maxx,maxy,maxz]]
  * @param {*} ro 
  * @param {*} rd 
  * @param {*} aabb 
  */
-export function intersection(out, ro, rd, aabb) {
-    var d = distance(ro, rd, aabb)
-    if (d === Infinity) {
-        out = null
-    } else {
-        out = out || []
-        for (var i = 0; i < ro.length; i++) {
-            out[i] = ro[i] + rd[i] * d
+export function aabbRayIntersection(ro, rd, aabb) {
+    var tmin = -Infinity, tmax = Infinity;
+
+    for (var i = 0; i < 3; ++i) {
+        if (rd[i] >= 1e-6 || rd[i] <= -1e-6) {
+            var t1 = (aabb[0][i] - ro[i]) / rd[i];
+            var t2 = (aabb[1][i] - ro[i]) / rd[i];
+
+            tmin = Math.max(tmin, Math.min(t1, t2));
+            tmax = Math.min(tmax, Math.max(t1, t2));
+        } else {
+            if (ro[i] < aabb[0][i] || ro[i] > aabb[1][i])
+                return Infinity;
         }
     }
 
-    return { dist: d, point: out }
-}
+    if (tmax < tmin || tmax < 0)
+        return Infinity;
 
-function distance(ro, rd, aabb) {
-    var dims = ro.length
-    var lo = -Infinity
-    var hi = +Infinity
+    return tmin > 0 ? tmin : Infinity;
 
-    for (var i = 0; i < dims; i++) {
-        var dimLo = (aabb[0][i] - ro[i]) / rd[i]
-        var dimHi = (aabb[1][i] - ro[i]) / rd[i]
-
-        if (dimLo > dimHi) {
-            var tmp = dimLo
-            dimLo = dimHi
-            dimHi = tmp
-        }
-
-        if (dimHi < lo || dimLo > hi) {
-            return Infinity
-        }
-
-        if (dimLo > lo) lo = dimLo
-        if (dimHi < hi) hi = dimHi
-    }
-
-    return lo > hi ? Infinity : lo
 }

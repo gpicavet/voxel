@@ -18,7 +18,7 @@ float castShadowRay(vec3 startPos, vec3 lightDir) {
 
     // On avance pas à pas dans la direction de la lumière
     for(int i = 0; i < maxSteps; i++) {
-        pos -= lightDir * 0.99f; // Petit pas
+        pos -= lightDir * 0.75f; // Petit pas
         // normalise la coord tex entre 0 et 1
         vec3 stu = pos + terrainOffset;
         stu = vec3(stu.x / terrainDim.x, stu.y / terrainDim.y, stu.z / terrainDim.z);
@@ -35,6 +35,10 @@ void main() {
     float shadow = castShadowRay(vPosition, lightDir);
 
     vec3 color = vColor * 0.2f + vColor * 0.8f * shadow;
+
+    //fog
+    float a = gl_FragCoord.z / gl_FragCoord.w * 0.001f;
+    color = color * (1.0f - a) + vec3(0.7f, 0.9f, 1) * a;
 
     fragColor = vec4(color, 1);
 }
