@@ -1,5 +1,7 @@
 #version 300 es
 precision highp float;
+precision highp int;
+precision highp sampler3D;
 
 uniform mat4 invViewProj;
 uniform vec3 camPosition;
@@ -13,6 +15,9 @@ in vec2 vNdc;
 out vec4 fragColor;
 
 @import ./common;
+@import ./clouds;
+@import ./cloud_shading;
+@import ./atmosphere;
 
 float hash(vec3 p) {
     p = fract(p * vec3(443.897, 441.423, 437.195));
@@ -41,5 +46,11 @@ void main() {
         sky += moonDiskColor * smoothstep(0.99990, 0.99994, dot(dir, moonDir));
         sky += stars(dir) * starVisibility;
     }
+    // voxel clouds (opaque, melting into the sky far away), then the light shafts in front of them
+    vec3 cloudNormal;
+    ivec3 cloudCellHit;
+    float t = traceClouds(camPosition, dir, 1e5, cloudNormal, cloudCellHit);
+    if(t >= 0.0) sky = mix(sky, shadeCloud(dir, cloudNormal, cloudCellHit), exp(-t / CLOUD_FADE));
+    sky += lightShaftsAt();
     fragColor = vec4(toneMap(sky), 1.0);
 }

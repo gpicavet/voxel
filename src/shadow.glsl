@@ -56,3 +56,24 @@ float castShadowRay(vec3 startPos, vec3 rd) {
 
     return 1.0;
 }
+
+// Cheaper visibility of the light from a point in the air, for the light shafts: only the 8^3 coarse occupancy
+// (an occupied block counts as solid), and a bounded number of steps. 1 = lit.
+float coarseVisibility(vec3 startPos, vec3 rd, int maxSteps) {
+    rd = mix(rd, vec3(1e-6), lessThan(abs(rd), vec3(1e-6)));
+    vec3 invRd = 1.0 / rd;
+    vec3 towards = step(0.0, rd);
+    vec3 ro = startPos - windowMin;
+    ivec3 coarseMask = textureSize(coarseTex, 0) - 1;
+    float t = 0.0;
+    for(int i = 0; i < maxSteps; i++) {
+        vec3 pos = ro + rd * t;
+        if(pos.z < 0.0) return 0.0;
+        if(any(lessThan(pos.xy, vec2(0.0))) || any(greaterThanEqual(pos, windowSize))) return 1.0;
+        ivec3 block = ivec3(pos) >> COARSE_POW;
+        if(texelFetch(coarseTex, (block + coarseOrigin) & coarseMask, 0).r != 0u) return 0.0;
+        vec3 tExit = (vec3(block << COARSE_POW) + towards * float(1 << COARSE_POW) - ro) * invRd;
+        t = min(min(tExit.x, tExit.y), tExit.z) + 1e-3;
+    }
+    return 1.0;
+}

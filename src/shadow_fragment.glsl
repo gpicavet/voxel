@@ -3,9 +3,11 @@ precision highp float;
 precision highp int;
 precision lowp usampler3D;
 precision highp sampler2D;
+precision highp sampler3D;
 
 // One shadow ray per half resolution pixel, written to the shadow mask read by the color pass:
-// r = lit (1) or in the shadow (0), g = face direction + 1 (0 = sky), b = face plane coordinate modulo 256.
+// r = lit (1) or in the shadow (0), g = face direction + 1 (0 = sky), b = face plane coordinate modulo 256,
+// a = light let through by the clouds (computed every frame: the clouds move).
 uniform sampler2D halfDepth;
 uniform sampler2D halfFace;
 uniform mat4 invViewProj;
@@ -19,6 +21,7 @@ uniform bool refreshAll;       // no usable history (first frame, resize, fast s
 out vec4 fragMask;
 
 @import ./shadow;
+@import ./clouds;
 
 // The shadow of a surface point does not depend on the camera, and the sun moves slowly: the previous mask is
 // reused where it shows the same face plane, all lit or all in the shadow (shadow edges are traced every frame,
@@ -81,8 +84,9 @@ void main() {
 
     float plane = mod(pos[axis], 256.0);
 
-    float lit = 0.0;
+    float lit = 0.0, cloud = 1.0;
     if(dot(normal, sunDir) > 0.0) {
+        cloud = cloudShadow(pos, sunDir);
         bool found = false;
         bool refresh = refreshAll || ((p.x >> 3) + (p.y >> 3) * 3 + frameIndex) % REFRESH_PERIOD == 0;
         if(!refresh) {
@@ -92,5 +96,5 @@ void main() {
             lit = castShadowRay(pos + normal * 0.01, sunDir);
         }
     }
-    fragMask = vec4(lit, float(face + 1) / 255.0, plane / 255.0, 1.0);
+    fragMask = vec4(lit, float(face + 1) / 255.0, plane / 255.0, cloud);
 }

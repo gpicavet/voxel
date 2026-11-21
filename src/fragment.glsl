@@ -3,6 +3,7 @@ precision highp float;
 precision highp int;
 precision lowp usampler3D;
 precision highp sampler2D;
+precision highp sampler3D;
 
 uniform vec3 camPosition;
 uniform bool halfResShadows;
@@ -22,6 +23,9 @@ out vec4 fragColor;
 
 @import ./shadow;
 @import ./common;
+@import ./clouds;
+@import ./cloud_shading;
+@import ./atmosphere;
 
 // start of the shadow ray: on the face plane (an integer coordinate: removes the interpolation error, which grows
 // far from the origin), just in front of the face
@@ -40,24 +44,26 @@ float linearDepth(float z) {
 
 // Shadow of this pixel from the half resolution mask: bilinear blend of the 4 nearest mask texels,
 // keeping only the ones on the same face plane, so shadows never leak across voxel edges.
-float maskShadow(vec3 toLight) {
+// x: terrain shadow, y: cloud shadow
+vec2 maskShadow(vec3 toLight) {
     vec2 h = gl_FragCoord.xy * maskScale - 0.5;
     vec2 f = fract(h);
     ivec2 base = ivec2(floor(h));
     ivec2 maxTexel = textureSize(shadowMask, 0) - 1;
     float plane = mod(floor(vPosition[vFace >> 1] + 0.5), 256.0);
 
-    float sum = 0.0, weightSum = 0.0, farthest = 0.0, anySum = 0.0, anyWeight = 0.0;
+    vec2 sum = vec2(0.0), anySum = vec2(0.0);
+    float weightSum = 0.0, farthest = 0.0, anyWeight = 0.0;
     for(int j = 0; j <= 1; j++) {
         for(int i = 0; i <= 1; i++) {
             ivec2 texel = clamp(base + ivec2(i, j), ivec2(0), maxTexel);
             vec4 m = texelFetch(shadowMask, texel, 0);
             farthest = max(farthest, texelFetch(halfDepth, texel, 0).r);
             float w = max(mix(1.0 - f.x, f.x, float(i)) * mix(1.0 - f.y, f.y, float(j)), 1e-3);
-            anySum += m.r * w;
+            anySum += m.ra * w;
             anyWeight += w;
             if(int(m.g * 255.0 + 0.5) - 1 == vFace && floor(m.b * 255.0 + 0.5) == plane) {
-                sum += m.r * w;
+                sum += m.ra * w;
                 weightSum += w;
             }
         }
@@ -71,7 +77,7 @@ float maskShadow(vec3 toLight) {
         if(dist > NEAR_FALLBACK || dist > linearDepth(farthest) * 1.0002 + 0.05) {
             return anySum / anyWeight;
         }
-        return castShadowRay(rayStart(), toLight);
+        return vec2(castShadowRay(rayStart(), toLight), anySum.y / anyWeight);
     }
     return sum / weightSum;
 }
@@ -83,7 +89,8 @@ void main() {
     // faces turned away from the light are in the shadow anyway: no ray
     float shadow = 0.0;
     if(ndotl > 0.0) {
-        shadow = halfResShadows ? maskShadow(toLight) : castShadowRay(rayStart(), toLight);
+        vec2 s = halfResShadows ? maskShadow(toLight) : vec2(castShadowRay(rayStart(), toLight), cloudShadow(vPosition, toLight));
+        shadow = s.x * s.y; // terrain x clouds
     }
 
     // linear lighting: ambient from the sky (darkened by the occlusion) + sun or moon (only partly darkened by the
@@ -94,6 +101,14 @@ void main() {
     vec3 toSurface = vPosition - camPosition;
     float dist = length(toSurface);
     vec3 viewDir = toSurface / dist;
+    // light shafts, and the clouds in front when the camera is above them
+    color += lightShaftsAt();
+    if(camPosition.z > CLOUD_BOTTOM) {
+        vec3 cloudNormal;
+        ivec3 cloudCellHit;
+        float t = traceClouds(camPosition, viewDir, dist, cloudNormal, cloudCellHit);
+        if(t >= 0.0) color = mix(color, shadeCloud(viewDir, cloudNormal, cloudCellHit), exp(-t / CLOUD_FADE));
+    }
     // valley mist, lit like the horizon in that direction
     float mist = 1.0 - exp(-mistDepth(camPosition, viewDir, dist));
     color = mix(color, skyRadiance(vec3(viewDir.xy, 0.0)), mist);

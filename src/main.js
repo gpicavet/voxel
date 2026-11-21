@@ -1,6 +1,7 @@
 import { mat4, vec3 } from "gl-matrix";
 import { moveWithCollisions } from "./collision";
 import { CHUNK_SIZE } from "./constants";
+import { createCloudNoiseTexture } from "./cloudNoise";
 import { clockTime, createDaylight, daylight } from "./daylight";
 import { World } from "./world";
 var vshader = require('./vertex.glsl');
@@ -10,6 +11,7 @@ var shadowFshader = require('./shadow_fragment.glsl');
 var skyVshader = require('./sky_vertex.glsl');
 var skyFshader = require('./sky_fragment.glsl');
 var skyLutFshader = require('./sky_lut_fragment.glsl');
+var atmosphereFshader = require('./atmosphere_fragment.glsl');
 
 // per second, so the speed no longer depends on the frame rate (same feel as before at 60 fps)
 const MOVE_SPEED = 60;
@@ -23,6 +25,11 @@ const CAMERA_HALF_SIZE = vec3.fromValues(0.3, 0.3, 0.3);
 const MAX_PIXEL_RATIO = 2;
 // uniforms of common.glsl
 const SKY_UNIFORMS = ["skyLUT", "sunDir", "lightDir", "lightColor", "exposure"];
+// uniforms of clouds.glsl and atmosphere.glsl
+const CLOUD_UNIFORMS = ["cloudNoise", "cloudTime", "cloudCoverage"];
+const ATMOSPHERE_UNIFORMS = ["atmosphereScatter", "screenSize", "atmosphereOn"];
+// weather presets (cloud coverage), w cycles through them
+const WEATHERS = [["cloudy", 0.55], ["overcast", 0.85], ["clear", 0.0], ["fair", 0.35]];
 // uniforms of shadow.glsl
 const SHADOW_UNIFORMS = ["brickTex", "coarseTex", "windowMin", "windowSize", "brickOrigin", "coarseOrigin"];
 
@@ -34,12 +41,20 @@ let halfResShadows = true;
 let viewRadiusChange = 0;
 let caveCullingToggle = false;
 let maskHistoryStale = false;
+let weather = 0;
+let lightShafts = true;
 
 function onkeydown(event) {
     keysDown[event.key] = true;
     if (event.key === "h") {
         halfResShadows = !halfResShadows;
         maskHistoryStale = true;
+    }
+    if (event.key === "w") {
+        weather = (weather + 1) % WEATHERS.length;
+    }
+    if (event.key === "g") {
+        lightShafts = !lightShafts;
     }
     if (event.key === "c") {
         caveCullingToggle = true;
@@ -130,6 +145,48 @@ function createShadowTargets(gl, screenWidth, screenHeight) {
     };
 }
 
+/**
+ * Quarter resolution targets of the clouds and light shafts, twice (current frame and previous frame):
+ * scattered light + transmittance (units 9, 10), distance where the view ray ends (units 11, 12).
+ */
+function createAtmosphereTargets(gl, screenWidth, screenHeight) {
+    const width = Math.max(1, Math.ceil(screenWidth / 4));
+    const height = Math.max(1, Math.ceil(screenHeight / 4));
+    const targets = { width, height, current: 0, historyValid: false, scatter: [], depth: [], framebuffers: [] };
+    for (let i = 0; i < 2; i++) {
+        const scatter = createTexture2D(gl, gl.TEXTURE9 + i, gl.RGBA16F, width, height);
+        const depth = createTexture2D(gl, gl.TEXTURE11 + i, gl.R16F, width, height);
+        // bilinear reads of the history
+        for (const texture of [scatter, depth]) {
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        }
+        gl.activeTexture(gl.TEXTURE9 + i);
+        gl.bindTexture(gl.TEXTURE_2D, scatter);
+        gl.activeTexture(gl.TEXTURE11 + i);
+        gl.bindTexture(gl.TEXTURE_2D, depth);
+        const framebuffer = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, scatter, 0);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, depth, 0);
+        gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+        const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        if (status !== gl.FRAMEBUFFER_COMPLETE) throw new Error("Atmosphere framebuffer incomplete : 0x" + status.toString(16));
+        targets.scatter.push(scatter);
+        targets.depth.push(depth);
+        targets.framebuffers.push(framebuffer);
+    }
+    gl.activeTexture(gl.TEXTURE0);
+    return targets;
+}
+
+function deleteAtmosphereTargets(gl, targets) {
+    targets.framebuffers.forEach(framebuffer => gl.deleteFramebuffer(framebuffer));
+    [...targets.scatter, ...targets.depth].forEach(texture => gl.deleteTexture(texture));
+}
+
 function deleteShadowTargets(gl, targets) {
     gl.deleteFramebuffer(targets.geometryFramebuffer);
     targets.maskFramebuffers.forEach(framebuffer => gl.deleteFramebuffer(framebuffer));
@@ -198,15 +255,19 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", ...SKY_UNIFORMS, ...SHADOW_UNIFORMS]);
+        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity",
+            ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
     const shadow = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, shadowFshader),
-        ["invViewProj", "lightDir", "halfDepth", "halfFace", "historyMask", "prevViewProj", "frameIndex", "refreshAll", ...SHADOW_UNIFORMS]);
+        ["invViewProj", "lightDir", "halfDepth", "halfFace", "historyMask", "prevViewProj", "frameIndex", "refreshAll", ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS]);
     const sky = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, skyFshader),
-        ["invViewProj", "camPosition", "moonDir", "sunDiskColor", "moonDiskColor", "starVisibility", ...SKY_UNIFORMS]);
+        ["invViewProj", "camPosition", "moonDir", "sunDiskColor", "moonDiskColor", "starVisibility", ...SKY_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const skyLut = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, skyLutFshader),
         ["sunDir", "moonDir", "moonSky", "lutSize"]);
+    const atmosphere = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, atmosphereFshader),
+        ["halfDepth", "historyScatter", "historyDepth", "invViewProj", "prevViewProj", "camPosition", "frameIndex", "historyValid", "lightShafts",
+            ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS]);
 
     // sky radiance texture (unit 7): half floats when they can be rendered to
     const floatTargets = !!gl.getExtension("EXT_color_buffer_float");
@@ -221,6 +282,10 @@ function init() {
     gl.activeTexture(gl.TEXTURE0);
     const skyLutFramebuffer = createFramebuffer(gl, skyLutTexture, null);
     let skyLutAngle = null;
+    // clouds and light shafts need float render targets
+    const atmosphereEnabled = floatTargets;
+    createCloudNoiseTexture(gl, gl.TEXTURE8);
+    let cloudTime = 0;
 
 
     const world = new World(gl);
@@ -233,10 +298,18 @@ function init() {
         gl.uniform1i(program.locations.brickTex, 0);
         gl.uniform1i(program.locations.coarseTex, 1);
     }
-    for (const program of [color, sky]) {
+    for (const program of [color, sky, atmosphere]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.skyLUT, 7);
     }
+    for (const program of [color, atmosphere, shadow, sky]) {
+        gl.useProgram(program.program);
+        gl.uniform1i(program.locations.cloudNoise, 8);
+    }
+    gl.useProgram(atmosphere.program);
+    gl.uniform1i(atmosphere.locations.brickTex, 0);
+    gl.uniform1i(atmosphere.locations.coarseTex, 1);
+    gl.uniform1i(atmosphere.locations.halfDepth, 3);
     gl.useProgram(color.program);
     gl.uniform1i(color.locations.halfDepth, 3);
     gl.useProgram(shadow.program);
@@ -245,6 +318,7 @@ function init() {
 
     var projMatrix = mat4.create();
     var shadowTargets = null;
+    var atmosphereTargets = null;
 
     // the far plane and the fog follow the view distance: chunks appear in the fog, not at a visible edge
     function viewDistance() {
@@ -270,6 +344,12 @@ function init() {
             deleteShadowTargets(gl, shadowTargets);
         }
         shadowTargets = createShadowTargets(gl, gl.drawingBufferWidth, gl.drawingBufferHeight);
+        if (atmosphereEnabled) {
+            if (atmosphereTargets) {
+                deleteAtmosphereTargets(gl, atmosphereTargets);
+            }
+            atmosphereTargets = createAtmosphereTargets(gl, gl.drawingBufferWidth, gl.drawingBufferHeight);
+        }
     }
     resize();
     window.addEventListener('resize', resize);
@@ -287,6 +367,17 @@ function init() {
     var light = createDaylight();
     var wasNight = null;
     var lastTime = performance.now();
+
+    function setClouds(program) {
+        gl.uniform1f(program.locations.cloudTime, cloudTime);
+        gl.uniform1f(program.locations.cloudCoverage, WEATHERS[weather][1]);
+    }
+    function setAtmosphere(program) {
+        const on = atmosphereEnabled;
+        gl.uniform1i(program.locations.atmosphereOn, on ? 1 : 0);
+        gl.uniform1i(program.locations.atmosphereScatter, 9 + (on ? atmosphereTargets.current : 0));
+        gl.uniform2f(program.locations.screenSize, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    }
 
     function setSky(program) {
         gl.uniform3fv(program.locations.sunDir, light.sunDir);
@@ -325,6 +416,7 @@ function init() {
 
         const timeScale = keysDown["t"] ? FAST_TIME : 1;
         hourAngle += SUN_SPEED * dt * timeScale;
+        cloudTime += dt * timeScale;
         daylight(light, hourAngle);
         const night = light.sunDir[2] < -0.05; // the moon is the main light (see daylight.js)
         // shadows of the previous frames are wrong when time runs fast, or when the moon takes over
@@ -395,7 +487,8 @@ function init() {
             shadowTargets.historyValid = false;
             maskHistoryStale = false;
         }
-        if (halfResShadows) {
+        const atmosphereOn = atmosphereEnabled;
+        if (halfResShadows || atmosphereOn) {
             // 1. half resolution: depth and face direction of the nearest surface (cheap fragment shader)
             gl.bindFramebuffer(gl.FRAMEBUFFER, shadowTargets.geometryFramebuffer);
             gl.viewport(0, 0, shadowTargets.width, shadowTargets.height);
@@ -403,6 +496,8 @@ function init() {
             gl.useProgram(gbuffer.program);
             gl.uniformMatrix4fv(gbuffer.locations.viewProj, false, viewProjMatrix);
             world.draw(visible, camPosition, gbuffer.locations.chunkOrigin);
+        }
+        if (halfResShadows) {
 
             // 2. shadow mask: reused from the previous frame, or one shadow ray per half resolution pixel
             const current = shadowTargets.current = 1 - shadowTargets.current;
@@ -415,11 +510,13 @@ function init() {
             gl.uniform1i(shadow.locations.historyMask, 6 - current); // units 5 and 6 hold masks 0 and 1
             gl.uniform1i(shadow.locations.frameIndex, frameIndex);
             gl.uniform1i(shadow.locations.refreshAll, shadowTargets.historyValid ? 0 : 1);
+            setClouds(shadow);
             setShadowWindow(shadow);
             gl.drawArrays(gl.TRIANGLES, 0, 3);
             gl.enable(gl.DEPTH_TEST);
             shadowTargets.historyValid = true;
-
+        }
+        if (halfResShadows || atmosphereOn) {
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
             gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
         }
@@ -441,11 +538,39 @@ function init() {
             gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
         }
 
+        // clouds and light shafts, quarter resolution, accumulated over frames
+        if (atmosphereOn) {
+            const current = atmosphereTargets.current = 1 - atmosphereTargets.current;
+            gl.bindFramebuffer(gl.FRAMEBUFFER, atmosphereTargets.framebuffers[current]);
+            gl.viewport(0, 0, atmosphereTargets.width, atmosphereTargets.height);
+            gl.disable(gl.DEPTH_TEST);
+            gl.useProgram(atmosphere.program);
+            gl.uniformMatrix4fv(atmosphere.locations.invViewProj, false, invViewProjMatrix);
+            gl.uniformMatrix4fv(atmosphere.locations.prevViewProj, false, prevViewProjMatrix);
+            gl.uniform3fv(atmosphere.locations.camPosition, camPosition);
+            gl.uniform1i(atmosphere.locations.frameIndex, frameIndex);
+            gl.uniform1i(atmosphere.locations.historyScatter, 9 + (1 - current));
+            gl.uniform1i(atmosphere.locations.historyDepth, 11 + (1 - current));
+            // history dropped while time runs fast (the light moves too much)
+            gl.uniform1i(atmosphere.locations.historyValid, atmosphereTargets.historyValid && timeScale === 1 ? 1 : 0);
+            gl.uniform1i(atmosphere.locations.lightShafts, lightShafts ? 1 : 0);
+            setSky(atmosphere);
+            setClouds(atmosphere);
+            setShadowWindow(atmosphere);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            gl.enable(gl.DEPTH_TEST);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+            atmosphereTargets.historyValid = true;
+        }
+
         // 3. full resolution color, shadows read from the mask (or traced per pixel)
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         gl.useProgram(color.program);
         gl.uniformMatrix4fv(color.locations.viewProj, false, viewProjMatrix);
         setSky(color);
+        setClouds(color);
+        setAtmosphere(color);
         gl.uniform3fv(color.locations.camPosition, camPosition);
         gl.uniform1i(color.locations.halfResShadows, halfResShadows ? 1 : 0);
         gl.uniform1i(color.locations.shadowMask, 5 + shadowTargets.current);
@@ -461,6 +586,8 @@ function init() {
         gl.uniformMatrix4fv(sky.locations.invViewProj, false, invViewProjMatrix);
         gl.uniform3fv(sky.locations.camPosition, camPosition);
         setSky(sky);
+        setClouds(sky);
+        setAtmosphere(sky);
         gl.uniform3fv(sky.locations.moonDir, light.moonDir);
         gl.uniform3fv(sky.locations.sunDiskColor, vec3.scale(vec3.create(), light.sunColor, 40));
         gl.uniform3fv(sky.locations.moonDiskColor, vec3.scale(vec3.create(), light.moonColor, 25));
@@ -489,7 +616,8 @@ function init() {
                 ` | ${canvas.width}x${canvas.height}` +
                 ` | pos ${Array.from(camPosition, v => v.toFixed(1)).join(" ")}` +
                 ` | shadows ${halfResShadows ? "half" : "full"} res (h)` +
-                ` | ${clockTime(hourAngle)} (t: fast)`;
+                ` | ${clockTime(hourAngle)} (t: fast)` +
+                (atmosphereEnabled ? ` | ${WEATHERS[weather][0]} (w) | light shafts ${lightShafts ? "on" : "off"} (g)` : "");
             frames = 0;
             statsTime = now;
         }
