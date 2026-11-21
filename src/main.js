@@ -1,6 +1,7 @@
 import { mat4, vec3 } from "gl-matrix";
 import { moveWithCollisions } from "./collision";
-import { Terrain } from "./terrain";
+import { CHUNK_SIZE } from "./constants";
+import { World } from "./world";
 var vshader = require('./vertex.glsl');
 var fshader = require('./fragment.glsl');
 var gbufferFshader = require('./gbuffer_fragment.glsl');
@@ -16,17 +17,30 @@ const SUN_SPEED = 0.3;
 const CAMERA_HALF_SIZE = vec3.fromValues(0.3, 0.3, 0.3);
 // sharper on high density screens, capped because every pixel runs the shadow ray
 const MAX_PIXEL_RATIO = 2;
+// uniforms of shadow.glsl
+const SHADOW_UNIFORMS = ["brickTex", "coarseTex", "windowMin", "windowSize", "brickOrigin", "coarseOrigin"];
 
-let camTheta = 0, camPhi = 0;
-let camPosition = vec3.fromValues(0, 0, 30);
+let camTheta = 0, camPhi = -0.35; // looking a bit down
+let camPosition = vec3.create();
 let keysDown = {};
 // shadow rays traced at half resolution (4 times fewer rays), or one per pixel
 let halfResShadows = true;
+let viewRadiusChange = 0;
+let caveCullingToggle = false;
 
 function onkeydown(event) {
     keysDown[event.key] = true;
     if (event.key === "h") {
         halfResShadows = !halfResShadows;
+    }
+    if (event.key === "c") {
+        caveCullingToggle = true;
+    }
+    if (event.key === "+" || event.key === "=") {
+        viewRadiusChange = 1;
+    }
+    if (event.key === "-") {
+        viewRadiusChange = -1;
     }
 }
 
@@ -173,27 +187,24 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "lightDir", "camPosition", "terrainTex", "coarseTex", "midTex", "terrainOffset", "terrainDim",
-            "halfResShadows", "shadowMask", "maskScale"]);
+        ["viewProj", "chunkOrigin", "lightDir", "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", ...SHADOW_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
     const shadow = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, shadowFshader),
-        ["invViewProj", "lightDir", "terrainTex", "coarseTex", "midTex", "terrainOffset", "terrainDim", "halfDepth", "halfFace"]);
+        ["invViewProj", "lightDir", "halfDepth", "halfFace", ...SHADOW_UNIFORMS]);
     const sky = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, skyFshader),
         ["invViewProj", "camPosition", "lightDir"]);
 
 
-    const terrain = new Terrain(vec3.fromValues(9, 9, 1));
-    terrain.init(gl);
+    const world = new World(gl);
+    // start above the ground at the center of the world
+    vec3.set(camPosition, 0.5, 0.5, world.surfaceHeight(0, 0) + 25);
 
-    // texture units: 0, 1, 2 voxel occupancy (fine, coarse, mid), 3 half depth, 4 half face, 5 shadow mask
+    // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 3 half depth, 4 half face, 5 shadow mask
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
-        gl.uniform1i(program.locations.terrainTex, 0);
+        gl.uniform1i(program.locations.brickTex, 0);
         gl.uniform1i(program.locations.coarseTex, 1);
-        gl.uniform1i(program.locations.midTex, 2);
-        gl.uniform3fv(program.locations.terrainOffset, terrain.offset);
-        gl.uniform3fv(program.locations.terrainDim, terrain.size);
     }
     gl.uniform1i(shadow.locations.halfDepth, 3);
     gl.uniform1i(shadow.locations.halfFace, 4);
@@ -203,6 +214,14 @@ function init() {
     var projMatrix = mat4.create();
     var shadowTargets = null;
 
+    // the far plane and the fog follow the view distance: chunks appear in the fog, not at a visible edge
+    function viewDistance() {
+        return (world.viewRadius - 0.5) * CHUNK_SIZE;
+    }
+    function updateProjection() {
+        mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, 0.1, viewDistance() * 1.5);
+    }
+
     function resize() {
         const ratio = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
         canvas.style.width = window.innerWidth + "px";
@@ -210,7 +229,7 @@ function init() {
         canvas.width = Math.round(window.innerWidth * ratio);
         canvas.height = Math.round(window.innerHeight * ratio);
         gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
-        mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, 0.1, 1000.0);
+        updateProjection();
         if (shadowTargets) {
             deleteShadowTargets(gl, shadowTargets);
         }
@@ -230,6 +249,13 @@ function init() {
 
     var angle = 0.0;
     var lastTime = performance.now();
+
+    function setShadowWindow(program) {
+        gl.uniform3fv(program.locations.windowMin, world.windowMin);
+        gl.uniform3fv(program.locations.windowSize, world.windowSize);
+        gl.uniform3iv(program.locations.brickOrigin, world.brickOrigin);
+        gl.uniform3iv(program.locations.coarseOrigin, world.coarseOrigin);
+    }
 
     const gpuTimer = createGpuTimer(gl);
     const statsElement = document.getElementById("stats");
@@ -270,9 +296,9 @@ function init() {
         vec3.set(camDir, Math.cos(camTheta) * Math.cos(camPhi), Math.sin(camTheta) * Math.cos(camPhi), Math.sin(camPhi));
 
         if (keysDown[" "]) {
-            const inter = terrain.intersection(camPosition, camDir);
+            const inter = world.intersection(camPosition, camDir);
             if (inter) {
-                terrain.boom(gl, inter.point, 10);
+                world.boom(inter.point, 10);
             }
         }
 
@@ -280,7 +306,7 @@ function init() {
         const forward = (keysDown["ArrowUp"] ? 1 : 0) - (keysDown["ArrowDown"] ? 1 : 0);
         if (forward !== 0) {
             vec3.scale(move, camDir, forward * MOVE_SPEED * dt);
-            moveWithCollisions(terrain, camPosition, move, CAMERA_HALF_SIZE);
+            moveWithCollisions(world, camPosition, move, CAMERA_HALF_SIZE);
         }
 
         vec3.add(camAt, camPosition, camDir);
@@ -297,7 +323,20 @@ function init() {
 
         mat4.invert(invViewProjMatrix, viewProjMatrix);
 
-        const visible = terrain.cull(viewProjMatrix, camPosition);
+        if (viewRadiusChange !== 0) {
+            world.setViewRadius(world.viewRadius + viewRadiusChange);
+            viewRadiusChange = 0;
+            updateProjection();
+            mat4.multiply(viewProjMatrix, projMatrix, viewMatrix);
+            mat4.invert(invViewProjMatrix, viewProjMatrix);
+        }
+        if (caveCullingToggle) {
+            world.caveCulling = !world.caveCulling;
+            caveCullingToggle = false;
+        }
+        world.update(camPosition);
+
+        const visible = world.cull(viewProjMatrix, camPosition);
         visibleChunks = visible.length;
 
         gl.enable(gl.DEPTH_TEST);
@@ -311,7 +350,7 @@ function init() {
             gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
             gl.useProgram(gbuffer.program);
             gl.uniformMatrix4fv(gbuffer.locations.viewProj, false, viewProjMatrix);
-            terrain.draw(gl, visible, camPosition, gbuffer.locations.chunkOrigin);
+            world.draw(visible, camPosition, gbuffer.locations.chunkOrigin);
 
             // 2. one shadow ray per half resolution pixel, exactly once whatever the overdraw
             gl.bindFramebuffer(gl.FRAMEBUFFER, shadowTargets.maskFramebuffer);
@@ -319,6 +358,7 @@ function init() {
             gl.useProgram(shadow.program);
             gl.uniformMatrix4fv(shadow.locations.invViewProj, false, invViewProjMatrix);
             gl.uniform3fv(shadow.locations.lightDir, lightDir);
+            setShadowWindow(shadow);
             gl.drawArrays(gl.TRIANGLES, 0, 3);
             gl.enable(gl.DEPTH_TEST);
 
@@ -335,7 +375,9 @@ function init() {
         gl.uniform1i(color.locations.halfResShadows, halfResShadows ? 1 : 0);
         gl.uniform2f(color.locations.maskScale,
             shadowTargets.width / gl.drawingBufferWidth, shadowTargets.height / gl.drawingBufferHeight);
-        facesDrawn = terrain.draw(gl, visible, camPosition, color.locations.chunkOrigin);
+        gl.uniform1f(color.locations.fogDensity, 1.2 / viewDistance()); // fog = 0.95 at the view distance
+        setShadowWindow(color);
+        facesDrawn = world.draw(visible, camPosition, color.locations.chunkOrigin);
 
         // 4. sky last, on the far plane: only the pixels the terrain left empty are shaded
         gl.useProgram(sky.program);
@@ -352,10 +394,14 @@ function init() {
         const now = performance.now();
         if (now - statsTime > 500) {
             const gpuMs = gpuTimer.take();
+            const stats = world.stats();
             statsElement.textContent =
                 `${(frames * 1000 / (now - statsTime)).toFixed(0)} fps` +
                 (gpuMs !== null ? ` | GPU ${gpuMs.toFixed(2)} ms` : "") +
-                ` | chunks ${visibleChunks}/${terrain.chunks.length}` +
+                ` | chunks ${visibleChunks} visible` +
+                ` | columns ${stats.meshed} meshed / ${stats.loaded} loaded, ${stats.pending} pending` +
+                ` | view ${world.viewRadius} (+/-)` +
+                ` | cave culling ${world.caveCulling ? "on" : "off"} (c)` +
                 ` | ${(facesDrawn * 2 / 1e6).toFixed(2)} M triangles` +
                 ` | ${canvas.width}x${canvas.height}` +
                 ` | pos ${Array.from(camPosition, v => v.toFixed(1)).join(" ")}` +

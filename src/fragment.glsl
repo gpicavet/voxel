@@ -9,6 +9,7 @@ uniform vec3 camPosition;
 uniform bool halfResShadows;
 uniform sampler2D shadowMask; // written by shadow_fragment.glsl at half resolution
 uniform vec2 maskScale;       // mask size / screen size
+uniform float fogDensity;     // set from the view distance, so that chunks appear in the fog
 
 in vec3 vAlbedo;
 in float vAO;
@@ -21,7 +22,14 @@ out vec4 fragColor;
 @import ./shadow;
 @import ./common;
 
-const float FOG_DENSITY = 1.0 / 450.0;
+// start of the shadow ray: on the face plane (an integer coordinate: removes the interpolation error, which grows
+// far from the origin), just in front of the face
+vec3 rayStart() {
+    vec3 p = vPosition;
+    int axis = vFace >> 1;
+    p[axis] = floor(p[axis] + 0.5);
+    return p + vNormal * 0.01;
+}
 
 // Shadow of this pixel from the half resolution mask: bilinear blend of the 4 nearest mask texels,
 // keeping only the ones on the same face plane, so shadows never leak across voxel edges.
@@ -45,7 +53,7 @@ float maskShadow(vec3 sunDir) {
     }
     // no mask texel on this surface (detail thinner than 2 pixels, silhouette): trace this pixel
     if(weightSum == 0.0) {
-        return castShadowRay(vPosition + vNormal * 1e-3, sunDir);
+        return castShadowRay(rayStart(), sunDir);
     }
     return sum / weightSum;
 }
@@ -57,7 +65,7 @@ void main() {
     // faces turned away from the sun are in the shadow anyway: no ray
     float shadow = 0.0;
     if(ndotl > 0.0) {
-        shadow = halfResShadows ? maskShadow(sunDir) : castShadowRay(vPosition + vNormal * 1e-3, sunDir);
+        shadow = halfResShadows ? maskShadow(sunDir) : castShadowRay(rayStart(), sunDir);
     }
 
     // linear lighting: ambient (darkened by the occlusion) + sun (only partly, so creases stay readable in the light)
@@ -67,7 +75,8 @@ void main() {
     // fog takes the color of the sky behind the surface, so far terrain melts into the horizon
     vec3 toSurface = vPosition - camPosition;
     float dist = length(toSurface);
-    float fog = 1.0 - exp(-(dist * FOG_DENSITY) * (dist * FOG_DENSITY));
+    float d2 = (dist * fogDensity) * (dist * fogDensity);
+    float fog = 1.0 - exp(-d2 * d2 * d2); // clear up to half the view distance, thick close to it
     color = mix(color, skyColor(toSurface / dist, sunDir), fog);
 
     fragColor = vec4(toneMap(color), 1);

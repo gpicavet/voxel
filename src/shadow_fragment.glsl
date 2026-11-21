@@ -40,6 +40,6 @@ void main() {
     int axis = face >> 1;
     pos[axis] = floor(pos[axis] + 0.5);
 
-    float lit = dot(normal, sunDir) > 0.0 ? castShadowRay(pos + normal * 1e-3, sunDir) : 0.0;
+    float lit = dot(normal, sunDir) > 0.0 ? castShadowRay(pos + normal * 0.01, sunDir) : 0.0;
     fragMask = vec4(lit, float(face + 1) / 255.0, mod(pos[axis], 256.0) / 255.0, 1.0);
 }

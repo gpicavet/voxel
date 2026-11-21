@@ -18,10 +18,11 @@ const vec3 NORMALS[6] = vec3[6](
     vec3(0, 0, 1), vec3(0, 0, -1));
 
 // sRGB, converted to linear below
-const vec3 MATERIALS[3] = vec3[3](
+const vec3 MATERIALS[4] = vec3[4](
     vec3(0.52, 0.40, 0.28),  // earth
-    vec3(0.52, 0.52, 0.54),  // rock
-    vec3(0.30, 0.62, 0.18)); // grass
+    vec3(0.40, 0.40, 0.42),  // rock: darker than the snow, even in the sun
+    vec3(0.30, 0.62, 0.18),  // grass
+    vec3(0.92, 0.94, 0.97)); // snow
 
 const float AO[4] = float[4](0.25, 0.5, 0.75, 1.0);
 
