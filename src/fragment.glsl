@@ -2,65 +2,52 @@
 precision highp float;
 precision highp int;
 precision lowp usampler3D;
+precision highp sampler2D;
 
-uniform usampler3D terrainTex; // 1 texel = 1 voxel
-uniform usampler3D coarseTex;  // 1 texel = 8^3 voxels, 0 when they are all empty
 uniform vec3 lightDir; // Direction de la lumière (normalisée)
-uniform vec3 terrainOffset; // offset pour la texture
-uniform vec3 terrainDim; // dim pour la texture
 uniform vec3 camPosition;
+uniform bool halfResShadows;
+uniform sampler2D shadowMask; // written by shadow_fragment.glsl at half resolution
+uniform vec2 maskScale;       // mask size / screen size
 
 in vec3 vAlbedo;
 in float vAO;
 in vec3 vPosition;
 in vec3 vNormal;
+flat in int vFace;
 
 out vec4 fragColor;
 
+@import ./shadow;
 @import ./common;
 
 const float FOG_DENSITY = 1.0 / 450.0;
 
-const int COARSE_POW = 3;
-const float COARSE = 8.0;
-const int MAX_STEPS = 256;
+// Shadow of this pixel from the half resolution mask: bilinear blend of the 4 nearest mask texels,
+// keeping only the ones on the same face plane, so shadows never leak across voxel edges.
+float maskShadow(vec3 sunDir) {
+    vec2 h = gl_FragCoord.xy * maskScale - 0.5;
+    vec2 f = fract(h);
+    ivec2 base = ivec2(floor(h));
+    ivec2 maxTexel = textureSize(shadowMask, 0) - 1;
+    float plane = mod(floor(vPosition[vFace >> 1] + 0.5), 256.0);
 
-// Voxel traversal towards the light. Every voxel crossed by the ray is tested (no fixed step that could
-// miss a corner), whole empty 8^3 blocks are crossed in one step, and the ray stops as soon as it
-// leaves the terrain.
-float castShadowRay(vec3 startPos, vec3 rd) {
-    rd = mix(rd, vec3(1e-6), lessThan(abs(rd), vec3(1e-6)));
-    vec3 invRd = 1.0 / rd;
-    vec3 towards = step(0.0, rd); // 1 on the axes where the ray goes up
-    vec3 ro = startPos + terrainOffset;
-    float t = 0.0;
-
-    for(int i = 0; i < MAX_STEPS; i++) {
-        vec3 pos = ro + rd * t;
-        if(any(lessThan(pos, vec3(0.0))) || any(greaterThanEqual(pos, terrainDim))) {
-            return 1.0; // left the terrain: lit
-        }
-        ivec3 cell = ivec3(pos);
-        ivec3 block = cell >> COARSE_POW;
-
-        vec3 boxMin;
-        float boxSize;
-        if(texelFetch(coarseTex, block, 0).r == 0u) {
-            boxMin = vec3(block << COARSE_POW);
-            boxSize = COARSE;
-        } else {
-            if(texelFetch(terrainTex, cell, 0).r > 0u) {
-                return 0.0; // Ombre
+    float sum = 0.0, weightSum = 0.0;
+    for(int j = 0; j <= 1; j++) {
+        for(int i = 0; i <= 1; i++) {
+            vec4 m = texelFetch(shadowMask, clamp(base + ivec2(i, j), ivec2(0), maxTexel), 0);
+            if(int(m.g * 255.0 + 0.5) - 1 == vFace && floor(m.b * 255.0 + 0.5) == plane) {
+                float w = max(mix(1.0 - f.x, f.x, float(i)) * mix(1.0 - f.y, f.y, float(j)), 1e-3);
+                sum += m.r * w;
+                weightSum += w;
             }
-            boxMin = vec3(cell);
-            boxSize = 1.0;
         }
-        // jump just past the exit of the current voxel or block
-        vec3 tExit = (boxMin + towards * boxSize - ro) * invRd;
-        t = min(min(tExit.x, tExit.y), tExit.z) + 1e-3;
     }
-
-    return 1.0;
+    // no mask texel on this surface (detail thinner than 2 pixels, silhouette): trace this pixel
+    if(weightSum == 0.0) {
+        return castShadowRay(vPosition + vNormal * 1e-3, sunDir);
+    }
+    return sum / weightSum;
 }
 
 void main() {
@@ -68,7 +55,10 @@ void main() {
     float ndotl = max(dot(vNormal, sunDir), 0.0);
 
     // faces turned away from the sun are in the shadow anyway: no ray
-    float shadow = ndotl > 0.0 ? castShadowRay(vPosition + vNormal * 1e-3, sunDir) : 0.0;
+    float shadow = 0.0;
+    if(ndotl > 0.0) {
+        shadow = halfResShadows ? maskShadow(sunDir) : castShadowRay(vPosition + vNormal * 1e-3, sunDir);
+    }
 
     // linear lighting: ambient (darkened by the occlusion) + sun (only partly, so creases stay readable in the light)
     vec3 light = ambientLight(vNormal) * vAO + SUN_COLOR * ndotl * shadow * (0.5 + 0.5 * vAO);

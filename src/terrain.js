@@ -4,8 +4,10 @@ import { createNoise3D } from "simplex-noise";
 import { Chunk } from "./chunk";
 import { aabbInFrustum, frustumPlanes } from "./utils";
 
-// One texel of the coarse occupancy texture covers 8^3 voxels: shadow rays jump over empty blocks
+// Occupancy pyramid for the shadow rays: one texel is 0 when all its voxels are empty, so rays jump over
+// empty 8^3 blocks (coarse) then 2^3 blocks (mid). Must match shadow.glsl.
 export const COARSE_POW = 3;
+export const MID_POW = 1;
 
 export class Terrain {
     constructor(dim) {
@@ -15,6 +17,7 @@ export class Terrain {
         this.offset = [0, 1, 2].map(i => Chunk.SIZE * Math.floor(dim[i] / 2));
         this.size = [0, 1, 2].map(i => Chunk.SIZE * dim[i]);
         this.voxelTexture = null;
+        this.midTexture = null;
         this.coarseTexture = null;
         this.indexBuffer = null;
         this.indexCapacity = 0; // in faces
@@ -65,6 +68,8 @@ export class Terrain {
         this.voxelTexture = createVoxelTexture(gl, gl.TEXTURE0, this.size[0], this.size[1], this.size[2]);
         this.coarseTexture = createVoxelTexture(gl, gl.TEXTURE1,
             this.size[0] >> COARSE_POW, this.size[1] >> COARSE_POW, this.size[2] >> COARSE_POW);
+        this.midTexture = createVoxelTexture(gl, gl.TEXTURE2,
+            this.size[0] >> MID_POW, this.size[1] >> MID_POW, this.size[2] >> MID_POW);
         this.updateTexture(this.chunks, gl);
     }
 
@@ -93,17 +98,19 @@ export class Terrain {
         this.indexCapacity = capacity;
     }
 
-    /** upload the voxels of the chunks into the fine and coarse 3D textures */
+    /** upload the voxels of the chunks into the fine, mid and coarse 3D textures */
     updateTexture(chunks, gl) {
         console.log("updating 3D texture")
 
-        const S = Chunk.SIZE, POW = Chunk.SIZE_POW, CS = S >> COARSE_POW;
+        const S = Chunk.SIZE, POW = Chunk.SIZE_POW, CS = S >> COARSE_POW, MS = S >> MID_POW;
         const fine = new Uint8Array(S * S * S);
         const coarse = new Uint8Array(CS * CS * CS);
+        const mid = new Uint8Array(MS * MS * MS);
         gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
         for (const chunk of chunks) {
             coarse.fill(0);
+            mid.fill(0);
             let offs = 0;
             // texture layout: x varies fastest
             for (let z = 0; z < S; z++) {
@@ -113,6 +120,7 @@ export class Terrain {
                         fine[offs++] = v;
                         if (v) {
                             coarse[(((z >> COARSE_POW) * CS) + (y >> COARSE_POW)) * CS + (x >> COARSE_POW)] = 1;
+                            mid[(((z >> MID_POW) * MS) + (y >> MID_POW)) * MS + (x >> MID_POW)] = 1;
                         }
                     }
                 }
@@ -128,6 +136,11 @@ export class Terrain {
             gl.bindTexture(gl.TEXTURE_3D, this.coarseTexture);
             gl.texSubImage3D(gl.TEXTURE_3D, 0, tx >> COARSE_POW, ty >> COARSE_POW, tz >> COARSE_POW,
                 CS, CS, CS, gl.RED_INTEGER, gl.UNSIGNED_BYTE, coarse);
+
+            gl.activeTexture(gl.TEXTURE2);
+            gl.bindTexture(gl.TEXTURE_3D, this.midTexture);
+            gl.texSubImage3D(gl.TEXTURE_3D, 0, tx >> MID_POW, ty >> MID_POW, tz >> MID_POW,
+                MS, MS, MS, gl.RED_INTEGER, gl.UNSIGNED_BYTE, mid);
         }
         gl.activeTexture(gl.TEXTURE0);
     }

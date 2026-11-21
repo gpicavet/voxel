@@ -3,7 +3,8 @@ import { moveWithCollisions } from "./collision";
 import { Terrain } from "./terrain";
 var vshader = require('./vertex.glsl');
 var fshader = require('./fragment.glsl');
-var depthFshader = require('./depth_fragment.glsl');
+var gbufferFshader = require('./gbuffer_fragment.glsl');
+var shadowFshader = require('./shadow_fragment.glsl');
 var skyVshader = require('./sky_vertex.glsl');
 var skyFshader = require('./sky_fragment.glsl');
 
@@ -19,14 +20,13 @@ const MAX_PIXEL_RATIO = 2;
 let camTheta = 0, camPhi = 0;
 let camPosition = vec3.fromValues(0, 0, 30);
 let keysDown = {};
-// Off by default: with the cheap shadow rays and the front to back order, the pre-pass costs more
-// vertex work than it saves (5-15 % slower on an M3 Pro). Worth it again if the fragment shader gets heavier.
-let depthPrepass = false;
+// shadow rays traced at half resolution (4 times fewer rays), or one per pixel
+let halfResShadows = true;
 
 function onkeydown(event) {
     keysDown[event.key] = true;
-    if (event.key === "p") {
-        depthPrepass = !depthPrepass;
+    if (event.key === "h") {
+        halfResShadows = !halfResShadows;
     }
 }
 
@@ -57,6 +57,60 @@ function createProgram(gl, vertexShader, fragmentShader, uniforms) {
         locations[name] = gl.getUniformLocation(program, name);
     }
     return { program, locations };
+}
+
+function createTexture2D(gl, unit, internalFormat, width, height) {
+    gl.activeTexture(unit);
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, internalFormat, width, height);
+    return texture;
+}
+
+function createFramebuffer(gl, color, depth) {
+    const framebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0);
+    if (depth) {
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0);
+    }
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        throw new Error("Framebuffer incomplete : 0x" + status.toString(16));
+    }
+    return framebuffer;
+}
+
+/**
+ * Half resolution render targets of the shadows:
+ * - geometry: depth + face direction of the nearest surface (texture units 3 and 4)
+ * - mask: shadow, face and plane per half resolution pixel, read by the color pass (texture unit 5)
+ */
+function createShadowTargets(gl, screenWidth, screenHeight) {
+    const width = Math.max(1, Math.ceil(screenWidth / 2));
+    const height = Math.max(1, Math.ceil(screenHeight / 2));
+    const depth = createTexture2D(gl, gl.TEXTURE3, gl.DEPTH_COMPONENT24, width, height);
+    const face = createTexture2D(gl, gl.TEXTURE4, gl.R8, width, height);
+    const mask = createTexture2D(gl, gl.TEXTURE5, gl.RGBA8, width, height);
+    gl.activeTexture(gl.TEXTURE0);
+    return {
+        width, height, depth, face, mask,
+        geometryFramebuffer: createFramebuffer(gl, face, depth),
+        maskFramebuffer: createFramebuffer(gl, mask, null),
+    };
+}
+
+function deleteShadowTargets(gl, targets) {
+    gl.deleteFramebuffer(targets.geometryFramebuffer);
+    gl.deleteFramebuffer(targets.maskFramebuffer);
+    gl.deleteTexture(targets.depth);
+    gl.deleteTexture(targets.face);
+    gl.deleteTexture(targets.mask);
 }
 
 /** GPU time of a frame, when EXT_disjoint_timer_query_webgl2 is available (not on Firefox and Safari) */
@@ -116,26 +170,38 @@ function init() {
     // SET UP PROGRAMS
     ///////////////////////////
 
-    // the same vertex shader in both programs, so the depth values match
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
+    const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "lightDir", "camPosition", "terrainTex", "coarseTex", "terrainOffset", "terrainDim"]);
-    const depth = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, depthFshader),
+        ["viewProj", "chunkOrigin", "lightDir", "camPosition", "terrainTex", "coarseTex", "midTex", "terrainOffset", "terrainDim",
+            "halfResShadows", "shadowMask", "maskScale"]);
+    const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
-    const sky = createProgram(gl, compileShader(gl, gl.VERTEX_SHADER, skyVshader), compileShader(gl, gl.FRAGMENT_SHADER, skyFshader),
+    const shadow = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, shadowFshader),
+        ["invViewProj", "lightDir", "terrainTex", "coarseTex", "midTex", "terrainOffset", "terrainDim", "halfDepth", "halfFace"]);
+    const sky = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, skyFshader),
         ["invViewProj", "camPosition", "lightDir"]);
 
 
     const terrain = new Terrain(vec3.fromValues(9, 9, 1));
     terrain.init(gl);
 
+    // texture units: 0, 1, 2 voxel occupancy (fine, coarse, mid), 3 half depth, 4 half face, 5 shadow mask
+    for (const program of [color, shadow]) {
+        gl.useProgram(program.program);
+        gl.uniform1i(program.locations.terrainTex, 0);
+        gl.uniform1i(program.locations.coarseTex, 1);
+        gl.uniform1i(program.locations.midTex, 2);
+        gl.uniform3fv(program.locations.terrainOffset, terrain.offset);
+        gl.uniform3fv(program.locations.terrainDim, terrain.size);
+    }
+    gl.uniform1i(shadow.locations.halfDepth, 3);
+    gl.uniform1i(shadow.locations.halfFace, 4);
     gl.useProgram(color.program);
-    gl.uniform1i(color.locations.terrainTex, 0);
-    gl.uniform1i(color.locations.coarseTex, 1);
-    gl.uniform3fv(color.locations.terrainOffset, terrain.offset);
-    gl.uniform3fv(color.locations.terrainDim, terrain.size);
+    gl.uniform1i(color.locations.shadowMask, 5);
 
     var projMatrix = mat4.create();
+    var shadowTargets = null;
 
     function resize() {
         const ratio = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
@@ -145,6 +211,10 @@ function init() {
         canvas.height = Math.round(window.innerHeight * ratio);
         gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
         mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, 0.1, 1000.0);
+        if (shadowTargets) {
+            deleteShadowTargets(gl, shadowTargets);
+        }
+        shadowTargets = createShadowTargets(gl, gl.drawingBufferWidth, gl.drawingBufferHeight);
     }
     resize();
     window.addEventListener('resize', resize);
@@ -169,7 +239,7 @@ function init() {
     gl.enable(gl.DEPTH_TEST);
     gl.enable(gl.CULL_FACE);
     gl.cullFace(gl.BACK);
-    gl.clearColor(0.8, 0.9, 1.0, 1.0);
+    gl.clearColor(0.0, 0.0, 0.0, 0.0); // 0 = no face in the half resolution face texture; the sky covers the screen
 
     document.getElementById("loading").style.display = 'none';
 
@@ -225,37 +295,49 @@ function init() {
         vec3.normalize(lightDir, lightDir);
         vec3.transformMat4(lightDir, lightDir, rotateZMatrix);
 
+        mat4.invert(invViewProjMatrix, viewProjMatrix);
+
         const visible = terrain.cull(viewProjMatrix, camPosition);
         visibleChunks = visible.length;
 
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LESS);
         gl.depthMask(true);
-        gl.colorMask(true, true, true, true);
-        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-        if (depthPrepass) {
-            // 1. depth only: after this pass the depth buffer holds the nearest surface of every pixel
-            gl.useProgram(depth.program);
-            gl.uniformMatrix4fv(depth.locations.viewProj, false, viewProjMatrix);
-            gl.colorMask(false, false, false, false);
-            gl.depthFunc(gl.LESS);
-            terrain.draw(gl, visible, camPosition, depth.locations.chunkOrigin);
+        if (halfResShadows) {
+            // 1. half resolution: depth and face direction of the nearest surface (cheap fragment shader)
+            gl.bindFramebuffer(gl.FRAMEBUFFER, shadowTargets.geometryFramebuffer);
+            gl.viewport(0, 0, shadowTargets.width, shadowTargets.height);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+            gl.useProgram(gbuffer.program);
+            gl.uniformMatrix4fv(gbuffer.locations.viewProj, false, viewProjMatrix);
+            terrain.draw(gl, visible, camPosition, gbuffer.locations.chunkOrigin);
 
-            // 2. the expensive fragment shader then runs once per pixel, whatever the overdraw
-            gl.colorMask(true, true, true, true);
-            gl.depthMask(false);
-            gl.depthFunc(gl.LEQUAL);
-        } else {
-            gl.depthFunc(gl.LESS);
+            // 2. one shadow ray per half resolution pixel, exactly once whatever the overdraw
+            gl.bindFramebuffer(gl.FRAMEBUFFER, shadowTargets.maskFramebuffer);
+            gl.disable(gl.DEPTH_TEST);
+            gl.useProgram(shadow.program);
+            gl.uniformMatrix4fv(shadow.locations.invViewProj, false, invViewProjMatrix);
+            gl.uniform3fv(shadow.locations.lightDir, lightDir);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            gl.enable(gl.DEPTH_TEST);
+
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
         }
 
+        // 3. full resolution color, shadows read from the mask (or traced per pixel)
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         gl.useProgram(color.program);
         gl.uniformMatrix4fv(color.locations.viewProj, false, viewProjMatrix);
         gl.uniform3fv(color.locations.lightDir, lightDir);
         gl.uniform3fv(color.locations.camPosition, camPosition);
+        gl.uniform1i(color.locations.halfResShadows, halfResShadows ? 1 : 0);
+        gl.uniform2f(color.locations.maskScale,
+            shadowTargets.width / gl.drawingBufferWidth, shadowTargets.height / gl.drawingBufferHeight);
         facesDrawn = terrain.draw(gl, visible, camPosition, color.locations.chunkOrigin);
 
-        // sky last, on the far plane: only the pixels the terrain left empty are shaded
-        mat4.invert(invViewProjMatrix, viewProjMatrix);
+        // 4. sky last, on the far plane: only the pixels the terrain left empty are shaded
         gl.useProgram(sky.program);
         gl.uniformMatrix4fv(sky.locations.invViewProj, false, invViewProjMatrix);
         gl.uniform3fv(sky.locations.camPosition, camPosition);
@@ -277,7 +359,7 @@ function init() {
                 ` | ${(facesDrawn * 2 / 1e6).toFixed(2)} M triangles` +
                 ` | ${canvas.width}x${canvas.height}` +
                 ` | pos ${Array.from(camPosition, v => v.toFixed(1)).join(" ")}` +
-                ` | depth pre-pass ${depthPrepass ? "on" : "off"} (p)`;
+                ` | shadows ${halfResShadows ? "half" : "full"} res (h)`;
             frames = 0;
             statsTime = now;
         }

@@ -10,9 +10,7 @@ out vec3 vAlbedo;
 out float vAO;
 out vec3 vPosition;
 out vec3 vNormal;
-
-// the depth pre-pass and the color pass must produce exactly the same depth
-invariant gl_Position;
+flat out int vFace;
 
 const vec3 NORMALS[6] = vec3[6](
     vec3(1, 0, 0), vec3(-1, 0, 0),
@@ -35,6 +33,7 @@ void main() {
 
     vPosition = chunkOrigin + local;
     vNormal = NORMALS[face];
+    vFace = face;
     vAlbedo = pow(MATERIALS[material], vec3(2.2));
     vAO = AO[ao];
     gl_Position = viewProj * vec4(vPosition, 1.0);
