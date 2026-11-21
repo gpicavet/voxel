@@ -29,7 +29,7 @@ const SKY_UNIFORMS = ["skyLUT", "sunDir", "lightDir", "lightColor", "exposure"];
 const CLOUD_UNIFORMS = ["cloudNoise", "cloudTime", "cloudCoverage"];
 const ATMOSPHERE_UNIFORMS = ["atmosphereScatter", "screenSize", "atmosphereOn"];
 // weather presets (cloud coverage), w cycles through them
-const WEATHERS = [["cloudy", 0.55], ["overcast", 0.85], ["clear", 0.0], ["fair", 0.35]];
+const WEATHERS = [["fair", 0.35], ["cloudy", 0.55], ["overcast", 0.85], ["clear", 0.0]]; // the first is the default
 // uniforms of shadow.glsl
 const SHADOW_UNIFORMS = ["brickTex", "coarseTex", "windowMin", "windowSize", "brickOrigin", "coarseOrigin"];
 
@@ -266,7 +266,7 @@ function init() {
     const skyLut = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, skyLutFshader),
         ["sunDir", "moonDir", "moonSky", "lutSize"]);
     const atmosphere = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, atmosphereFshader),
-        ["halfDepth", "historyScatter", "historyDepth", "invViewProj", "prevViewProj", "camPosition", "frameIndex", "historyValid", "lightShafts",
+        ["halfDepth", "historyScatter", "historyDepth", "invViewProj", "prevViewProj", "camPosition", "frameIndex", "historyValid", "lightShafts", "shaftDistance",
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS]);
 
     // sky radiance texture (unit 7): half floats when they can be rendered to
@@ -554,6 +554,7 @@ function init() {
             // history dropped while time runs fast (the light moves too much)
             gl.uniform1i(atmosphere.locations.historyValid, atmosphereTargets.historyValid && timeScale === 1 ? 1 : 0);
             gl.uniform1i(atmosphere.locations.lightShafts, lightShafts ? 1 : 0);
+            gl.uniform1f(atmosphere.locations.shaftDistance, viewDistance());
             setSky(atmosphere);
             setClouds(atmosphere);
             setShadowWindow(atmosphere);

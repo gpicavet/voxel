@@ -5,10 +5,13 @@ precision lowp usampler3D;
 precision highp sampler2D;
 precision highp sampler3D;
 
-// Light shafts (god rays), at quarter resolution, accumulated over frames: sunlight scattered by the haze, where
-// it is not blocked by the terrain or the clouds. Each frame recomputes one tile of 8x8 pixels in four (in turn,
+// Light shafts (god rays), at quarter resolution, accumulated over frames. The haze dims the terrain behind it
+// (towards the color of the horizon, see fragment.glsl) and scatters the sunlight only where the terrain and the
+// clouds let it through: shadowed air is darker and bluish, lit air golden. It stops at the view distance, where the
+// fog ends, so that the terrain melts into the sky without an edge. Each frame recomputes one tile of 8x8 pixels in four (in turn,
 // whole tiles keep the GPU threads coherent); the others reuse the previous result at the same place, reprojected.
-// Out: the scattered light, and the distance where the view ray ends (to check the reprojection).
+// Out: the scattered light and the transmittance of the haze, and the distance where the view ray ends (to check
+// the reprojection).
 
 uniform sampler2D halfDepth;
 uniform sampler2D historyScatter;
@@ -19,6 +22,7 @@ uniform vec3 camPosition;
 uniform int frameIndex;
 uniform bool historyValid;
 uniform bool lightShafts;
+uniform float shaftDistance; // the view distance
 
 layout(location = 0) out vec4 outScatter;
 layout(location = 1) out vec4 outDepth;
@@ -28,10 +32,10 @@ layout(location = 1) out vec4 outDepth;
 @import ./clouds;
 
 const float FAR = 60000.0;
-const int SHAFT_STEPS = 8;
-const float SHAFT_DISTANCE = 700.0;
-const float HAZE_DENSITY = 0.0007; // per meter at the ground
-const float HAZE_HEIGHT = 140.0;
+const int SHAFT_STEPS = 10;
+const float HAZE_DENSITY = 0.0016; // per meter at the ground
+const float HAZE_HEIGHT = 180.0;
+const int SHAFT_OCCLUSION_STEPS = 20; // coarse steps towards the light: far ridges cut shafts too
 
 // interleaved gradient noise: a different start for the samples of every pixel and every frame
 float jitterNoise(vec2 p) {
@@ -84,24 +88,27 @@ void main() {
     vec3 toLight = -lightDir;
     float mu = dot(dir, toLight);
     vec3 scatter = vec3(0.0);
+    float transmittance = 1.0;
     if(lightShafts) {
-        float tMax = min(tEnd, SHAFT_DISTANCE);
+        float tMax = min(tEnd, shaftDistance);
         float t0, t1;
         if(camPosition.z < CLOUD_BOTTOM && cloudLayer(camPosition, dir, t0, t1)) tMax = min(tMax, t0); // below the clouds
         float dt = tMax / float(SHAFT_STEPS);
-        float phase = henyeyGreenstein(mu, 0.7);
-        float inscatter = 0.0;
+        // strong forward scattering around the light, and a wider lobe so that shafts show away from it too
+        float phase = mix(henyeyGreenstein(mu, 0.3), henyeyGreenstein(mu, 0.8), 0.6);
+        vec3 sunLight = lightColor * phase;
         for(int i = 0; i < SHAFT_STEPS; i++) {
             vec3 p = camPosition + dir * (float(i) + jitter) * dt;
             float haze = HAZE_DENSITY * exp(-max(p.z, 0.0) / HAZE_HEIGHT);
-            float visible = coarseVisibility(p, toLight, 12);
+            float visible = coarseVisibility(p, toLight, SHAFT_OCCLUSION_STEPS);
             if(visible > 0.0) visible *= cloudShadow(p, toLight);
-            inscatter += visible * haze * dt;
+            float stepTransmittance = exp(-haze * dt);
+            scatter += transmittance * sunLight * visible * (1.0 - stepTransmittance);
+            transmittance *= stepTransmittance;
         }
-        scatter = lightColor * phase * inscatter;
     }
 
     // accumulation over frames: blend with the previous result (a new sample every 4 frames)
-    vec4 current = vec4(scatter, 1.0);
+    vec4 current = vec4(scatter, transmittance);
     outScatter = historyFound ? mix(history, current, 0.35) : current;
 }

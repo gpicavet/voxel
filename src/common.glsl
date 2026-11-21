@@ -8,8 +8,9 @@ uniform float exposure;   // higher at night
 
 const float PI = 3.14159265;
 
-// valley mist: density decreasing with altitude
-const float MIST_DENSITY = 0.0008;
+// valley mist: density decreasing with altitude. Kept light: the haze of the light shafts, which knows the shadows,
+// does most of the work, and a uniform mist would wash out the contrast of the shafts
+const float MIST_DENSITY = 0.0003;
 const float MIST_BASE = 15.0;
 const float MIST_HEIGHT = 28.0;
 

@@ -51,6 +51,6 @@ void main() {
     ivec3 cloudCellHit;
     float t = traceClouds(camPosition, dir, 1e5, cloudNormal, cloudCellHit);
     if(t >= 0.0) sky = mix(sky, shadeCloud(dir, cloudNormal, cloudCellHit), exp(-t / CLOUD_FADE));
-    sky += lightShaftsAt();
+    sky += lightShaftsAt().rgb; // the sky already contains the scattering of the air: no dimming
     fragColor = vec4(toneMap(sky), 1.0);
 }
