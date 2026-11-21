@@ -12,7 +12,7 @@ var skyFshader = require('./sky_fragment.glsl');
 // per second, so the speed no longer depends on the frame rate (same feel as before at 60 fps)
 const MOVE_SPEED = 60;
 const TURN_SPEED = 0.6;
-const SUN_SPEED = 0.3;
+const SUN_SPEED = 0.003; // slow: the shadows of the previous frames stay valid and are reused
 // the camera is a box: it cannot get closer than this to a voxel (keeps the near plane out of the walls)
 const CAMERA_HALF_SIZE = vec3.fromValues(0.3, 0.3, 0.3);
 // sharper on high density screens, capped because every pixel runs the shadow ray
@@ -27,11 +27,13 @@ let keysDown = {};
 let halfResShadows = true;
 let viewRadiusChange = 0;
 let caveCullingToggle = false;
+let maskHistoryStale = false;
 
 function onkeydown(event) {
     keysDown[event.key] = true;
     if (event.key === "h") {
         halfResShadows = !halfResShadows;
+        maskHistoryStale = true;
     }
     if (event.key === "c") {
         caveCullingToggle = true;
@@ -110,21 +112,24 @@ function createShadowTargets(gl, screenWidth, screenHeight) {
     const height = Math.max(1, Math.ceil(screenHeight / 2));
     const depth = createTexture2D(gl, gl.TEXTURE3, gl.DEPTH_COMPONENT24, width, height);
     const face = createTexture2D(gl, gl.TEXTURE4, gl.R8, width, height);
-    const mask = createTexture2D(gl, gl.TEXTURE5, gl.RGBA8, width, height);
+    // two masks: one is written while the other (previous frame) is read, then they swap
+    const masks = [createTexture2D(gl, gl.TEXTURE5, gl.RGBA8, width, height), createTexture2D(gl, gl.TEXTURE6, gl.RGBA8, width, height)];
     gl.activeTexture(gl.TEXTURE0);
     return {
-        width, height, depth, face, mask,
+        width, height, depth, face, masks,
+        current: 0, // index of the mask written this frame
+        historyValid: false,
         geometryFramebuffer: createFramebuffer(gl, face, depth),
-        maskFramebuffer: createFramebuffer(gl, mask, null),
+        maskFramebuffers: masks.map(mask => createFramebuffer(gl, mask, null)),
     };
 }
 
 function deleteShadowTargets(gl, targets) {
     gl.deleteFramebuffer(targets.geometryFramebuffer);
-    gl.deleteFramebuffer(targets.maskFramebuffer);
+    targets.maskFramebuffers.forEach(framebuffer => gl.deleteFramebuffer(framebuffer));
     gl.deleteTexture(targets.depth);
     gl.deleteTexture(targets.face);
-    gl.deleteTexture(targets.mask);
+    targets.masks.forEach(mask => gl.deleteTexture(mask));
 }
 
 /** GPU time of a frame, when EXT_disjoint_timer_query_webgl2 is available (not on Firefox and Safari) */
@@ -191,7 +196,7 @@ function init() {
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
     const shadow = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, shadowFshader),
-        ["invViewProj", "lightDir", "halfDepth", "halfFace", ...SHADOW_UNIFORMS]);
+        ["invViewProj", "lightDir", "halfDepth", "halfFace", "historyMask", "prevViewProj", "frameIndex", "refreshAll", ...SHADOW_UNIFORMS]);
     const sky = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, skyFshader),
         ["invViewProj", "camPosition", "lightDir"]);
 
@@ -200,7 +205,7 @@ function init() {
     // start above the ground at the center of the world
     vec3.set(camPosition, 0.5, 0.5, world.surfaceHeight(0, 0) + 25);
 
-    // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 3 half depth, 4 half face, 5 shadow mask
+    // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 3 half depth, 4 half face, 5 and 6 shadow masks
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.brickTex, 0);
@@ -208,8 +213,6 @@ function init() {
     }
     gl.uniform1i(shadow.locations.halfDepth, 3);
     gl.uniform1i(shadow.locations.halfFace, 4);
-    gl.useProgram(color.program);
-    gl.uniform1i(color.locations.shadowMask, 5);
 
     var projMatrix = mat4.create();
     var shadowTargets = null;
@@ -241,6 +244,8 @@ function init() {
     var viewMatrix = mat4.create();
     var viewProjMatrix = mat4.create();
     var invViewProjMatrix = mat4.create();
+    var prevViewProjMatrix = mat4.create();
+    var frameIndex = 0;
     var rotateZMatrix = mat4.create();
     var camDir = vec3.create();
     var camAt = vec3.create();
@@ -343,6 +348,10 @@ function init() {
         gl.depthFunc(gl.LESS);
         gl.depthMask(true);
 
+        if (maskHistoryStale) {
+            shadowTargets.historyValid = false;
+            maskHistoryStale = false;
+        }
         if (halfResShadows) {
             // 1. half resolution: depth and face direction of the nearest surface (cheap fragment shader)
             gl.bindFramebuffer(gl.FRAMEBUFFER, shadowTargets.geometryFramebuffer);
@@ -352,15 +361,21 @@ function init() {
             gl.uniformMatrix4fv(gbuffer.locations.viewProj, false, viewProjMatrix);
             world.draw(visible, camPosition, gbuffer.locations.chunkOrigin);
 
-            // 2. one shadow ray per half resolution pixel, exactly once whatever the overdraw
-            gl.bindFramebuffer(gl.FRAMEBUFFER, shadowTargets.maskFramebuffer);
+            // 2. shadow mask: reused from the previous frame, or one shadow ray per half resolution pixel
+            const current = shadowTargets.current = 1 - shadowTargets.current;
+            gl.bindFramebuffer(gl.FRAMEBUFFER, shadowTargets.maskFramebuffers[current]);
             gl.disable(gl.DEPTH_TEST);
             gl.useProgram(shadow.program);
             gl.uniformMatrix4fv(shadow.locations.invViewProj, false, invViewProjMatrix);
+            gl.uniformMatrix4fv(shadow.locations.prevViewProj, false, prevViewProjMatrix);
             gl.uniform3fv(shadow.locations.lightDir, lightDir);
+            gl.uniform1i(shadow.locations.historyMask, 6 - current); // units 5 and 6 hold masks 0 and 1
+            gl.uniform1i(shadow.locations.frameIndex, frameIndex);
+            gl.uniform1i(shadow.locations.refreshAll, shadowTargets.historyValid ? 0 : 1);
             setShadowWindow(shadow);
             gl.drawArrays(gl.TRIANGLES, 0, 3);
             gl.enable(gl.DEPTH_TEST);
+            shadowTargets.historyValid = true;
 
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
             gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
@@ -373,6 +388,7 @@ function init() {
         gl.uniform3fv(color.locations.lightDir, lightDir);
         gl.uniform3fv(color.locations.camPosition, camPosition);
         gl.uniform1i(color.locations.halfResShadows, halfResShadows ? 1 : 0);
+        gl.uniform1i(color.locations.shadowMask, 5 + shadowTargets.current);
         gl.uniform2f(color.locations.maskScale,
             shadowTargets.width / gl.drawingBufferWidth, shadowTargets.height / gl.drawingBufferHeight);
         gl.uniform1f(color.locations.fogDensity, 1.2 / viewDistance()); // fog = 0.95 at the view distance
@@ -389,6 +405,8 @@ function init() {
         gl.drawArrays(gl.TRIANGLES, 0, 3);
 
         gpuTimer.end();
+        mat4.copy(prevViewProjMatrix, viewProjMatrix);
+        frameIndex++;
 
         frames++;
         const now = performance.now();
