@@ -198,7 +198,7 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", ...SKY_UNIFORMS, ...SHADOW_UNIFORMS]);
+        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", ...SKY_UNIFORMS, ...SHADOW_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
     const shadow = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, shadowFshader),
@@ -237,6 +237,8 @@ function init() {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.skyLUT, 7);
     }
+    gl.useProgram(color.program);
+    gl.uniform1i(color.locations.halfDepth, 3);
     gl.useProgram(shadow.program);
     gl.uniform1i(shadow.locations.halfDepth, 3);
     gl.uniform1i(shadow.locations.halfFace, 4);
@@ -248,8 +250,12 @@ function init() {
     function viewDistance() {
         return (world.viewRadius - 0.5) * CHUNK_SIZE;
     }
+    const NEAR = 0.1;
+    function farPlane() {
+        return viewDistance() * 1.5;
+    }
     function updateProjection() {
-        mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, 0.1, viewDistance() * 1.5);
+        mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, NEAR, farPlane());
     }
 
     function resize() {
@@ -443,6 +449,7 @@ function init() {
         gl.uniform3fv(color.locations.camPosition, camPosition);
         gl.uniform1i(color.locations.halfResShadows, halfResShadows ? 1 : 0);
         gl.uniform1i(color.locations.shadowMask, 5 + shadowTargets.current);
+        gl.uniform2f(color.locations.depthRange, NEAR, farPlane());
         gl.uniform2f(color.locations.maskScale,
             shadowTargets.width / gl.drawingBufferWidth, shadowTargets.height / gl.drawingBufferHeight);
         gl.uniform1f(color.locations.fogDensity, 1.2 / viewDistance()); // fog = 0.95 at the view distance

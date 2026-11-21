@@ -8,6 +8,8 @@ uniform vec3 camPosition;
 uniform bool halfResShadows;
 uniform sampler2D shadowMask; // written by shadow_fragment.glsl at half resolution
 uniform vec2 maskScale;       // mask size / screen size
+uniform sampler2D halfDepth;  // depth of the half resolution pass
+uniform vec2 depthRange;      // near and far planes
 uniform float fogDensity;     // set from the view distance, so that chunks appear in the fog
 
 in vec3 vAlbedo;
@@ -30,6 +32,12 @@ vec3 rayStart() {
     return p + vNormal * 0.01;
 }
 
+const float NEAR_FALLBACK = 40.0; // beyond, no fallback ray
+
+float linearDepth(float z) {
+    return depthRange.x * depthRange.y / (depthRange.y - z * (depthRange.y - depthRange.x));
+}
+
 // Shadow of this pixel from the half resolution mask: bilinear blend of the 4 nearest mask texels,
 // keeping only the ones on the same face plane, so shadows never leak across voxel edges.
 float maskShadow(vec3 toLight) {
@@ -39,19 +47,30 @@ float maskShadow(vec3 toLight) {
     ivec2 maxTexel = textureSize(shadowMask, 0) - 1;
     float plane = mod(floor(vPosition[vFace >> 1] + 0.5), 256.0);
 
-    float sum = 0.0, weightSum = 0.0;
+    float sum = 0.0, weightSum = 0.0, farthest = 0.0, anySum = 0.0, anyWeight = 0.0;
     for(int j = 0; j <= 1; j++) {
         for(int i = 0; i <= 1; i++) {
-            vec4 m = texelFetch(shadowMask, clamp(base + ivec2(i, j), ivec2(0), maxTexel), 0);
+            ivec2 texel = clamp(base + ivec2(i, j), ivec2(0), maxTexel);
+            vec4 m = texelFetch(shadowMask, texel, 0);
+            farthest = max(farthest, texelFetch(halfDepth, texel, 0).r);
+            float w = max(mix(1.0 - f.x, f.x, float(i)) * mix(1.0 - f.y, f.y, float(j)), 1e-3);
+            anySum += m.r * w;
+            anyWeight += w;
             if(int(m.g * 255.0 + 0.5) - 1 == vFace && floor(m.b * 255.0 + 0.5) == plane) {
-                float w = max(mix(1.0 - f.x, f.x, float(i)) * mix(1.0 - f.y, f.y, float(j)), 1e-3);
                 sum += m.r * w;
                 weightSum += w;
             }
         }
     }
-    // no mask texel on this surface (detail thinner than 2 pixels, silhouette): trace this pixel
     if(weightSum == 0.0) {
+        // No mask texel on this face plane. Far away, voxel faces are smaller than a pixel and every face touching a
+        // pixel runs this shader (antialiasing): the shadow of the neighbours is right enough there. A fragment behind
+        // all the surfaces around it will be covered (overdraw): no ray either. Nearby, it is a silhouette or a thin
+        // detail: trace the ray.
+        float dist = linearDepth(gl_FragCoord.z);
+        if(dist > NEAR_FALLBACK || dist > linearDepth(farthest) * 1.0002 + 0.05) {
+            return anySum / anyWeight;
+        }
         return castShadowRay(rayStart(), toLight);
     }
     return sum / weightSum;
