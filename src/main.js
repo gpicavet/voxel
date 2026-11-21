@@ -13,6 +13,7 @@ var skyVshader = require('./sky_vertex.glsl');
 var skyFshader = require('./sky_fragment.glsl');
 var skyLutFshader = require('./sky_lut_fragment.glsl');
 var atmosphereFshader = require('./atmosphere_fragment.glsl');
+var textureGenFshader = require('./texture_gen_fragment.glsl');
 
 // per second, so the speed no longer depends on the frame rate (same feel as before at 60 fps)
 const MOVE_SPEED = 60;
@@ -256,7 +257,7 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelTextures",
+        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals",
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
@@ -286,7 +287,8 @@ function init() {
     // clouds and light shafts need float render targets
     const atmosphereEnabled = floatTargets;
     createCloudNoiseTexture(gl, gl.TEXTURE8);
-    createVoxelTextures(gl, gl.TEXTURE13);
+    const textureGen = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, textureGenFshader), ["layer", "size"]);
+    createVoxelTextures(gl, textureGen, gl.TEXTURE13, gl.TEXTURE14);
     let cloudTime = 0;
 
 
@@ -295,7 +297,7 @@ function init() {
     vec3.set(camPosition, 0.5, 0.5, world.surfaceHeight(0, 0) + 25);
 
     // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 3 half depth, 4 half face, 5 and 6 shadow masks,
-    // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 voxel textures
+    // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 and 14 voxel textures (albedo, normals)
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.brickTex, 0);
@@ -315,7 +317,8 @@ function init() {
     gl.uniform1i(atmosphere.locations.halfDepth, 3);
     gl.useProgram(color.program);
     gl.uniform1i(color.locations.halfDepth, 3);
-    gl.uniform1i(color.locations.voxelTextures, 13);
+    gl.uniform1i(color.locations.voxelAlbedo, 13);
+    gl.uniform1i(color.locations.voxelNormals, 14);
     gl.useProgram(shadow.program);
     gl.uniform1i(shadow.locations.halfDepth, 3);
     gl.uniform1i(shadow.locations.halfFace, 4);

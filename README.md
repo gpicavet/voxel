@@ -6,7 +6,7 @@ The world is 28 800 x 28 800 voxels (450 x 450 chunks of 64^3) and 256 high: mou
 128 of underground with tunnels and caverns. Chunks are generated and meshed in web workers and loaded around the camera.
 
 Day and night cycle with a physical sky (Rayleigh and Mie scattering), sun and moon shadows, voxel clouds drifting with
-the wind and casting shadows, light shafts (god rays) and valley mist. Pixel-art textures (16 x 16) generated at startup.
+the wind and casting shadows, light shafts (god rays) and valley mist. Realistic textures (512 x 512, albedo and normal map) generated on the GPU at startup.
 
 Controls: arrows to move and turn, `z` / `s` to look up and down, `space` to blow up the terrain,
 `t` (held) to fast-forward time, `w` to change the weather, `g` to switch the light shafts,
