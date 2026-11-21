@@ -6,7 +6,8 @@ layout(location=0) in uint data;
 uniform mat4 viewProj;
 uniform vec3 chunkOrigin;
 
-out vec3 vColor;
+out vec3 vAlbedo;
+out float vAO;
 out vec3 vPosition;
 out vec3 vNormal;
 
@@ -18,10 +19,11 @@ const vec3 NORMALS[6] = vec3[6](
     vec3(0, 1, 0), vec3(0, -1, 0),
     vec3(0, 0, 1), vec3(0, 0, -1));
 
+// sRGB, converted to linear below
 const vec3 MATERIALS[3] = vec3[3](
-    vec3(0.5, 0.4, 0.3),  // earth
-    vec3(0.5, 0.5, 0.5),  // rock
-    vec3(0.1, 1.0, 0.2)); // grass
+    vec3(0.52, 0.40, 0.28),  // earth
+    vec3(0.52, 0.52, 0.54),  // rock
+    vec3(0.30, 0.62, 0.18)); // grass
 
 const float AO[4] = float[4](0.25, 0.5, 0.75, 1.0);
 
@@ -33,6 +35,7 @@ void main() {
 
     vPosition = chunkOrigin + local;
     vNormal = NORMALS[face];
-    vColor = MATERIALS[material] * AO[ao];
+    vAlbedo = pow(MATERIALS[material], vec3(2.2));
+    vAO = AO[ao];
     gl_Position = viewProj * vec4(vPosition, 1.0);
 }

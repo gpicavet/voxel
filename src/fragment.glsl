@@ -8,12 +8,18 @@ uniform usampler3D coarseTex;  // 1 texel = 8^3 voxels, 0 when they are all empt
 uniform vec3 lightDir; // Direction de la lumière (normalisée)
 uniform vec3 terrainOffset; // offset pour la texture
 uniform vec3 terrainDim; // dim pour la texture
+uniform vec3 camPosition;
 
-in vec3 vColor;
+in vec3 vAlbedo;
+in float vAO;
 in vec3 vPosition;
 in vec3 vNormal;
 
 out vec4 fragColor;
+
+@import ./common;
+
+const float FOG_DENSITY = 1.0 / 450.0;
 
 const int COARSE_POW = 3;
 const float COARSE = 8.0;
@@ -44,7 +50,7 @@ float castShadowRay(vec3 startPos, vec3 rd) {
             boxSize = COARSE;
         } else {
             if(texelFetch(terrainTex, cell, 0).r > 0u) {
-                return 0.2; // Ombre
+                return 0.0; // Ombre
             }
             boxMin = vec3(cell);
             boxSize = 1.0;
@@ -58,17 +64,21 @@ float castShadowRay(vec3 startPos, vec3 rd) {
 }
 
 void main() {
-    float ndotl = max(dot(vNormal, -lightDir), 0.0);
+    vec3 sunDir = -lightDir;
+    float ndotl = max(dot(vNormal, sunDir), 0.0);
 
     // faces turned away from the sun are in the shadow anyway: no ray
-    float shadow = ndotl > 0.0 ? castShadowRay(vPosition + vNormal * 1e-3, -lightDir) : 0.2;
+    float shadow = ndotl > 0.0 ? castShadowRay(vPosition + vNormal * 1e-3, sunDir) : 0.0;
 
-    vec3 lit = vColor * ndotl;
-    vec3 color = lit * 0.2f + lit * 0.8f * shadow;
+    // linear lighting: ambient (darkened by the occlusion) + sun (only partly, so creases stay readable in the light)
+    vec3 light = ambientLight(vNormal) * vAO + SUN_COLOR * ndotl * shadow * (0.5 + 0.5 * vAO);
+    vec3 color = vAlbedo * light;
 
-    //fog
-    float a = gl_FragCoord.z / gl_FragCoord.w * 0.001f;
-    color = color * (1.0f - a) + vec3(0.7f, 0.9f, 1) * a;
+    // fog takes the color of the sky behind the surface, so far terrain melts into the horizon
+    vec3 toSurface = vPosition - camPosition;
+    float dist = length(toSurface);
+    float fog = 1.0 - exp(-(dist * FOG_DENSITY) * (dist * FOG_DENSITY));
+    color = mix(color, skyColor(toSurface / dist, sunDir), fog);
 
-    fragColor = vec4(color, 1);
+    fragColor = vec4(toneMap(color), 1);
 }

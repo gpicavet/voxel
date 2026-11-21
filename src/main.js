@@ -1,9 +1,20 @@
 import { mat4, vec3 } from "gl-matrix";
+import { moveWithCollisions } from "./collision";
 import { Terrain } from "./terrain";
 var vshader = require('./vertex.glsl');
 var fshader = require('./fragment.glsl');
 var depthFshader = require('./depth_fragment.glsl');
+var skyVshader = require('./sky_vertex.glsl');
+var skyFshader = require('./sky_fragment.glsl');
 
+// per second, so the speed no longer depends on the frame rate (same feel as before at 60 fps)
+const MOVE_SPEED = 60;
+const TURN_SPEED = 0.6;
+const SUN_SPEED = 0.3;
+// the camera is a box: it cannot get closer than this to a voxel (keeps the near plane out of the walls)
+const CAMERA_HALF_SIZE = vec3.fromValues(0.3, 0.3, 0.3);
+// sharper on high density screens, capped because every pixel runs the shadow ray
+const MAX_PIXEL_RATIO = 2;
 
 let camTheta = 0, camPhi = 0;
 let camPosition = vec3.fromValues(0, 0, 30);
@@ -90,8 +101,6 @@ function createGpuTimer(gl) {
 function init() {
 
     var canvas = document.getElementById("gl-canvas");
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
     document.addEventListener('keydown', onkeydown, false);
     document.addEventListener('keyup', onkeyup, false);
 
@@ -110,9 +119,11 @@ function init() {
     // the same vertex shader in both programs, so the depth values match
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "lightDir", "terrainTex", "coarseTex", "terrainOffset", "terrainDim"]);
+        ["viewProj", "chunkOrigin", "lightDir", "camPosition", "terrainTex", "coarseTex", "terrainOffset", "terrainDim"]);
     const depth = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, depthFshader),
         ["viewProj", "chunkOrigin"]);
+    const sky = createProgram(gl, compileShader(gl, gl.VERTEX_SHADER, skyVshader), compileShader(gl, gl.FRAGMENT_SHADER, skyFshader),
+        ["invViewProj", "camPosition", "lightDir"]);
 
 
     const terrain = new Terrain(vec3.fromValues(9, 9, 1));
@@ -125,16 +136,30 @@ function init() {
     gl.uniform3fv(color.locations.terrainDim, terrain.size);
 
     var projMatrix = mat4.create();
-    mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, 0.1, 1000.0);
+
+    function resize() {
+        const ratio = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
+        canvas.style.width = window.innerWidth + "px";
+        canvas.style.height = window.innerHeight + "px";
+        canvas.width = Math.round(window.innerWidth * ratio);
+        canvas.height = Math.round(window.innerHeight * ratio);
+        gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+        mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, 0.1, 1000.0);
+    }
+    resize();
+    window.addEventListener('resize', resize);
 
     var viewMatrix = mat4.create();
     var viewProjMatrix = mat4.create();
+    var invViewProjMatrix = mat4.create();
     var rotateZMatrix = mat4.create();
     var camDir = vec3.create();
     var camAt = vec3.create();
     var lightDir = vec3.create();
+    var move = vec3.create();
 
     var angle = 0.0;
+    var lastTime = performance.now();
 
     const gpuTimer = createGpuTimer(gl);
     const statsElement = document.getElementById("stats");
@@ -152,20 +177,26 @@ function init() {
 
         gpuTimer.begin();
 
-        angle += 0.005;
+        const time = performance.now();
+        // capped so that a long pause (tab in the background) does not make a huge jump
+        const dt = Math.min((time - lastTime) / 1000, 0.1);
+        lastTime = time;
+
+        angle += SUN_SPEED * dt;
 
         if (keysDown["q"] || keysDown["ArrowLeft"]) {
-            camTheta += 0.01;
+            camTheta += TURN_SPEED * dt;
         }
         if (keysDown["d"] || keysDown["ArrowRight"]) {
-            camTheta -= 0.01;
+            camTheta -= TURN_SPEED * dt;
         }
         if (keysDown["z"]) {
-            camPhi += 0.01;
+            camPhi += TURN_SPEED * dt;
         }
         if (keysDown["s"]) {
-            camPhi -= 0.01;
+            camPhi -= TURN_SPEED * dt;
         }
+        camPhi = Math.max(-1.55, Math.min(1.55, camPhi)); // lookAt breaks when looking straight up or down
         vec3.set(camDir, Math.cos(camTheta) * Math.cos(camPhi), Math.sin(camTheta) * Math.cos(camPhi), Math.sin(camPhi));
 
         if (keysDown[" "]) {
@@ -176,11 +207,10 @@ function init() {
         }
 
 
-        if (keysDown["ArrowUp"]) {
-            vec3.scaleAndAdd(camPosition, camPosition, camDir, 1);
-        }
-        if (keysDown["ArrowDown"]) {
-            vec3.scaleAndAdd(camPosition, camPosition, camDir, -1);
+        const forward = (keysDown["ArrowUp"] ? 1 : 0) - (keysDown["ArrowDown"] ? 1 : 0);
+        if (forward !== 0) {
+            vec3.scale(move, camDir, forward * MOVE_SPEED * dt);
+            moveWithCollisions(terrain, camPosition, move, CAMERA_HALF_SIZE);
         }
 
         vec3.add(camAt, camPosition, camDir);
@@ -221,7 +251,18 @@ function init() {
         gl.useProgram(color.program);
         gl.uniformMatrix4fv(color.locations.viewProj, false, viewProjMatrix);
         gl.uniform3fv(color.locations.lightDir, lightDir);
+        gl.uniform3fv(color.locations.camPosition, camPosition);
         facesDrawn = terrain.draw(gl, visible, camPosition, color.locations.chunkOrigin);
+
+        // sky last, on the far plane: only the pixels the terrain left empty are shaded
+        mat4.invert(invViewProjMatrix, viewProjMatrix);
+        gl.useProgram(sky.program);
+        gl.uniformMatrix4fv(sky.locations.invViewProj, false, invViewProjMatrix);
+        gl.uniform3fv(sky.locations.camPosition, camPosition);
+        gl.uniform3fv(sky.locations.lightDir, lightDir);
+        gl.depthMask(false);
+        gl.depthFunc(gl.LEQUAL);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
 
         gpuTimer.end();
 
@@ -234,6 +275,8 @@ function init() {
                 (gpuMs !== null ? ` | GPU ${gpuMs.toFixed(2)} ms` : "") +
                 ` | chunks ${visibleChunks}/${terrain.chunks.length}` +
                 ` | ${(facesDrawn * 2 / 1e6).toFixed(2)} M triangles` +
+                ` | ${canvas.width}x${canvas.height}` +
+                ` | pos ${Array.from(camPosition, v => v.toFixed(1)).join(" ")}` +
                 ` | depth pre-pass ${depthPrepass ? "on" : "off"} (p)`;
             frames = 0;
             statsTime = now;
