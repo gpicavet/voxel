@@ -5,6 +5,8 @@ uniform vec3 sunDir;      // towards the sun
 uniform vec3 lightDir;    // direction of the main light (the sun, or the moon at night)
 uniform vec3 lightColor;  // that light, once through the atmosphere
 uniform float exposure;   // higher at night
+uniform bool rawOutput;   // linear HDR output, no tone mapping (reflection of the water)
+uniform float underwaterDensity; // > 0 when the camera is under the water: fog of the water per meter
 
 const float PI = 3.14159265;
 
@@ -45,7 +47,13 @@ float mistDepth(vec3 origin, vec3 dir, float dist) {
     return abs(k) < 1e-4 ? start * dist : start * (1.0 - exp(-k * dist)) / k;
 }
 
+// color of the water seen from inside, lit by the sky and the sun or moon
+vec3 underwaterColor() {
+    return vec3(0.004, 0.020, 0.026) * (ambientLight(vec3(0.0, 0.0, 1.0)) + lightColor * max(-lightDir.z, 0.0)) * 4.0;
+}
+
 vec3 toneMap(vec3 color) {
+    if(rawOutput) return color;
     color *= exposure;
     // ACES filmic curve (Narkowicz 2015 fit), then gamma
     color = clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), 0.0, 1.0);

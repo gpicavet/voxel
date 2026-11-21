@@ -3,7 +3,8 @@ precision highp float;
 precision highp int;
 
 // Generates one layer of the voxel textures (run once at startup, textures.js): realistic, tileable (every noise is
-// periodic over the texture), with a relief turned into a normal map. Layers: 0 earth, 1 rock, 2 grass, 3 snow.
+// periodic over the texture), with a relief turned into a normal map. Layers: 0 earth, 1 rock, 2 grass, 3 snow, 4 sand,
+// 5 water ripples (only its normal map is used, by water_fragment.glsl).
 
 uniform int layer;
 uniform float size; // texels per side
@@ -110,6 +111,24 @@ float material(vec2 uv, out vec3 albedo) {
         albedo *= 0.75 + 0.5 * blades;
         return height;
     }
+    if(layer == 4) {
+        // sand: fine grain, ripples, a few small pebbles and darker damp patches
+        float ripples = sin((uv.y + fbm(uv, vec2(3.0), 3) * 0.3) * 6.2831853 * 14.0) * 0.5 + 0.5;
+        float grain = vnoise(uv, vec2(256.0));
+        vec3 w = worley(uv, 36.0);
+        float pebble = smoothstep(0.25, 0.12, w.x) * step(0.9, w.z);
+        float height = ripples * 0.08 + grain * 0.05 + fbm(uv, vec2(8.0), 4) * 0.35 + pebble * 0.2;
+        albedo = mix(vec3(0.46, 0.40, 0.28), vec3(0.60, 0.53, 0.39), fbm(uv, vec2(10.0), 4) * 0.7 + grain * 0.3);
+        albedo *= 0.96 + 0.06 * ripples;
+        albedo = mix(albedo, vec3(0.35, 0.33, 0.30), pebble * 0.8);
+        return height;
+    }
+    if(layer == 5) {
+        // small waves: rounded crests in all directions
+        float height = fbm(uv, vec2(5.0), 5) * 0.65 + fbm(uv + 0.5, vec2(17.0), 3) * 0.35;
+        albedo = vec3(0.0);
+        return height;
+    }
     // snow: soft drifts, wind ripples, bluish hollows
     float drifts = fbm(uv, vec2(5.0), 5);
     float ripples = vnoise(uv, vec2(8.0, 48.0));
@@ -125,7 +144,7 @@ void main() {
     // normal from the relief (finite differences, wrapping around with the noise)
     float hx = material(uv + vec2(1.0 / size, 0.0), unused);
     float hy = material(uv + vec2(0.0, 1.0 / size), unused);
-    float strength = layer == 3 ? 2.0 : layer == 2 ? 5.0 : 8.0;
+    float strength = layer == 3 || layer == 4 ? 2.0 : layer == 2 ? 5.0 : layer == 5 ? 3.0 : 8.0;
     vec3 n = normalize(vec3((h - hx) * size * strength / 64.0, (h - hy) * size * strength / 64.0, 1.0));
     outAlbedo = vec4(albedo, 1.0);
     outNormal = vec4(n * 0.5 + 0.5, 1.0);

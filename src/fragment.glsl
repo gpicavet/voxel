@@ -13,7 +13,9 @@ uniform vec2 maskScale;       // mask size / screen size
 uniform sampler2D halfDepth;  // depth of the half resolution pass
 uniform vec2 depthRange;      // near and far planes
 uniform float fogDensity;     // set from the view distance, so that chunks appear in the fog
-uniform sampler2DArray voxelAlbedo;  // textures.js: 0 earth, 1 rock, 2 grass, 3 snow
+uniform sampler2DArray voxelAlbedo;  // textures.js: 0 earth, 1 rock, 2 grass, 3 snow, 4 sand
+uniform bool reflectionPass;  // rendering the mirrored scene for the water: nothing below the water, no mist
+uniform float seaLevel;
 uniform sampler2DArray voxelNormals; // tangent space normal maps of the same layers
 
 in float vAO;
@@ -111,9 +113,9 @@ void surface(out vec3 albedo, out vec3 normal) {
     bool top = vFace == 4, bottom = vFace == 5;
 
     // layer below and layer on top: grass voxels are earth under grass, snow voxels rock under snow
-    float base = vMaterial == 0 ? 0.0 : vMaterial == 1 ? 1.0 : vMaterial == 2 ? 0.0 : 1.0;
+    float base = vMaterial == 0 ? 0.0 : vMaterial == 1 ? 1.0 : vMaterial == 2 ? 0.0 : vMaterial == 3 ? 1.0 : 4.0;
     float cover = vMaterial == 2 ? 2.0 : vMaterial == 3 ? 3.0 : base;
-    float coverage = vMaterial < 2 || bottom ? 0.0 : top ? 1.0
+    float coverage = vMaterial < 2 || vMaterial == 4 || bottom ? 0.0 : top ? 1.0
         : fringe(uv.x * TEXTURE_TILE, vLocal.z, vMaterial == 2 ? 0.22 : 0.32);
 
     vec4 a = texture(voxelAlbedo, vec3(uv, base)), n = texture(voxelNormals, vec3(uv, base));
@@ -129,6 +131,7 @@ void surface(out vec3 albedo, out vec3 normal) {
 }
 
 void main() {
+    if(reflectionPass && vPosition.z < seaLevel - 0.12) discard; // under the water: not in the reflection
     vec3 toLight = -lightDir;
     float ndotl = max(dot(vNormal, toLight), 0.0);
     vec3 albedo, normal;
@@ -162,13 +165,15 @@ void main() {
     vec4 shafts = lightShaftsAt();
     color = mix(skyRadiance(vec3(0.0, 0.0, 1.0)) * 0.5, color, shafts.a);
     // valley mist, lit like the horizon in that direction
-    float mist = 1.0 - exp(-mistDepth(camPosition, viewDir, dist));
+    float mist = reflectionPass ? 0.0 : 1.0 - exp(-mistDepth(camPosition, viewDir, dist));
     color = mix(color, skyRadiance(vec3(viewDir.xy, 0.0)), mist);
     // distance fog with the color of the sky behind the surface: far terrain melts into the horizon, and chunks
     // appear in the fog rather than at a visible edge
     float d2 = (dist * fogDensity) * (dist * fogDensity);
     float fog = 1.0 - exp(-d2 * d2 * d2); // clear up to half the view distance, thick close to it
     color = mix(color, skyRadiance(viewDir), fog);
+    // camera under the water: everything fades into the water with the distance
+    if(underwaterDensity > 0.0) color = mix(color, underwaterColor(), 1.0 - exp(-dist * underwaterDensity));
     // sunlit haze last: it is in the air in front, not hidden by the fog that hides the far chunks
     color += shafts.rgb;
 

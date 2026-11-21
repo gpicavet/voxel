@@ -1,6 +1,6 @@
-import { CHUNK_SIZE, CZ_MAX, CZ_MIN, SEED } from './constants';
+import { CHUNK_SIZE, CZ_MAX, CZ_MIN, SEA_LEVEL, SEED } from './constants';
 import { createGenerator, P } from './generator';
-import { buildMesh, coarseFromBricks, packBricks } from './mesher';
+import { buildMesh, buildWaterMesh, coarseFromBricks, packBricks } from './mesher';
 import { faceConnectivity, uniformConnectivity } from './visibility';
 
 let generator = null;
@@ -29,12 +29,17 @@ export function runColumnTask({ id, cx, cy, mesh }) {
         } else {
             connectivity = uniformConnectivity(uniform);
         }
-        let chunkMesh = null;
+        let chunkMesh = null, waterMesh = null;
+        const origin = [cx * CHUNK_SIZE, cy * CHUNK_SIZE, cz * CHUNK_SIZE];
         if (mesh && uniform !== 0) {
-            chunkMesh = buildMesh(padded, heights, [cx * CHUNK_SIZE, cy * CHUNK_SIZE, cz * CHUNK_SIZE]);
+            chunkMesh = buildMesh(padded, heights, origin);
             transfer.push(chunkMesh.vertices.buffer);
         }
-        chunks.push({ cz, uniform, bricks, coarse, connectivity, mesh: chunkMesh });
+        if (mesh && uniform !== 1 && origin[2] < SEA_LEVEL) {
+            waterMesh = buildWaterMesh(padded, heights, origin);
+            if (waterMesh) transfer.push(waterMesh.vertices.buffer);
+        }
+        chunks.push({ cz, uniform, bricks, coarse, connectivity, mesh: chunkMesh, waterMesh });
     }
     return { result: { id, cx, cy, mesh, heights, chunks }, transfer };
 }

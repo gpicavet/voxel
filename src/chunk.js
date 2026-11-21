@@ -39,6 +39,9 @@ export class Chunk {
         this.nFaces = 0;
         this.faceFirst = new Int32Array(6);
         this.faceCount = new Int32Array(6);
+        this.waterVertexArray = null;
+        this.waterBuffer = null;
+        this.nWaterFaces = 0;
     }
 
     setData(uniform, bricks, coarse, connectivity) {
@@ -125,7 +128,41 @@ export class Chunk {
         this.nFaces = mesh.nFaces;
     }
 
+    /** water mesh (or null), drawn in its own transparent pass */
+    uploadWater(gl, mesh, indexBuffer) {
+        if (!mesh) {
+            this.nWaterFaces = 0;
+            return;
+        }
+        if (this.waterVertexArray == null) {
+            this.waterVertexArray = gl.createVertexArray();
+            this.waterBuffer = gl.createBuffer();
+            gl.bindVertexArray(this.waterVertexArray);
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.waterBuffer);
+            gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 4, 0);
+            gl.enableVertexAttribArray(0);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+            gl.bindVertexArray(null);
+        }
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.waterBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, mesh.vertices, gl.STATIC_DRAW);
+        this.nWaterFaces = mesh.nFaces;
+    }
+
+    drawWater(gl) {
+        if (this.nWaterFaces === 0) return;
+        gl.bindVertexArray(this.waterVertexArray);
+        gl.drawElements(gl.TRIANGLES, this.nWaterFaces * 6, gl.UNSIGNED_INT, 0);
+    }
+
     freeMesh(gl) {
+        if (this.waterVertexArray !== null) {
+            gl.deleteVertexArray(this.waterVertexArray);
+            gl.deleteBuffer(this.waterBuffer);
+            this.waterVertexArray = null;
+            this.waterBuffer = null;
+        }
+        this.nWaterFaces = 0;
         if (this.vertexArray !== null) {
             gl.deleteVertexArray(this.vertexArray);
             gl.deleteBuffer(this.vertexBuffer);

@@ -1,6 +1,6 @@
 #version 300 es
 
-// x, y, z in the chunk (7 bits each) | face direction (3 bits) | ambient occlusion (2 bits) | material (2 bits)
+// x, y, z in the chunk (7 bits each) | face direction (3 bits) | ambient occlusion (2 bits) | material (3 bits)
 layout(location=0) in uint data;
 
 uniform mat4 viewProj;
@@ -24,7 +24,7 @@ void main() {
     vec3 local = vec3(float(data & 127u), float((data >> 7) & 127u), float((data >> 14) & 127u));
     int face = int((data >> 21) & 7u);
     int ao = int((data >> 24) & 3u);
-    int material = int((data >> 26) & 3u);
+    int material = int((data >> 26) & 7u);
 
     vPosition = chunkOrigin + local;
     vNormal = NORMALS[face];

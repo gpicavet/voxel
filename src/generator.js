@@ -1,6 +1,6 @@
 import alea from 'alea';
 import { createNoise2D, createNoise3D } from 'simplex-noise';
-import { BEDROCK_TOP, CHUNK_SIZE, MAX_HEIGHT, WORLD_BOTTOM, WORLD_MAX_XY, WORLD_MIN_XY } from './constants';
+import { BEDROCK_TOP, CHUNK_SIZE, MAX_HEIGHT, SEA_LEVEL, WORLD_BOTTOM, WORLD_MAX_XY, WORLD_MIN_XY } from './constants';
 
 // Padded chunk: the chunk and one voxel of its neighbours on every side (what the mesher needs).
 export const P = CHUNK_SIZE + 2;
@@ -93,6 +93,7 @@ export function createGenerator(seed) {
     }
     function isCave(z, h, a, b, c) {
         if (z < BEDROCK_TOP) return false;                  // bedrock layers
+        if (h < SEA_LEVEL + 2 && z >= h - 5) return false;  // lake beds stay sealed: no tunnel opens under the water
         if (a * a + b * b < TUNNEL_WIDTH) return true;       // tunnels: where two noise surfaces cross
         return needsC(z, h) && c > CAVERN_THRESHOLD;         // large caverns, deep only
     }
