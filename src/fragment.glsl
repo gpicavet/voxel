@@ -4,6 +4,7 @@ precision highp int;
 precision lowp usampler3D;
 precision highp sampler2D;
 precision highp sampler3D;
+precision mediump sampler2DArray;
 
 uniform vec3 camPosition;
 uniform bool halfResShadows;
@@ -12,12 +13,14 @@ uniform vec2 maskScale;       // mask size / screen size
 uniform sampler2D halfDepth;  // depth of the half resolution pass
 uniform vec2 depthRange;      // near and far planes
 uniform float fogDensity;     // set from the view distance, so that chunks appear in the fog
+uniform sampler2DArray voxelTextures; // textures.js
 
-in vec3 vAlbedo;
 in float vAO;
 in vec3 vPosition;
 in vec3 vNormal;
 flat in int vFace;
+flat in int vMaterial;
+in vec3 vLocal;
 
 out vec4 fragColor;
 
@@ -82,6 +85,19 @@ vec2 maskShadow(vec3 toLight) {
     return sum / weightSum;
 }
 
+// color of the voxel face: a 16 x 16 texture per voxel, chosen from the material and the face
+// (layers of textures.js: 0 earth, 1 rock, 2 grass top, 3 grass side, 4 snow top, 5 snow side)
+vec3 albedo() {
+    bool top = vFace == 4, bottom = vFace == 5;
+    int layer = vMaterial == 0 ? 0
+        : vMaterial == 1 ? 1
+        : vMaterial == 2 ? (top ? 2 : bottom ? 0 : 3)
+        : (top ? 4 : bottom ? 1 : 5);
+    // texture coordinates along the face; on the sides, t is the height (the fringes hang from the top)
+    vec2 uv = vFace < 2 ? vLocal.yz : vFace < 4 ? vLocal.xz : vLocal.xy;
+    return texture(voxelTextures, vec3(uv, float(layer))).rgb; // sRGB texture: linear color
+}
+
 void main() {
     vec3 toLight = -lightDir;
     float ndotl = max(dot(vNormal, toLight), 0.0);
@@ -96,7 +112,7 @@ void main() {
     // linear lighting: ambient from the sky (darkened by the occlusion) + sun or moon (only partly darkened by the
     // occlusion, so creases stay readable in the light)
     vec3 light = ambientLight(vNormal) * vAO + lightColor * ndotl * shadow * (0.5 + 0.5 * vAO);
-    vec3 color = vAlbedo * light;
+    vec3 color = albedo() * light;
 
     vec3 toSurface = vPosition - camPosition;
     float dist = length(toSurface);

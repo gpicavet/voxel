@@ -2,6 +2,7 @@ import { mat4, vec3 } from "gl-matrix";
 import { moveWithCollisions } from "./collision";
 import { CHUNK_SIZE } from "./constants";
 import { createCloudNoiseTexture } from "./cloudNoise";
+import { createVoxelTextures } from "./textures";
 import { clockTime, createDaylight, daylight } from "./daylight";
 import { World } from "./world";
 var vshader = require('./vertex.glsl');
@@ -255,7 +256,7 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity",
+        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelTextures",
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
@@ -285,6 +286,7 @@ function init() {
     // clouds and light shafts need float render targets
     const atmosphereEnabled = floatTargets;
     createCloudNoiseTexture(gl, gl.TEXTURE8);
+    createVoxelTextures(gl, gl.TEXTURE13);
     let cloudTime = 0;
 
 
@@ -292,7 +294,8 @@ function init() {
     // start above the ground at the center of the world
     vec3.set(camPosition, 0.5, 0.5, world.surfaceHeight(0, 0) + 25);
 
-    // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 3 half depth, 4 half face, 5 and 6 shadow masks
+    // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 3 half depth, 4 half face, 5 and 6 shadow masks,
+    // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 voxel textures
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.brickTex, 0);
@@ -312,6 +315,7 @@ function init() {
     gl.uniform1i(atmosphere.locations.halfDepth, 3);
     gl.useProgram(color.program);
     gl.uniform1i(color.locations.halfDepth, 3);
+    gl.uniform1i(color.locations.voxelTextures, 13);
     gl.useProgram(shadow.program);
     gl.uniform1i(shadow.locations.halfDepth, 3);
     gl.uniform1i(shadow.locations.halfFace, 4);
