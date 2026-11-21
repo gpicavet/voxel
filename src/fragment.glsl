@@ -4,7 +4,6 @@ precision highp int;
 precision lowp usampler3D;
 precision highp sampler2D;
 
-uniform vec3 lightDir; // Direction de la lumière (normalisée)
 uniform vec3 camPosition;
 uniform bool halfResShadows;
 uniform sampler2D shadowMask; // written by shadow_fragment.glsl at half resolution
@@ -33,7 +32,7 @@ vec3 rayStart() {
 
 // Shadow of this pixel from the half resolution mask: bilinear blend of the 4 nearest mask texels,
 // keeping only the ones on the same face plane, so shadows never leak across voxel edges.
-float maskShadow(vec3 sunDir) {
+float maskShadow(vec3 toLight) {
     vec2 h = gl_FragCoord.xy * maskScale - 0.5;
     vec2 f = fract(h);
     ivec2 base = ivec2(floor(h));
@@ -53,31 +52,37 @@ float maskShadow(vec3 sunDir) {
     }
     // no mask texel on this surface (detail thinner than 2 pixels, silhouette): trace this pixel
     if(weightSum == 0.0) {
-        return castShadowRay(rayStart(), sunDir);
+        return castShadowRay(rayStart(), toLight);
     }
     return sum / weightSum;
 }
 
 void main() {
-    vec3 sunDir = -lightDir;
-    float ndotl = max(dot(vNormal, sunDir), 0.0);
+    vec3 toLight = -lightDir;
+    float ndotl = max(dot(vNormal, toLight), 0.0);
 
-    // faces turned away from the sun are in the shadow anyway: no ray
+    // faces turned away from the light are in the shadow anyway: no ray
     float shadow = 0.0;
     if(ndotl > 0.0) {
-        shadow = halfResShadows ? maskShadow(sunDir) : castShadowRay(rayStart(), sunDir);
+        shadow = halfResShadows ? maskShadow(toLight) : castShadowRay(rayStart(), toLight);
     }
 
-    // linear lighting: ambient (darkened by the occlusion) + sun (only partly, so creases stay readable in the light)
-    vec3 light = ambientLight(vNormal) * vAO + SUN_COLOR * ndotl * shadow * (0.5 + 0.5 * vAO);
+    // linear lighting: ambient from the sky (darkened by the occlusion) + sun or moon (only partly darkened by the
+    // occlusion, so creases stay readable in the light)
+    vec3 light = ambientLight(vNormal) * vAO + lightColor * ndotl * shadow * (0.5 + 0.5 * vAO);
     vec3 color = vAlbedo * light;
 
-    // fog takes the color of the sky behind the surface, so far terrain melts into the horizon
     vec3 toSurface = vPosition - camPosition;
     float dist = length(toSurface);
+    vec3 viewDir = toSurface / dist;
+    // valley mist, lit like the horizon in that direction
+    float mist = 1.0 - exp(-mistDepth(camPosition, viewDir, dist));
+    color = mix(color, skyRadiance(vec3(viewDir.xy, 0.0)), mist);
+    // distance fog with the color of the sky behind the surface: far terrain melts into the horizon, and chunks
+    // appear in the fog rather than at a visible edge
     float d2 = (dist * fogDensity) * (dist * fogDensity);
     float fog = 1.0 - exp(-d2 * d2 * d2); // clear up to half the view distance, thick close to it
-    color = mix(color, skyColor(toSurface / dist, sunDir), fog);
+    color = mix(color, skyRadiance(viewDir), fog);
 
     fragColor = vec4(toneMap(color), 1);
 }

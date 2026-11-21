@@ -1,6 +1,7 @@
 import { mat4, vec3 } from "gl-matrix";
 import { moveWithCollisions } from "./collision";
 import { CHUNK_SIZE } from "./constants";
+import { clockTime, createDaylight, daylight } from "./daylight";
 import { World } from "./world";
 var vshader = require('./vertex.glsl');
 var fshader = require('./fragment.glsl');
@@ -8,15 +9,20 @@ var gbufferFshader = require('./gbuffer_fragment.glsl');
 var shadowFshader = require('./shadow_fragment.glsl');
 var skyVshader = require('./sky_vertex.glsl');
 var skyFshader = require('./sky_fragment.glsl');
+var skyLutFshader = require('./sky_lut_fragment.glsl');
 
 // per second, so the speed no longer depends on the frame rate (same feel as before at 60 fps)
 const MOVE_SPEED = 60;
 const TURN_SPEED = 0.6;
-const SUN_SPEED = 0.003; // slow: the shadows of the previous frames stay valid and are reused
+const SUN_SPEED = 0.003; // rad/s of hour angle (a day in 35 min); slow: the shadows of the previous frames stay valid
+const FAST_TIME = 200;    // time speed while t is held
+const SKY_LUT_SIZE = [256, 128];
 // the camera is a box: it cannot get closer than this to a voxel (keeps the near plane out of the walls)
 const CAMERA_HALF_SIZE = vec3.fromValues(0.3, 0.3, 0.3);
 // sharper on high density screens, capped because every pixel runs the shadow ray
 const MAX_PIXEL_RATIO = 2;
+// uniforms of common.glsl
+const SKY_UNIFORMS = ["skyLUT", "sunDir", "lightDir", "lightColor", "exposure"];
 // uniforms of shadow.glsl
 const SHADOW_UNIFORMS = ["brickTex", "coarseTex", "windowMin", "windowSize", "brickOrigin", "coarseOrigin"];
 
@@ -192,13 +198,29 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "lightDir", "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", ...SHADOW_UNIFORMS]);
+        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", ...SKY_UNIFORMS, ...SHADOW_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
     const shadow = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, shadowFshader),
         ["invViewProj", "lightDir", "halfDepth", "halfFace", "historyMask", "prevViewProj", "frameIndex", "refreshAll", ...SHADOW_UNIFORMS]);
     const sky = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, skyFshader),
-        ["invViewProj", "camPosition", "lightDir"]);
+        ["invViewProj", "camPosition", "moonDir", "sunDiskColor", "moonDiskColor", "starVisibility", ...SKY_UNIFORMS]);
+    const skyLut = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, skyLutFshader),
+        ["sunDir", "moonDir", "moonSky", "lutSize"]);
+
+    // sky radiance texture (unit 7): half floats when they can be rendered to
+    const floatTargets = !!gl.getExtension("EXT_color_buffer_float");
+    gl.activeTexture(gl.TEXTURE7);
+    const skyLutTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, skyLutTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT); // azimuth
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, floatTargets ? gl.RGBA16F : gl.RGBA8, SKY_LUT_SIZE[0], SKY_LUT_SIZE[1]);
+    gl.activeTexture(gl.TEXTURE0);
+    const skyLutFramebuffer = createFramebuffer(gl, skyLutTexture, null);
+    let skyLutAngle = null;
 
 
     const world = new World(gl);
@@ -211,6 +233,11 @@ function init() {
         gl.uniform1i(program.locations.brickTex, 0);
         gl.uniform1i(program.locations.coarseTex, 1);
     }
+    for (const program of [color, sky]) {
+        gl.useProgram(program.program);
+        gl.uniform1i(program.locations.skyLUT, 7);
+    }
+    gl.useProgram(shadow.program);
     gl.uniform1i(shadow.locations.halfDepth, 3);
     gl.uniform1i(shadow.locations.halfFace, 4);
 
@@ -246,14 +273,21 @@ function init() {
     var invViewProjMatrix = mat4.create();
     var prevViewProjMatrix = mat4.create();
     var frameIndex = 0;
-    var rotateZMatrix = mat4.create();
     var camDir = vec3.create();
     var camAt = vec3.create();
-    var lightDir = vec3.create();
     var move = vec3.create();
 
-    var angle = 0.0;
+    var hourAngle = -1.0; // about 8 in the morning
+    var light = createDaylight();
+    var wasNight = null;
     var lastTime = performance.now();
+
+    function setSky(program) {
+        gl.uniform3fv(program.locations.sunDir, light.sunDir);
+        gl.uniform3fv(program.locations.lightDir, light.lightDir);
+        gl.uniform3fv(program.locations.lightColor, light.lightColor);
+        gl.uniform1f(program.locations.exposure, light.exposure);
+    }
 
     function setShadowWindow(program) {
         gl.uniform3fv(program.locations.windowMin, world.windowMin);
@@ -283,7 +317,15 @@ function init() {
         const dt = Math.min((time - lastTime) / 1000, 0.1);
         lastTime = time;
 
-        angle += SUN_SPEED * dt;
+        const timeScale = keysDown["t"] ? FAST_TIME : 1;
+        hourAngle += SUN_SPEED * dt * timeScale;
+        daylight(light, hourAngle);
+        const night = light.sunDir[2] < -0.05; // the moon is the main light (see daylight.js)
+        // shadows of the previous frames are wrong when time runs fast, or when the moon takes over
+        if (timeScale > 1 || night !== wasNight) {
+            maskHistoryStale = true;
+        }
+        wasNight = night;
 
         if (keysDown["q"] || keysDown["ArrowLeft"]) {
             camTheta += TURN_SPEED * dt;
@@ -320,11 +362,6 @@ function init() {
             camAt,
             vec3.fromValues(0, 0, 1));
         mat4.multiply(viewProjMatrix, projMatrix, viewMatrix);
-
-        mat4.fromZRotation(rotateZMatrix, angle);
-        vec3.set(lightDir, -1, -1, -1);
-        vec3.normalize(lightDir, lightDir);
-        vec3.transformMat4(lightDir, lightDir, rotateZMatrix);
 
         mat4.invert(invViewProjMatrix, viewProjMatrix);
 
@@ -368,7 +405,7 @@ function init() {
             gl.useProgram(shadow.program);
             gl.uniformMatrix4fv(shadow.locations.invViewProj, false, invViewProjMatrix);
             gl.uniformMatrix4fv(shadow.locations.prevViewProj, false, prevViewProjMatrix);
-            gl.uniform3fv(shadow.locations.lightDir, lightDir);
+            gl.uniform3fv(shadow.locations.lightDir, light.lightDir);
             gl.uniform1i(shadow.locations.historyMask, 6 - current); // units 5 and 6 hold masks 0 and 1
             gl.uniform1i(shadow.locations.frameIndex, frameIndex);
             gl.uniform1i(shadow.locations.refreshAll, shadowTargets.historyValid ? 0 : 1);
@@ -381,11 +418,28 @@ function init() {
             gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
         }
 
+        // sky radiance texture, when the sun has moved
+        if (skyLutAngle === null || Math.abs(hourAngle - skyLutAngle) > 0.002) {
+            skyLutAngle = hourAngle;
+            gl.bindFramebuffer(gl.FRAMEBUFFER, skyLutFramebuffer);
+            gl.viewport(0, 0, SKY_LUT_SIZE[0], SKY_LUT_SIZE[1]);
+            gl.disable(gl.DEPTH_TEST);
+            gl.useProgram(skyLut.program);
+            gl.uniform3fv(skyLut.locations.sunDir, light.sunDir);
+            gl.uniform3fv(skyLut.locations.moonDir, light.moonDir);
+            gl.uniform1f(skyLut.locations.moonSky, light.moonSky);
+            gl.uniform2f(skyLut.locations.lutSize, SKY_LUT_SIZE[0], SKY_LUT_SIZE[1]);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            gl.enable(gl.DEPTH_TEST);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+        }
+
         // 3. full resolution color, shadows read from the mask (or traced per pixel)
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         gl.useProgram(color.program);
         gl.uniformMatrix4fv(color.locations.viewProj, false, viewProjMatrix);
-        gl.uniform3fv(color.locations.lightDir, lightDir);
+        setSky(color);
         gl.uniform3fv(color.locations.camPosition, camPosition);
         gl.uniform1i(color.locations.halfResShadows, halfResShadows ? 1 : 0);
         gl.uniform1i(color.locations.shadowMask, 5 + shadowTargets.current);
@@ -399,7 +453,11 @@ function init() {
         gl.useProgram(sky.program);
         gl.uniformMatrix4fv(sky.locations.invViewProj, false, invViewProjMatrix);
         gl.uniform3fv(sky.locations.camPosition, camPosition);
-        gl.uniform3fv(sky.locations.lightDir, lightDir);
+        setSky(sky);
+        gl.uniform3fv(sky.locations.moonDir, light.moonDir);
+        gl.uniform3fv(sky.locations.sunDiskColor, vec3.scale(vec3.create(), light.sunColor, 40));
+        gl.uniform3fv(sky.locations.moonDiskColor, vec3.scale(vec3.create(), light.moonColor, 25));
+        gl.uniform1f(sky.locations.starVisibility, light.starVisibility);
         gl.depthMask(false);
         gl.depthFunc(gl.LEQUAL);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -423,7 +481,8 @@ function init() {
                 ` | ${(facesDrawn * 2 / 1e6).toFixed(2)} M triangles` +
                 ` | ${canvas.width}x${canvas.height}` +
                 ` | pos ${Array.from(camPosition, v => v.toFixed(1)).join(" ")}` +
-                ` | shadows ${halfResShadows ? "half" : "full"} res (h)`;
+                ` | shadows ${halfResShadows ? "half" : "full"} res (h)` +
+                ` | ${clockTime(hourAngle)} (t: fast)`;
             frames = 0;
             statsTime = now;
         }
