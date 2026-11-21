@@ -2,12 +2,38 @@ import alea from 'alea';
 import { vec3 } from "gl-matrix";
 import { createNoise3D } from "simplex-noise";
 import { Chunk } from "./chunk";
+import { aabbInFrustum, frustumPlanes } from "./utils";
+
+// One texel of the coarse occupancy texture covers 8^3 voxels: shadow rays jump over empty blocks
+export const COARSE_POW = 3;
 
 export class Terrain {
     constructor(dim) {
         this.dim = dim;
         this.chunks = [];
+        // texture coordinates = world coordinates + offset
+        this.offset = [0, 1, 2].map(i => Chunk.SIZE * Math.floor(dim[i] / 2));
+        this.size = [0, 1, 2].map(i => Chunk.SIZE * dim[i]);
         this.voxelTexture = null;
+        this.coarseTexture = null;
+        this.indexBuffer = null;
+        this.indexCapacity = 0; // in faces
+        this.planes = new Float32Array(24);
+        this.visible = [];
+    }
+
+    chunkAt(cx, cy, cz) {
+        return this.chunks[(cx * this.dim[1] + cy) * this.dim[2] + cz];
+    }
+
+    /** voxel at world coordinates: below the world is solid, around it is empty */
+    getVoxel(wx, wy, wz) {
+        const tx = wx + this.offset[0], ty = wy + this.offset[1], tz = wz + this.offset[2];
+        if (tz < 0) return 1;
+        if (tx < 0 || ty < 0 || tx >= this.size[0] || ty >= this.size[1] || tz >= this.size[2]) return 0;
+        const mask = Chunk.SIZE - 1;
+        return this.chunkAt(tx >> Chunk.SIZE_POW, ty >> Chunk.SIZE_POW, tz >> Chunk.SIZE_POW)
+            .getVoxel(tx & mask, ty & mask, tz & mask);
     }
 
     init(gl) {
@@ -15,117 +41,122 @@ export class Terrain {
 
         console.log("generating chunks")
 
-        const cx = Math.floor(this.dim[0] / 2);
-        const cy = Math.floor(this.dim[1] / 2);
-        const cz = Math.floor(this.dim[2] / 2);
-
-        this.chunks = new Array(this.dim[0]);
+        const c = [0, 1, 2].map(i => Math.floor(this.dim[i] / 2));
+        this.chunks = [];
         for (var x = 0; x < this.dim[0]; x++) {
-            this.chunks[x] = new Array(this.dim[1]);
             for (var y = 0; y < this.dim[1]; y++) {
-                this.chunks[x][y] = new Array(this.dim[2]);
                 for (var z = 0; z < this.dim[2]; z++) {
                     const chunk = new Chunk(
-                        vec3.fromValues((x - cx) << Chunk.SIZE_POW, (y - cy) << Chunk.SIZE_POW, (z - cz) << Chunk.SIZE_POW));
-                    this.chunks[x][y][z] = chunk;
+                        vec3.fromValues((x - c[0]) << Chunk.SIZE_POW, (y - c[1]) << Chunk.SIZE_POW, (z - c[2]) << Chunk.SIZE_POW));
                     chunk.init(noise3D);
-                    chunk.createArray(gl);
+                    this.chunks.push(chunk);
                 }
             }
         }
 
-        console.log("generating 3D texture")
-
-        gl.activeTexture(gl.TEXTURE0);
-
-        this.voxelTexture = gl.createTexture();
-        gl.bindTexture(gl.TEXTURE_3D, this.voxelTexture);
-
-        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
-
-        const terrainData = new Uint8Array(this.dim[0] * Chunk.SIZE * this.dim[1] * Chunk.SIZE * this.dim[2] * Chunk.SIZE);
-        var offs = 0;
-
-        // Charger les données du terrain dans la texture 3D
-        for (var z = 0; z < this.dim[2] * Chunk.SIZE; z++) {
-            for (var y = 0; y < this.dim[1] * Chunk.SIZE; y++) {
-                for (var x = 0; x < this.dim[0] * Chunk.SIZE; x++) {
-                    const cz = (z >> Chunk.SIZE_POW);
-                    const cy = (y >> Chunk.SIZE_POW);
-                    const cx = (x >> Chunk.SIZE_POW);
-                    const vx = x & (Chunk.SIZE - 1);
-                    const vy = y & (Chunk.SIZE - 1);
-                    const vz = z & (Chunk.SIZE - 1);
-                    terrainData[offs++] = this.chunks[cx][cy][cz].getVoxel(vx, vy, vz);
-                }
-            }
+        // meshing needs the neighbours, so it starts once every chunk is generated
+        console.log("meshing chunks")
+        this.indexBuffer = gl.createBuffer();
+        for (const chunk of this.chunks) {
+            this.remesh(gl, chunk);
         }
 
-        gl.texImage3D(gl.TEXTURE_3D, 0,
-            gl.R8UI,
-            this.dim[0] * Chunk.SIZE, this.dim[1] * Chunk.SIZE, this.dim[2] * Chunk.SIZE,
-            0, gl.RED_INTEGER, gl.UNSIGNED_BYTE,
-            terrainData);
+        console.log("generating 3D textures")
+        this.voxelTexture = createVoxelTexture(gl, gl.TEXTURE0, this.size[0], this.size[1], this.size[2]);
+        this.coarseTexture = createVoxelTexture(gl, gl.TEXTURE1,
+            this.size[0] >> COARSE_POW, this.size[1] >> COARSE_POW, this.size[2] >> COARSE_POW);
+        this.updateTexture(this.chunks, gl);
     }
 
+    remesh(gl, chunk) {
+        const vertices = chunk.buildMesh(this);
+        this.ensureIndexCapacity(gl, chunk.nFaces);
+        chunk.upload(gl, vertices, this.indexBuffer);
+    }
+
+    /** grow the index buffer shared by all chunks: 2 triangles (6 indices) per face of 4 vertices */
+    ensureIndexCapacity(gl, nFaces) {
+        if (nFaces <= this.indexCapacity) return;
+        let capacity = Math.max(1 << 14, this.indexCapacity);
+        while (capacity < nFaces) capacity *= 2;
+
+        const indices = new Uint32Array(capacity * 6);
+        for (let q = 0; q < capacity; q++) {
+            const v = q * 4, i = q * 6;
+            indices[i] = v; indices[i + 1] = v + 1; indices[i + 2] = v + 2;
+            indices[i + 3] = v + 2; indices[i + 4] = v + 3; indices[i + 5] = v;
+        }
+        // the buffer object is kept, so the vertex arrays already pointing at it see the new content
+        gl.bindVertexArray(null);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+        this.indexCapacity = capacity;
+    }
+
+    /** upload the voxels of the chunks into the fine and coarse 3D textures */
     updateTexture(chunks, gl) {
         console.log("updating 3D texture")
 
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_3D, this.voxelTexture);
+        const S = Chunk.SIZE, POW = Chunk.SIZE_POW, CS = S >> COARSE_POW;
+        const fine = new Uint8Array(S * S * S);
+        const coarse = new Uint8Array(CS * CS * CS);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
-
-        // Charger les données du terrain dans la texture 3D
-        for (var chunk of chunks) {
-            const terrainData = new Uint8Array(Chunk.SIZE * Chunk.SIZE * Chunk.SIZE);
-            var offs = 0;
-
-            for (var z = 0; z < Chunk.SIZE; z++) {
-                for (var y = 0; y < Chunk.SIZE; y++) {
-                    for (var x = 0; x < Chunk.SIZE; x++) {
-                        terrainData[offs++] = chunk.getVoxel(x, y, z);
+        for (const chunk of chunks) {
+            coarse.fill(0);
+            let offs = 0;
+            // texture layout: x varies fastest
+            for (let z = 0; z < S; z++) {
+                for (let y = 0; y < S; y++) {
+                    for (let x = 0; x < S; x++) {
+                        const v = chunk.voxels[(((x << POW) + y) << POW) + z];
+                        fine[offs++] = v;
+                        if (v) {
+                            coarse[(((z >> COARSE_POW) * CS) + (y >> COARSE_POW)) * CS + (x >> COARSE_POW)] = 1;
+                        }
                     }
                 }
             }
-            gl.texSubImage3D(gl.TEXTURE_3D, 0,
-                chunk.pos[0] + Math.floor(this.dim[0] / 2) * Chunk.SIZE,
-                chunk.pos[1] + Math.floor(this.dim[1] / 2) * Chunk.SIZE,
-                chunk.pos[2] + Math.floor(this.dim[2] / 2) * Chunk.SIZE,
-                Chunk.SIZE, Chunk.SIZE, Chunk.SIZE,
-                gl.RED_INTEGER, gl.UNSIGNED_BYTE,
-                terrainData);
+
+            const tx = chunk.pos[0] + this.offset[0], ty = chunk.pos[1] + this.offset[1], tz = chunk.pos[2] + this.offset[2];
+
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_3D, this.voxelTexture);
+            gl.texSubImage3D(gl.TEXTURE_3D, 0, tx, ty, tz, S, S, S, gl.RED_INTEGER, gl.UNSIGNED_BYTE, fine);
+
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_3D, this.coarseTexture);
+            gl.texSubImage3D(gl.TEXTURE_3D, 0, tx >> COARSE_POW, ty >> COARSE_POW, tz >> COARSE_POW,
+                CS, CS, CS, gl.RED_INTEGER, gl.UNSIGNED_BYTE, coarse);
         }
-
-
+        gl.activeTexture(gl.TEXTURE0);
     }
 
-    intersection(from, dir) {
-        var chunksSortedByDist = [];
-        for (var x = 0; x < this.dim[0]; x++) {
-            for (var y = 0; y < this.dim[1]; y++) {
-                for (var z = 0; z < this.dim[2]; z++) {
-                    const chunk = this.chunks[x][y][z];
-                    const res = chunk.bbIntersectionWithRay(from, dir);
-                    //console.log(chunk.pos[0], chunk.pos[1], chunk.pos[2], " : ", res[0], res[1], res[2]);
-                    if (res.dist !== Infinity && res.dist >= 0) {
-                        chunksSortedByDist.push({ chunk, res });
-                    }
-                }
-            }
-        }
-        chunksSortedByDist.sort((c1, c2) => c1.res.dist - c2.res.dist);
-
-        for (var chunk of chunksSortedByDist) {
-            const res = chunk.chunk.voxelIntersection(from, dir);
-            if (res) {
-                return { chunk: chunk.chunk, res };
-            }
+    /**
+     * First solid voxel along the ray (voxel traversal, Amanatides & Woo).
+     * @returns {{point, dist}} the point where the ray enters the voxel, or null
+     */
+    intersection(from, dir, maxDist = 500) {
+        const cell = [Math.floor(from[0]), Math.floor(from[1]), Math.floor(from[2])];
+        const step = [], tDelta = [], tMax = [];
+        for (let i = 0; i < 3; i++) {
+            step[i] = Math.sign(dir[i]);
+            tDelta[i] = dir[i] !== 0 ? Math.abs(1 / dir[i]) : Infinity;
+            tMax[i] = dir[i] > 0 ? (cell[i] + 1 - from[i]) * tDelta[i]
+                : dir[i] < 0 ? (from[i] - cell[i]) * tDelta[i]
+                    : Infinity;
         }
 
+        let t = 0;
+        while (t <= maxDist) {
+            if (this.getVoxel(cell[0], cell[1], cell[2]) > 0) {
+                return { dist: t, point: [from[0] + dir[0] * t, from[1] + dir[1] * t, from[2] + dir[2] * t] };
+            }
+            const a = tMax[0] < tMax[1] ? (tMax[0] < tMax[2] ? 0 : 2) : (tMax[1] < tMax[2] ? 1 : 2);
+            t = tMax[a];
+            cell[a] += step[a];
+            tMax[a] += tDelta[a];
+        }
         return null;
     }
 
@@ -133,51 +164,58 @@ export class Terrain {
         if (!center)
             return;
 
-        var chunksInter = [];
-        for (var x = 0; x < this.dim[0]; x++) {
-            for (var y = 0; y < this.dim[1]; y++) {
-                for (var z = 0; z < this.dim[2]; z++) {
-                    const chunk = this.chunks[x][y][z];
+        const changed = this.chunks.filter(chunk => chunk.intersectsSphere(center, radius) && chunk.boom(center, radius));
+        if (changed.length === 0)
+            return;
 
-                    if (chunk.bbIntersectionWithSphere(center, radius)) {
-                        const res = chunk.boom(center, 10);
-                        if (res) {
-                            chunk.createArray(gl);
-                        }
-                    }
-                }
+        // faces and ambient occlusion also depend on the voxels next to the removed ones
+        for (const chunk of this.chunks) {
+            if (chunk.intersectsSphere(center, radius + 2)) {
+                this.remesh(gl, chunk);
             }
         }
-
-        if (chunksInter.length > 0)
-            this.updateTexture(chunksInter, gl);
-
+        this.updateTexture(changed, gl);
     }
 
-    draw(gl, camPosition) {
-        //we render chunk from the nearest to the farthest, so we better use the depth buffer to limit fragment shader useless overdraw
-        //TODO: dont render chunks outside camera frustrum
-        var chunkSortedByDist = [];
-        for (var x = 0; x < this.dim[0]; x++) {
-            for (var y = 0; y < this.dim[1]; y++) {
-                for (var z = 0; z < this.dim[2]; z++) {
-                    chunkSortedByDist.push(this.chunks[x][y][z]);
-                }
+    /**
+     * Chunks inside the camera frustum, from the nearest to the farthest
+     * (front to back limits overdraw in the depth pre-pass).
+     */
+    cull(viewProj, camPosition) {
+        frustumPlanes(this.planes, viewProj);
+        const visible = this.visible;
+        visible.length = 0;
+        for (const chunk of this.chunks) {
+            if (chunk.nFaces > 0 && aabbInFrustum(this.planes, chunk.aabbMin, chunk.aabbMax)) {
+                chunk.camDist2 = vec3.sqrDist(chunk.centerPos, camPosition);
+                visible.push(chunk);
             }
         }
-
-        chunkSortedByDist.sort((c1, c2) => {
-            const c1Center = c1.center();
-            const c2Center = c2.center();
-            const c1CenterToCam = vec3.fromValues(camPosition[0] - c1Center[0], camPosition[1] - c1Center[1], camPosition[2] - c1Center[2]);
-            const c2CenterToCam = vec3.fromValues(camPosition[0] - c2Center[0], camPosition[1] - c2Center[1], camPosition[2] - c2Center[2]);
-            const c1dist2 = vec3.dot(c1CenterToCam, c1CenterToCam);
-            const c2dist2 = vec3.dot(c2CenterToCam, c2CenterToCam);
-            return c1dist2 - c2dist2;
-        });
-
-        for (const chunk of chunkSortedByDist) {
-            chunk.draw(gl);
-        }
+        visible.sort((c1, c2) => c1.camDist2 - c2.camDist2);
+        return visible;
     }
+
+    /** @returns the number of faces drawn */
+    draw(gl, chunks, camPosition, chunkOriginLocation) {
+        let faces = 0;
+        for (const chunk of chunks) {
+            gl.uniform3fv(chunkOriginLocation, chunk.pos);
+            faces += chunk.draw(gl, camPosition);
+        }
+        gl.bindVertexArray(null);
+        return faces;
+    }
+}
+
+function createVoxelTexture(gl, unit, w, h, d) {
+    gl.activeTexture(unit);
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_3D, texture);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+    gl.texStorage3D(gl.TEXTURE_3D, 1, gl.R8UI, w, h, d);
+    return texture;
 }

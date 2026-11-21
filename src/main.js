@@ -1,20 +1,90 @@
 import { mat4, vec3 } from "gl-matrix";
-import { Chunk } from './chunk';
 import { Terrain } from "./terrain";
 var vshader = require('./vertex.glsl');
 var fshader = require('./fragment.glsl');
+var depthFshader = require('./depth_fragment.glsl');
 
 
 let camTheta = 0, camPhi = 0;
 let camPosition = vec3.fromValues(0, 0, 30);
 let keysDown = {};
+// Off by default: with the cheap shadow rays and the front to back order, the pre-pass costs more
+// vertex work than it saves (5-15 % slower on an M3 Pro). Worth it again if the fragment shader gets heavier.
+let depthPrepass = false;
 
 function onkeydown(event) {
     keysDown[event.key] = true;
+    if (event.key === "p") {
+        depthPrepass = !depthPrepass;
+    }
 }
 
 function onkeyup(event) {
     delete keysDown[event.key];
+}
+
+function compileShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source.trim());
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        throw new Error((type === gl.VERTEX_SHADER ? "Vertex" : "Fragment") + " shader error : " + gl.getShaderInfoLog(shader));
+    }
+    return shader;
+}
+
+function createProgram(gl, vertexShader, fragmentShader, uniforms) {
+    const program = gl.createProgram();
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        throw new Error("Program link error : " + gl.getProgramInfoLog(program));
+    }
+    const locations = {};
+    for (const name of uniforms) {
+        locations[name] = gl.getUniformLocation(program, name);
+    }
+    return { program, locations };
+}
+
+/** GPU time of a frame, when EXT_disjoint_timer_query_webgl2 is available (not on Firefox and Safari) */
+function createGpuTimer(gl) {
+    const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+    let query = null;
+    let samples = 0, total = 0;
+    return {
+        begin() {
+            if (!ext) return;
+            // one query in flight: read the previous one first
+            if (query) {
+                if (!gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE)) return;
+                if (!gl.getParameter(ext.GPU_DISJOINT_EXT)) {
+                    total += gl.getQueryParameter(query, gl.QUERY_RESULT) / 1e6;
+                    samples++;
+                }
+                gl.deleteQuery(query);
+                query = null;
+            }
+            query = gl.createQuery();
+            gl.beginQuery(ext.TIME_ELAPSED_EXT, query);
+            this.running = true;
+        },
+        end() {
+            if (this.running) {
+                gl.endQuery(ext.TIME_ELAPSED_EXT);
+                this.running = false;
+            }
+        },
+        /** average since the last call, in ms, or null */
+        take() {
+            if (samples === 0) return null;
+            const avg = total / samples;
+            total = 0; samples = 0;
+            return avg;
+        },
+        running: false,
+    };
 }
 
 function init() {
@@ -29,76 +99,46 @@ function init() {
     if (!gl) {
         console.error("WebGL 2 not available");
         document.body.innerHTML = "This example requires WebGL 2 which is unavailable on this system."
+        return;
     }
 
 
     ///////////////////////////
-    // SET UP PROGRAM
+    // SET UP PROGRAMS
     ///////////////////////////
 
-    var vsSource = vshader.trim();
-    var vertexShader = gl.createShader(gl.VERTEX_SHADER);
-    gl.shaderSource(vertexShader, vsSource);
-    gl.compileShader(vertexShader);
-
-    if (!gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS)) {
-        throw new Error((gl.getShaderInfoLog(vertexShader)));
-    }
-
-    var fsSource = fshader.trim();
-    var fragment = gl.createShader(gl.FRAGMENT_SHADER);
-    gl.shaderSource(fragment, fsSource);
-    gl.compileShader(fragment);
-
-    if (!gl.getShaderParameter(fragment, gl.COMPILE_STATUS)) {
-        throw new Error("Vertex shader error : " + gl.getShaderInfoLog(fragment));
-    }
-
-    var program = gl.createProgram();
-    gl.attachShader(program, vertexShader);
-    gl.attachShader(program, fragment);
-    gl.linkProgram(program);
-
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-        console.error("Fragment shader error : " + gl.getProgramInfoLog(program));
-    }
-
-    gl.useProgram(program);
+    // the same vertex shader in both programs, so the depth values match
+    const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
+    const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
+        ["viewProj", "chunkOrigin", "lightDir", "terrainTex", "coarseTex", "terrainOffset", "terrainDim"]);
+    const depth = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, depthFshader),
+        ["viewProj", "chunkOrigin"]);
 
 
     const terrain = new Terrain(vec3.fromValues(9, 9, 1));
     terrain.init(gl);
 
-    var voxelTextureLocation = gl.getUniformLocation(program, "terrainTex");
-    gl.uniform1i(voxelTextureLocation, 0);
-
-    var terrainOffsetLocation = gl.getUniformLocation(program, "terrainOffset");
-    gl.uniform3fv(terrainOffsetLocation, vec3.fromValues(
-        Chunk.SIZE * Math.floor(terrain.dim[0] / 2),
-        Chunk.SIZE * Math.floor(terrain.dim[1] / 2),
-        Chunk.SIZE * Math.floor(terrain.dim[2] / 2)));
-    var terrainDimLocation = gl.getUniformLocation(program, "terrainDim");
-    gl.uniform3fv(terrainDimLocation, vec3.fromValues(
-        Chunk.SIZE * terrain.dim[0],
-        Chunk.SIZE * terrain.dim[1],
-        Chunk.SIZE * terrain.dim[2]));
+    gl.useProgram(color.program);
+    gl.uniform1i(color.locations.terrainTex, 0);
+    gl.uniform1i(color.locations.coarseTex, 1);
+    gl.uniform3fv(color.locations.terrainOffset, terrain.offset);
+    gl.uniform3fv(color.locations.terrainDim, terrain.size);
 
     var projMatrix = mat4.create();
     mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, 0.1, 1000.0);
 
-    var lightDirLocation = gl.getUniformLocation(program, "lightDir");
-
-
-
     var viewMatrix = mat4.create();
     var viewProjMatrix = mat4.create();
     var rotateZMatrix = mat4.create();
+    var camDir = vec3.create();
+    var camAt = vec3.create();
+    var lightDir = vec3.create();
 
     var angle = 0.0;
 
-    const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
-
-    var timer = Date.now();
+    const gpuTimer = createGpuTimer(gl);
+    const statsElement = document.getElementById("stats");
+    let frames = 0, statsTime = performance.now(), visibleChunks = 0, facesDrawn = 0;
 
 
     gl.enable(gl.DEPTH_TEST);
@@ -110,8 +150,7 @@ function init() {
 
     function draw() {
 
-        const query = gl.createQuery();
-        gl.beginQuery(ext.TIME_ELAPSED_EXT, query);
+        gpuTimer.begin();
 
         angle += 0.005;
 
@@ -127,12 +166,12 @@ function init() {
         if (keysDown["s"]) {
             camPhi -= 0.01;
         }
-        var camDir = vec3.fromValues(Math.cos(camTheta) * Math.cos(camPhi), Math.sin(camTheta) * Math.cos(camPhi), Math.sin(camPhi));
+        vec3.set(camDir, Math.cos(camTheta) * Math.cos(camPhi), Math.sin(camTheta) * Math.cos(camPhi), Math.sin(camPhi));
 
         if (keysDown[" "]) {
             const inter = terrain.intersection(camPosition, camDir);
             if (inter) {
-                terrain.boom(gl, inter.res.point, 10);
+                terrain.boom(gl, inter.point, 10);
             }
         }
 
@@ -144,41 +183,60 @@ function init() {
             vec3.scaleAndAdd(camPosition, camPosition, camDir, -1);
         }
 
-        var camAt = vec3.create();
-        camAt = vec3.add(camAt, camPosition, camDir);
+        vec3.add(camAt, camPosition, camDir);
 
         mat4.lookAt(viewMatrix, camPosition,
             camAt,
             vec3.fromValues(0, 0, 1));
         mat4.multiply(viewProjMatrix, projMatrix, viewMatrix);
 
-        var viewProjLocation = gl.getUniformLocation(program, "viewProj");
-        gl.uniformMatrix4fv(viewProjLocation, false, viewProjMatrix);
-
-
         mat4.fromZRotation(rotateZMatrix, angle);
-        var lightDir = vec3.fromValues(-1, -1, -1);
-        lightDir = vec3.normalize(lightDir, lightDir);
+        vec3.set(lightDir, -1, -1, -1);
+        vec3.normalize(lightDir, lightDir);
         vec3.transformMat4(lightDir, lightDir, rotateZMatrix);
 
-        gl.uniform3fv(lightDirLocation, lightDir);
+        const visible = terrain.cull(viewProjMatrix, camPosition);
+        visibleChunks = visible.length;
 
+        gl.depthMask(true);
+        gl.colorMask(true, true, true, true);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-        terrain.draw(gl, camPosition);
+        if (depthPrepass) {
+            // 1. depth only: after this pass the depth buffer holds the nearest surface of every pixel
+            gl.useProgram(depth.program);
+            gl.uniformMatrix4fv(depth.locations.viewProj, false, viewProjMatrix);
+            gl.colorMask(false, false, false, false);
+            gl.depthFunc(gl.LESS);
+            terrain.draw(gl, visible, camPosition, depth.locations.chunkOrigin);
 
-        gl.endQuery(ext.TIME_ELAPSED_EXT);
+            // 2. the expensive fragment shader then runs once per pixel, whatever the overdraw
+            gl.colorMask(true, true, true, true);
+            gl.depthMask(false);
+            gl.depthFunc(gl.LEQUAL);
+        } else {
+            gl.depthFunc(gl.LESS);
+        }
 
-        if (Date.now() - timer > 1000) {
+        gl.useProgram(color.program);
+        gl.uniformMatrix4fv(color.locations.viewProj, false, viewProjMatrix);
+        gl.uniform3fv(color.locations.lightDir, lightDir);
+        facesDrawn = terrain.draw(gl, visible, camPosition, color.locations.chunkOrigin);
 
-            setTimeout(() => {
-                const available = gl.getQueryParameter(query, gl.QUERY_RESULT_AVAILABLE);
-                if (available) {
-                    timer = Date.now();
-                    const elapsedNanos = gl.getQueryParameter(query, gl.QUERY_RESULT);
-                    //console.log("rendering time", elapsedNanos / 1000000);
-                }
-            }, 100);
+        gpuTimer.end();
+
+        frames++;
+        const now = performance.now();
+        if (now - statsTime > 500) {
+            const gpuMs = gpuTimer.take();
+            statsElement.textContent =
+                `${(frames * 1000 / (now - statsTime)).toFixed(0)} fps` +
+                (gpuMs !== null ? ` | GPU ${gpuMs.toFixed(2)} ms` : "") +
+                ` | chunks ${visibleChunks}/${terrain.chunks.length}` +
+                ` | ${(facesDrawn * 2 / 1e6).toFixed(2)} M triangles` +
+                ` | depth pre-pass ${depthPrepass ? "on" : "off"} (p)`;
+            frames = 0;
+            statsTime = now;
         }
 
         requestAnimationFrame(draw);
