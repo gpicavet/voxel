@@ -1,348 +1,170 @@
 import { vec3 } from "gl-matrix";
-import { aabbRayIntersection } from "./utils";
+import { BEDROCK_TOP, BRICK_BYTES, CHUNK_POW, CHUNK_SIZE } from "./constants";
+import { coarseFromBricks } from "./mesher";
 
+const SIZE = CHUNK_SIZE;
+
+function brickIndex(x, y, z) {
+    return (((z >> 1) << 5 | (y >> 1)) << 5) | (x >> 1);
+}
+function brickBit(x, y, z) {
+    return (x & 1) | ((y & 1) << 1) | ((z & 1) << 2);
+}
+
+/**
+ * A 64^3 chunk: voxels at 1 bit each (or nothing when the chunk is all air or all solid), and its mesh on the GPU.
+ */
 export class Chunk {
-    static SIZE_POW = 6;//size = 64
-    static SIZE = 1 << Chunk.SIZE_POW;
-    static SIZE_HALF = Chunk.SIZE >> 1;
+    static SIZE_POW = CHUNK_POW;
+    static SIZE = SIZE;
 
-    constructor(pos) {
-        this.pos = pos;
-        this.voxels = new Array(Chunk.SIZE * Chunk.SIZE * Chunk.SIZE);
+    constructor(cx, cy, cz) {
+        this.cx = cx;
+        this.cy = cy;
+        this.cz = cz;
+        this.pos = vec3.fromValues(cx * SIZE, cy * SIZE, cz * SIZE);
+        this.aabbMin = vec3.clone(this.pos);
+        this.aabbMax = vec3.fromValues(this.pos[0] + SIZE, this.pos[1] + SIZE, this.pos[2] + SIZE);
+        this.centerPos = vec3.fromValues(this.pos[0] + SIZE / 2, this.pos[1] + SIZE / 2, this.pos[2] + SIZE / 2);
+
+        this.uniform = 0;     // value of every voxel when bricks is null
+        this.bricks = null;   // 1 byte per 2x2x2 voxels (layout of the shadow texture)
+        this.coarse = null;   // 1 byte per 8x8x8 voxels, 0 when empty
+        this.modified = false;
+        this.connectivity = null; // per face, mask of the faces connected to it through air (cave culling)
+        this.visibleFrame = -1;
+
         this.vertexArray = null;
-        this.positionBuffer = null;
-        this.normalBuffer = null;
-        this.colorBuffer = null;
-        this.nElements = 0;
+        this.vertexBuffer = null;
+        this.nFaces = 0;
+        this.faceFirst = new Int32Array(6);
+        this.faceCount = new Int32Array(6);
     }
 
-    center() {
-        return vec3.fromValues(this.pos[0] + Chunk.SIZE_HALF, this.pos[1] + Chunk.SIZE_HALF, this.pos[2] + Chunk.SIZE_HALF);
+    setData(uniform, bricks, coarse, connectivity) {
+        this.uniform = uniform < 0 ? 0 : uniform;
+        this.bricks = bricks;
+        this.coarse = coarse;
+        this.connectivity = connectivity;
+    }
+
+    getVoxel(x, y, z) {
+        const b = this.bricks;
+        if (b === null) return this.uniform;
+        return (b[brickIndex(x, y, z)] >> brickBit(x, y, z)) & 1;
     }
 
     setVoxel(x, y, z, val) {
-        this.voxels[(((x << Chunk.SIZE_POW) + y) << Chunk.SIZE_POW) + z] = val;
-    }
-    getVoxel(x, y, z) {
-        return this.voxels[(((x << Chunk.SIZE_POW) + y) << Chunk.SIZE_POW) + z];
-    }
-
-    init(noise) {
-
-        for (var x = 0; x < Chunk.SIZE; x++) {
-            for (var y = 0; y < Chunk.SIZE; y++) {
-                for (var z = 0; z < Chunk.SIZE; z++) {
-                    var dens = (noise((this.pos[0] + x) * 0.01,
-                        (this.pos[1] + y) * 0.01,
-                        (this.pos[2] + z) * 0.01));
-
-                    this.setVoxel(x, y, z, 0);
-                    if (z + this.pos[2] == 0 || dens < -0.1) {
-                        this.setVoxel(x, y, z, 1);
-                    }
-                }
-            }
+        if (this.bricks === null) {
+            if (val === this.uniform) return;
+            this.bricks = new Uint8Array(BRICK_BYTES).fill(this.uniform ? 0xff : 0);
         }
-
+        const i = brickIndex(x, y, z), bit = 1 << brickBit(x, y, z);
+        this.bricks[i] = val ? (this.bricks[i] | bit) : (this.bricks[i] & ~bit);
+        this.modified = true;
     }
 
-
-    bbIntersectionWithRay(from, dir) {
-        var aabb = [
-            [this.pos[0], this.pos[1], this.pos[2]],
-            [this.pos[0] + Chunk.SIZE, this.pos[1] + Chunk.SIZE, this.pos[2] + Chunk.SIZE],
-        ];
-
-        var inside = true;
-        for (var i = 0; i < 3; i++)
-            if (aabb[0][i] > from[i] || from[i] > aabb[1][i]) {
-                inside = false;
-                break;
-            }
-
-        if (inside) {
-            return { dist: 0 };
-        } else {
-            return { dist: aabbRayIntersection(from, dir, aabb) };
-        }
-    }
-
-    bbIntersectionWithSphere(center, radius) {
-        var aabb = [
-            [this.pos[0], this.pos[1], this.pos[2]],
-            [this.pos[0] + Chunk.SIZE, this.pos[1] + Chunk.SIZE, this.pos[2] + Chunk.SIZE],
-        ];
-
-        const radius2 = radius * radius;
+    intersectsSphere(center, radius) {
         var dmin = 0;
         for (var i = 0; i < 3; i++) {
-            if (center[i] < aabb[0][i])
-                dmin += (center[i] - aabb[0][i]) * (center[i] - aabb[0][i]);
-            else if (center[i] > aabb[1][i])
-                dmin += (center[i] - aabb[1][i]) * (center[i] - aabb[1][i]);
+            if (center[i] < this.aabbMin[i])
+                dmin += (center[i] - this.aabbMin[i]) * (center[i] - this.aabbMin[i]);
+            else if (center[i] > this.aabbMax[i])
+                dmin += (center[i] - this.aabbMax[i]) * (center[i] - this.aabbMax[i]);
         }
-        return dmin <= radius2;
+        return dmin <= radius * radius;
     }
 
-    voxelIntersection(from, dir) {
-        var minInter = null;
-        for (var x = 0; x < Chunk.SIZE; x++) {
-            for (var y = 0; y < Chunk.SIZE; y++) {
-                for (var z = 0; z < Chunk.SIZE; z++) {
-                    if (this.getVoxel(x, y, z) > 0) {
-                        const min = [this.pos[0] + x, this.pos[1] + y, this.pos[2] + z];
-                        const max = [min[0] + 1, min[1] + 1, min[2] + 1];
-                        const aabb = [
-                            min, max
-                        ];
-
-                        var inside = true;
-                        for (var i = 0; i < 3; i++)
-                            if (aabb[0][i] < from[i] || from[i] > aabb[1][i]) {
-                                inside = false;
-                                break;
-                            }
-
-                        if (inside) {
-                            const del = [min[0] + 0.5 - from[0], min[1] + 0.5 - from[1], min[2] + 0.5 - from[2]];
-                            return { dist: Math.sqrt(del[0] * del[0] + del[1] * del[1] + del[2] * del[2]), point: min };
-                        } else {
-                            const dist = aabbRayIntersection(from, dir, aabb);
-                            if (dist !== Infinity && dist >= 0) {
-                                if (minInter == null || minInter.dist > dist) {
-                                    const point = [from[0] + dist * dir[0],
-                                    from[1] + dist * dir[1],
-                                    from[2] + dist * dir[2]];
-                                    minInter = { dist, point };
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return minInter;
-    }
-
+    /**
+     * Remove the voxels inside the sphere. Only the voxels of the sphere bounding box are visited.
+     * @returns true if a voxel changed
+     */
     boom(center, radius) {
-        if (!center)
-            return;
+        const lo = [], hi = [], c = [];
+        for (let i = 0; i < 3; i++) {
+            c[i] = center[i] - this.pos[i];
+            lo[i] = Math.max(0, Math.floor(c[i] - radius));
+            hi[i] = Math.min(SIZE - 1, Math.ceil(c[i] + radius));
+        }
+        lo[2] = Math.max(lo[2], BEDROCK_TOP - this.pos[2]); // bedrock is indestructible
 
-        console.log("boom ", center, radius);
-
+        const radius2 = radius * radius;
         var changed = false;
-
-        var radius2 = radius * radius;
-        var center = vec3.fromValues(center[0] - this.pos[0], center[1] - this.pos[1], center[2] - this.pos[2]);
-
-        for (var x = 0; x < Chunk.SIZE; x++) {
-            for (var y = 0; y < Chunk.SIZE; y++) {
-                for (var z = 0; z < Chunk.SIZE; z++) {
-                    if (this.getVoxel(x, y, z) > 0) {
-                        var deltapos = [center[0] - x, center[1] - y, center[2] - z];
-                        var dist2 = deltapos[0] * deltapos[0] + deltapos[1] * deltapos[1] + deltapos[2] * deltapos[2];
-                        // console.log(deltapos, dist2);
-                        if (dist2 < radius2) {
-                            this.setVoxel(x, y, z, 0);
-                            changed = true;
-                        }
+        for (var x = lo[0]; x <= hi[0]; x++) {
+            for (var y = lo[1]; y <= hi[1]; y++) {
+                for (var z = lo[2]; z <= hi[2]; z++) {
+                    const dx = x + 0.5 - c[0], dy = y + 0.5 - c[1], dz = z + 0.5 - c[2];
+                    if (dx * dx + dy * dy + dz * dz < radius2 && this.getVoxel(x, y, z) > 0) {
+                        this.setVoxel(x, y, z, 0);
+                        changed = true;
                     }
                 }
             }
         }
-
+        if (changed) {
+            this.coarse = coarseFromBricks(this.bricks);
+        }
         return changed;
     }
 
-    createArray(gl) {
-
-        const cubevertices = [
-            0.5, 0.5, -0.5,
-            0.5, 0.5, 0.5,
-            0.5, -0.5, 0.5,
-            0.5, -0.5, -0.5,
-            -0.5, 0.5, -0.5,
-            -0.5, 0.5, 0.5,
-            -0.5, -0.5, 0.5,
-            -0.5, -0.5, -0.5,
-        ];
-
-        const cubenormals = [
-            1, 0, 0,  // x>0 face
-            -1, 0, 0, // x<0 face
-            0, 1, 0,  // y>0 face
-            0, -1, 0, // y<0 face
-            0, 0, 1,  // z>0 face
-            0, 0, -1, // z<0 face
-        ];
-
-        const cubeindices = [
-            [0, 1, 2, 3], // x>0 face
-            [5, 4, 7, 6], // x<0 face
-            [4, 5, 1, 0], // y>0 face
-            [7, 3, 2, 6], // y<0 face
-            [1, 5, 6, 2], // z>0 face
-            [0, 3, 7, 4], // z<0 face
-        ];
-
-        const positions = [];
-        const normals = [];
-        const colors = [];
-
-        for (var x = 0; x < Chunk.SIZE; x++) {
-            for (var y = 0; y < Chunk.SIZE; y++) {
-                for (var z = 0; z < Chunk.SIZE; z++) {
-
-                    if (this.getVoxel(x, y, z) > 0) {
-
-                        const visibleFace = [];
-                        visibleFace[0] = (x >= Chunk.SIZE - 1 || this.getVoxel(x + 1, y, z) == 0);
-                        visibleFace[1] = (x <= 0 || this.getVoxel(x - 1, y, z) == 0);
-                        visibleFace[2] = (y >= Chunk.SIZE - 1 || this.getVoxel(x, y + 1, z) == 0);
-                        visibleFace[3] = (y <= 0 || this.getVoxel(x, y - 1, z) == 0);
-                        visibleFace[4] = (z >= Chunk.SIZE - 1 || this.getVoxel(x, y, z + 1) == 0);
-                        visibleFace[5] = (z <= 0 || this.getVoxel(x, y, z - 1) == 0);
-
-                        const visible = visibleFace[0] || visibleFace[1] || visibleFace[2] || visibleFace[3] || visibleFace[4] || visibleFace[5];
-                        if (visible) {
-                            var wx = x + this.pos[0];
-                            var wy = y + this.pos[1];
-                            var wz = z + this.pos[2];
-
-                            const colorRock = [0.5, 0.5, 0.5];
-                            const colorGrass = [0.1, 1, 0.2];
-                            const colorEarth = [0.5, 0.4, 0.3];
-                            var color = colorEarth;
-
-
-                            if (wz > 30) {
-                                color = colorRock;
-                            }
-                            var zz = z + 1;
-                            if (zz >= Chunk.SIZE - 1 || this.getVoxel(x, y, zz) == 0) {
-                                color = colorGrass;
-                            }
-
-                            //simple ambient occlusion
-                            const aoFaceNeighborsPosList = [
-                                [[+1, 0, -1], [+1, +1, -1], [+1, +1, 0], [+1, +1, +1], [+1, 0, +1], [+1, -1, +1], [+1, -1, 0], [+1, -1, -1]],
-                                [[-1, 0, -1], [-1, +1, -1], [-1, +1, 0], [-1, +1, +1], [-1, 0, +1], [-1, -1, +1], [-1, -1, 0], [-1, -1, -1]],
-                                [[0, +1, -1], [-1, +1, -1], [-1, +1, 0], [-1, +1, +1], [0, +1, +1], [+1, +1, +1], [+1, +1, 0], [+1, +1, -1]],
-                                [[0, -1, -1], [-1, -1, -1], [-1, -1, 0], [-1, -1, +1], [0, -1, +1], [+1, -1, +1], [+1, -1, 0], [+1, -1, -1]],
-                                [[+1, 0, +1], [+1, +1, +1], [0, +1, +1], [-1, +1, +1], [-1, 0, +1], [-1, -1, +1], [0, -1, +1], [+1, -1, +1]],
-                                [[+1, 0, -1], [+1, +1, -1], [0, +1, -1], [-1, +1, -1], [-1, 0, -1], [-1, -1, -1], [0, -1, -1], [+1, -1, -1]],
-                            ]
-
-                            const aoFaceNeighborsOrder = [[0, 1, 2], [2, 3, 4], [4, 5, 6], [6, 7, 0]];
-
-                            const test = (diff) => {
-                                const [dx, dy, dz] = diff;
-                                return (dx == 0 || (dx < 0 && x > 0) || (dx > 0 && x < Chunk.SIZE - 1)) &&
-                                    (dy == 0 || (dy < 0 && y > 0) || (dy > 0 && y < Chunk.SIZE - 1)) &&
-                                    (dz == 0 || (dz < 0 && z > 0) || (dz > 0 && z < Chunk.SIZE - 1)) &&
-                                    this.getVoxel(x + dx, y + dy, z + dz) > 0;
-                            }
-
-                            for (var f = 0; f < 6; f++) {
-                                //culling
-                                //only create triangles indices for not shared faces (visible face)
-                                if (visibleFace[f]) {
-                                    const faceIndices = cubeindices[f];
-                                    for (const vertIndicePtr of [0, 1, 2, 2, 3, 0]) {
-                                        const vertI = faceIndices[vertIndicePtr];
-                                        const vertCompOffs = 3 * vertI;
-                                        const normCompOffs = 3 * f;
-
-                                        positions.push((0.5 + cubevertices[vertCompOffs + 0]) + wx);
-                                        positions.push((0.5 + cubevertices[vertCompOffs + 1]) + wy);
-                                        positions.push((0.5 + cubevertices[vertCompOffs + 2]) + wz);
-
-                                        normals.push(cubenormals[normCompOffs + 0]);
-                                        normals.push(cubenormals[normCompOffs + 1]);
-                                        normals.push(cubenormals[normCompOffs + 2]);
-
-                                        //simple ambient occlusion
-                                        const aoFaceNeighborsPoss = aoFaceNeighborsPosList[f];
-
-                                        var ao = 1;
-                                        if (f >= 0) {
-
-                                            var side1 = test(aoFaceNeighborsPoss[aoFaceNeighborsOrder[vertIndicePtr][0]]);
-                                            var corner = test(aoFaceNeighborsPoss[aoFaceNeighborsOrder[vertIndicePtr][1]]);
-                                            var side2 = test(aoFaceNeighborsPoss[aoFaceNeighborsOrder[vertIndicePtr][2]]);
-
-                                            if (side1 && side2) {
-                                                ao = 0.25;
-                                            }
-                                            else if (side1 && corner) {
-                                                ao = 0.5;
-                                            }
-                                            else if (side2 && corner) {
-                                                ao = 0.5;
-                                            }
-                                            else if (side2 || side2 || corner) {
-                                                ao = 0.75;
-                                            }
-                                        }
-
-                                        colors.push((color[0]) * ao);
-                                        colors.push((color[1]) * ao);
-                                        colors.push((color[2]) * ao);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                }
-            }
-        }
-
-        var positionsA = new Float32Array(positions);
-        var normalsA = new Float32Array(normals);
-        var colorsA = new Float32Array(colors);
-
+    upload(gl, mesh, indexBuffer) {
         if (this.vertexArray == null) {
             this.vertexArray = gl.createVertexArray();
+            this.vertexBuffer = gl.createBuffer();
+            gl.bindVertexArray(this.vertexArray);
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
+            gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 4, 0);
+            gl.enableVertexAttribArray(0);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+            gl.bindVertexArray(null);
         }
-        gl.bindVertexArray(this.vertexArray);
-
-        if (this.positionBuffer != null) {
-            gl.deleteBuffer(this.positionBuffer);
-        }
-        this.positionBuffer = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, positionsA, gl.STATIC_DRAW);
-        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-        gl.enableVertexAttribArray(0);
-
-        if (this.normalBuffer != null) {
-            gl.deleteBuffer(this.normalBuffer);
-        }
-        this.normalBuffer = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, this.normalBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, normalsA, gl.STATIC_DRAW);
-        gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-        gl.enableVertexAttribArray(1);
-
-        if (this.colorBuffer != null) {
-            gl.deleteBuffer(this.colorBuffer);
-        }
-        this.colorBuffer = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, this.colorBuffer);
-        gl.bufferData(gl.ARRAY_BUFFER, colorsA, gl.STATIC_DRAW);
-        gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 0, 0);
-        gl.enableVertexAttribArray(2);
-
-        this.nElements = positionsA.length / 3;//number of vertices
-
-        console.log("chunk created with " + this.nElements + " vertices");
-
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, mesh.vertices, gl.STATIC_DRAW);
+        this.faceFirst.set(mesh.faceFirst);
+        this.faceCount.set(mesh.faceCount);
+        this.nFaces = mesh.nFaces;
     }
 
-    draw(gl) {
+    freeMesh(gl) {
+        if (this.vertexArray !== null) {
+            gl.deleteVertexArray(this.vertexArray);
+            gl.deleteBuffer(this.vertexBuffer);
+            this.vertexArray = null;
+            this.vertexBuffer = null;
+        }
+        this.nFaces = 0;
+    }
+
+    /**
+     * Draw the face directions that can be seen from the camera, in one call with WEBGL_multi_draw.
+     * @returns the number of faces drawn
+     */
+    draw(gl, camPosition, multiDraw) {
+        if (this.nFaces === 0) return 0;
         gl.bindVertexArray(this.vertexArray);
-        gl.drawArrays(gl.TRIANGLES, 0, this.nElements);
+        let drawn = 0, n = 0;
+        for (let f = 0; f < 6; f++) {
+            const count = this.faceCount[f];
+            if (count === 0) continue;
+            // +x faces lie on planes x in ]min, max], they can only be seen from x > min, and so on
+            const axis = f >> 1;
+            const visible = (f & 1) === 0
+                ? camPosition[axis] > this.aabbMin[axis]
+                : camPosition[axis] < this.aabbMax[axis];
+            if (!visible) continue;
+            drawCounts[n] = count * 6;
+            drawOffsets[n] = this.faceFirst[f] * 6 * 4;
+            n++;
+            drawn += count;
+        }
+        if (multiDraw) {
+            if (n > 0) multiDraw.multiDrawElementsWEBGL(gl.TRIANGLES, drawCounts, 0, gl.UNSIGNED_INT, drawOffsets, 0, n);
+        } else {
+            for (let i = 0; i < n; i++) gl.drawElements(gl.TRIANGLES, drawCounts[i], gl.UNSIGNED_INT, drawOffsets[i]);
+        }
+        return drawn;
     }
 }
+
+const drawCounts = new Int32Array(6);
+const drawOffsets = new Int32Array(6);
