@@ -4,7 +4,8 @@ precision highp int;
 
 // Generates one layer of the voxel textures (run once at startup, textures.js): realistic, tileable (every noise is
 // periodic over the texture), with a relief turned into a normal map. Layers: 0 earth, 1 rock, 2 grass, 3 snow, 4 sand,
-// 5 water ripples (only its normal map is used, by water_fragment.glsl).
+// 5 water ripples (only its normal map is used, by water_fragment.glsl), and for the trees: 6 oak bark, 7 birch bark,
+// 8 dead wood, 9 leaves and 10 needles (with transparent gaps in the alpha channel).
 
 uniform int layer;
 uniform float size; // texels per side
@@ -65,8 +66,54 @@ vec3 worley(vec2 uv, float period) {
     return vec3(f1, f2, id);
 }
 
+float gAlpha = 1.0; // opacity of the texel (leaves and needles)
+
+// leaf shape in its own frame: x along the leaf (-1 tip .. 1 stem), y across; distance > 0 outside.
+// needle: long and thin
+float leafShape(vec2 q, bool needle) {
+    float halfWidth = needle ? 0.07 * (1.0 - pow(abs(q.x), 6.0)) : 0.38 * sqrt(max(1.0 - q.x * q.x, 0.0)) * (1.0 + 0.25 * q.x);
+    return abs(q.y) - halfWidth;
+}
+
+// leaves on a jittered grid (periodic): the topmost leaf covering uv. Returns its height; its color variation and
+// whether uv is covered in out
+float leaves(vec2 uv, float cells, int perCell, float size, bool needle, out float variation, out float covered) {
+    vec2 p = uv * cells;
+    vec2 i = floor(p);
+    float best = -1.0, height = 0.0;
+    variation = 0.0;
+    covered = 0.0;
+    for(int y = -1; y <= 1; y++) {
+        for(int x = -1; x <= 1; x++) {
+            vec2 cell = mod(i + vec2(x, y), cells);
+            for(int k = 0; k < 4; k++) {
+                if(k >= perCell) break;
+                vec2 seed = cell + float(k) * 13.7;
+                vec2 center = i + vec2(x, y) + hash2(seed);
+                float angle = hash(seed + 5.1) * 6.2831853;
+                float scale = size * (0.75 + 0.5 * hash(seed + 9.3));
+                vec2 d = (p - center) / scale;
+                vec2 q = vec2(cos(angle) * d.x + sin(angle) * d.y, -sin(angle) * d.x + cos(angle) * d.y);
+                float shape = leafShape(q, needle);
+                float order = hash(seed + 2.7);
+                if(shape < 0.0 && order > best) {
+                    best = order;
+                    covered = 1.0;
+                    variation = hash(seed + 7.7);
+                    float dome = sqrt(max(-shape, 0.0)) * (needle ? 2.0 : 0.8);
+                    float midrib = smoothstep(0.035, 0.0, abs(q.y)) * 0.25;
+                    float veins = smoothstep(0.03, 0.0, abs(fract((q.x + abs(q.y) * 1.4) * 4.0) - 0.5) - 0.44) * 0.12;
+                    height = 0.4 + dome - midrib - veins + order * 0.2;
+                }
+            }
+        }
+    }
+    return height;
+}
+
 // relief (0 .. 1) and color of a material at uv
 float material(vec2 uv, out vec3 albedo) {
+    gAlpha = 1.0;
     if(layer == 0) {
         // earth: lumps, fine grain, pebbles in some cells
         float lumps = fbm(uv, vec2(6.0), 5);
@@ -129,6 +176,57 @@ float material(vec2 uv, out vec3 albedo) {
         albedo = vec3(0.0);
         return height;
     }
+    if(layer == 6) {
+        // oak bark: vertical plates separated by deep furrows, broken across from time to time
+        float warp = uv.x * 10.0 + (fbm(uv, vec2(3.0, 6.0), 4) - 0.5) * 3.0;
+        float plates = smoothstep(0.05, 0.45, abs(sin(warp * 3.14159265)));
+        float breaks = smoothstep(0.82, 0.92, vnoise(uv, vec2(10.0, 7.0)));
+        float grain = vnoise(uv, vec2(96.0, 24.0));
+        float height = plates * (1.0 - breaks * 0.6) * 0.75 + grain * 0.25;
+        albedo = mix(vec3(0.08, 0.06, 0.045), vec3(0.30, 0.25, 0.20), height);
+        albedo *= 0.85 + 0.3 * fbm(uv, vec2(5.0), 3);
+        float moss = smoothstep(0.6, 0.75, fbm(uv + 0.3, vec2(4.0, 8.0), 4)) * (1.0 - plates);
+        albedo = mix(albedo, vec3(0.16, 0.22, 0.07), moss * 0.6);
+        return height;
+    }
+    if(layer == 7) {
+        // birch bark: white, horizontal dark lenticels, black patches, a little peeling
+        float lenticel = smoothstep(0.78, 0.86, vnoise(uv, vec2(12.0, 90.0))) * smoothstep(0.4, 0.7, vnoise(uv + 0.2, vec2(24.0, 6.0)));
+        float blotch = smoothstep(0.66, 0.74, fbm(uv, vec2(3.0, 5.0), 5));
+        float grain = vnoise(uv, vec2(40.0, 160.0));
+        float height = 0.6 + grain * 0.15 - lenticel * 0.4 - blotch * 0.2;
+        albedo = mix(vec3(0.78, 0.76, 0.72), vec3(0.92, 0.90, 0.86), grain);
+        albedo = mix(albedo, vec3(0.86, 0.72, 0.58), smoothstep(0.7, 0.8, fbm(uv + 0.6, vec2(6.0, 12.0), 3)) * 0.35); // peeling
+        albedo = mix(albedo, vec3(0.06, 0.05, 0.05), max(lenticel * 0.85, blotch));
+        return height;
+    }
+    if(layer == 8) {
+        // dead wood: silver gray, fine vertical grain, a few deep cracks
+        float grain = vnoise(uv, vec2(80.0, 4.0)) * 0.6 + vnoise(uv, vec2(160.0, 10.0)) * 0.4;
+        float crack = smoothstep(0.035, 0.0, abs(fract(uv.x * 5.0 + (fbm(uv, vec2(2.0, 4.0), 3) - 0.5) * 0.6) - 0.5) - 0.465);
+        float height = grain * 0.7 + 0.3 - crack * 0.6;
+        albedo = mix(vec3(0.30, 0.28, 0.25), vec3(0.58, 0.55, 0.50), grain);
+        albedo *= 1.0 - crack * 0.7;
+        return height;
+    }
+    if(layer == 9) {
+        // leaves: overlapping leaves on transparent gaps, each a bit different, lighter midrib and veins
+        float variation, covered;
+        float height = leaves(uv, 6.0, 3, 0.62, false, variation, covered);
+        gAlpha = covered;
+        albedo = mix(vec3(0.06, 0.15, 0.03), vec3(0.20, 0.36, 0.07), variation);
+        albedo *= 0.65 + 0.6 * clamp(height - 0.3, 0.0, 1.0);
+        return height;
+    }
+    if(layer == 10) {
+        // needles: thin needles in every direction, densely packed, dark green with lighter tips
+        float variation, covered;
+        float height = leaves(uv, 12.0, 4, 1.05, true, variation, covered);
+        gAlpha = covered;
+        albedo = mix(vec3(0.025, 0.08, 0.035), vec3(0.07, 0.19, 0.08), variation);
+        albedo *= 0.7 + 0.5 * clamp(height - 0.3, 0.0, 1.0);
+        return height;
+    }
     // snow: soft drifts, wind ripples, bluish hollows
     float drifts = fbm(uv, vec2(5.0), 5);
     float ripples = vnoise(uv, vec2(8.0, 48.0));
@@ -144,8 +242,11 @@ void main() {
     // normal from the relief (finite differences, wrapping around with the noise)
     float hx = material(uv + vec2(1.0 / size, 0.0), unused);
     float hy = material(uv + vec2(0.0, 1.0 / size), unused);
-    float strength = layer == 3 || layer == 4 ? 2.0 : layer == 2 ? 5.0 : layer == 5 ? 3.0 : 8.0;
+    float strength = layer == 3 || layer == 4 ? 2.0 : layer == 2 ? 5.0 : layer == 5 ? 3.0 : layer >= 9 ? 4.0 : 8.0;
     vec3 n = normalize(vec3((h - hx) * size * strength / 64.0, (h - hy) * size * strength / 64.0, 1.0));
-    outAlbedo = vec4(albedo, 1.0);
+    // the alpha of the texel itself (material() of the neighbours changed gAlpha)
+    vec3 unusedAlbedo;
+    material(uv, unusedAlbedo);
+    outAlbedo = vec4(albedo, gAlpha);
     outNormal = vec4(n * 0.5 + 0.5, 1.0);
 }

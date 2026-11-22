@@ -4,6 +4,7 @@ precision highp int;
 precision lowp usampler3D;
 precision highp sampler2D;
 precision highp sampler3D;
+precision mediump sampler2DArray;
 
 uniform vec3 camPosition;
 uniform bool halfResShadows;
@@ -21,6 +22,7 @@ in float vAO;
 flat in int vMaterial;
 flat in float vTint;
 flat in float vSkyLight;
+flat in float vYaw;
 
 out vec4 fragColor;
 
@@ -31,19 +33,10 @@ out vec4 fragColor;
 @import ./atmosphere;
 @import ./surface_atmosphere;
 @import ./tree_shadow;
+@import ./tree_surface;
 
 const int TREE_FACE = 7;
 const float NEAR_FALLBACK = 40.0;
-
-// sRGB colors of the materials of treeModels.js
-const vec3 COLORS[7] = vec3[7](
-    vec3(0.33, 0.24, 0.16),  // bark
-    vec3(0.21, 0.38, 0.11),  // oak leaves
-    vec3(0.82, 0.80, 0.74),  // birch bark
-    vec3(0.10, 0.26, 0.12),  // pine needles
-    vec3(0.42, 0.38, 0.33),  // dead wood
-    vec3(0.34, 0.47, 0.15),  // birch leaves
-    vec3(0.18, 0.34, 0.09)); // bush leaves
 
 float hash(vec3 p) {
     p = fract(p * vec3(0.1031, 0.1030, 0.0973));
@@ -51,23 +44,28 @@ float hash(vec3 p) {
     return fract((p.x + p.y) * p.z);
 }
 
-vec3 albedo(bool leaf) {
-    vec3 voxel = floor(vLocal - vLocalNormal * 0.5);
-    float h = hash(voxel);
-    vec3 color = COLORS[vMaterial];
-    if(vMaterial == 2) {
-        // birch: dark marks on the white bark
-        if(hash(vec3(voxel.z, floor(voxel.x / 2.0), 7.0)) < 0.14) color = vec3(0.16, 0.15, 0.14);
-    } else if(vMaterial == 0 || vMaterial == 4) {
-        // bark: vertical streaks
-        color *= 0.8 + 0.35 * hash(vec3(voxel.xy, 3.0));
-    }
-    color *= 0.82 + 0.36 * h;
+// color (linear) and normal (world) of the fragment, from the textures; per tree and per voxel variations
+void treeSurface(bool leaf, out vec3 albedo, out vec3 normal) {
+    vec2 uv = treeUV(vLocal, vLocalNormal, vTint * 7.0);
+    vec4 texel = treeTexel(vMaterial, uv);
+    albedo = texel.rgb;
+    if(vMaterial == 5) albedo *= vec3(1.25, 1.25, 1.05);     // birch leaves: lighter
+    if(vMaterial == 3) albedo *= 0.8;                         // needles: darker
+    if(vMaterial == 6) albedo *= vec3(0.85, 0.9, 0.85);      // bush leaves: darker
     if(leaf) {
         // every tree a bit different: from fresh green to yellowish, lighter or darker
-        color = mix(color, color * vec3(1.25, 1.08, 0.7), vTint * 0.4) * (0.88 + 0.24 * vTint);
+        albedo = mix(albedo, albedo * vec3(1.25, 1.08, 0.7), vTint * 0.4) * (0.88 + 0.24 * vTint);
     }
-    return pow(color, vec3(2.2));
+    // a little per voxel, so the voxels still read
+    albedo *= 0.94 + 0.12 * hash(floor(vLocal - vLocalNormal * 0.5));
+
+    vec3 tn = texture(voxelNormals, vec3(uv, float(TREE_LAYERS[vMaterial]))).xyz * 2.0 - 1.0;
+    vec3 n = vLocalNormal;
+    vec3 t = abs(n.x) > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 b = abs(n.z) > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+    vec3 local = normalize(t * tn.x + b * tn.y + n * tn.z);
+    float c = cos(vYaw), s = sin(vYaw);
+    normal = vec3(c * local.x - s * local.y, s * local.x + c * local.y, local.z);
 }
 
 // terrain and cloud shadow of this tree pixel, from the half resolution mask (texels of trees only)
@@ -97,8 +95,9 @@ vec2 maskShadow(vec3 toLight) {
 void main() {
     if(reflectionPass && vPosition.z < seaLevel - 0.12) discard;
     vec3 toLight = -lightDir;
-    bool leaf = vMaterial == 1 || vMaterial == 3 || vMaterial == 5 || vMaterial == 6;
-    vec3 n = normalize(vNormal);
+    bool leaf = isLeaf(vMaterial);
+    vec3 albedo, n;
+    treeSurface(leaf, albedo, n);
     float ndotl = dot(n, toLight);
     // leaves let some light through: lit a little from behind too
     float diffuse = leaf ? clamp(ndotl * 0.7 + 0.3, 0.0, 1.0) : max(ndotl, 0.0);
@@ -111,6 +110,6 @@ void main() {
     }
     float skyAccess = 0.02 + 0.98 * pow(0.8, (1.0 - vSkyLight) * 15.0);
     vec3 light = ambientLight(n) * vAO * skyAccess + lightColor * diffuse * shadow;
-    vec3 color = albedo(leaf) * light;
+    vec3 color = albedo * light;
     fragColor = vec4(toneMap(applyAtmosphere(color, vPosition)), 1.0);
 }

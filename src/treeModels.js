@@ -186,14 +186,53 @@ function downsample(grid) {
     return out;
 }
 
+const LEAVES = new Set([OAK_LEAVES, NEEDLES, BIRCH_LEAVES, BUSH_LEAVES]);
+
+/** per voxel, distance (in voxels) to the outside through the leaves: 1 on the surface, up to 3 */
+function leafDepth(grid) {
+    const { nx, ny, nz } = grid;
+    const depth = new Uint8Array(nx * ny * nz);
+    const index = (x, y, z) => (x * ny + y) * nz + z;
+    const NEIGHBORS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    for (let d = 1; d <= 3; d++) {
+        for (let x = 0; x < nx; x++) {
+            for (let y = 0; y < ny; y++) {
+                for (let z = 0; z < nz; z++) {
+                    const i = index(x, y, z);
+                    if (grid.v[i] === 0 || depth[i] !== 0) continue;
+                    // next to the outside (d = 1), or to a voxel of depth d - 1
+                    if (NEIGHBORS.some(([dx, dy, dz]) => {
+                        const m = grid.get(x + dx, y + dy, z + dz);
+                        if (m === 0) return d === 1;
+                        return depth[index(x + dx, y + dy, z + dz)] === d - 1 && d > 1;
+                    })) depth[i] = d;
+                }
+            }
+        }
+    }
+    return depth;
+}
+
 /**
  * Faces of the voxels next to an empty voxel, with ambient occlusion per corner. Same vertex format as the terrain:
  * x, y, z (7 bits each) | face (3 bits) | ambient occlusion (2 bits) | material (3 bits)
+ * cutout (finest level, leaves with transparent gaps): also a second layer of leaves under the surface, and the branches
+ * inside the crowns, seen through the gaps.
  */
-function meshGrid(grid) {
+function meshGrid(grid, cutout) {
     const { nx, ny, nz } = grid;
     const vertices = [];
     const solid = (x, y, z) => grid.get(x, y, z) !== 0;
+    const depth = cutout ? leafDepth(grid) : null;
+    const depthAt = (x, y, z) => depth[(x * ny + y) * nz + z];
+    const visibleAgainst = (m, x, y, z, nxv, nyv, nzv) => {
+        const n = grid.get(nxv, nyv, nzv);
+        if (n === 0) return true;
+        if (!cutout || !LEAVES.has(n - 1)) return false;
+        // wood inside the leaves shows through the gaps; second layer of leaves, facing the surface ones
+        if (!LEAVES.has(m - 1)) return true;
+        return depthAt(x, y, z) === 2 && depthAt(nxv, nyv, nzv) === 1;
+    };
     for (let x = 0; x < nx; x++) {
         for (let y = 0; y < ny; y++) {
             for (let z = 0; z < nz; z++) {
@@ -201,7 +240,7 @@ function meshGrid(grid) {
                 if (m === 0) continue;
                 FACES.forEach((face, f) => {
                     const [fx, fy, fz] = face.n;
-                    if (solid(x + fx, y + fy, z + fz)) return;
+                    if (!visibleAgainst(m, x, y, z, x + fx, y + fy, z + fz)) return;
                     const axis = face.n.findIndex(v => v !== 0);
                     const [u, v] = [0, 1, 2].filter(a => a !== axis);
                     const ao = face.c.map(c => {
@@ -240,7 +279,7 @@ export function buildTreeModels(seed = 'trees') {
         for (let lod = 0; lod < TREE_LODS; lod++) {
             if (lod > 0) grid = downsample(grid);
             const scale = 1 << lod;
-            const vertices = meshGrid(grid);
+            const vertices = meshGrid(grid, lod === 0);
             lods.push({
                 vertices,
                 nFaces: vertices.length / 4,

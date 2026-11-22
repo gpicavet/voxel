@@ -19,6 +19,7 @@ out float vAO;
 flat out int vMaterial;
 flat out float vTint;
 flat out float vSkyLight;
+flat out float vYaw;
 
 const vec3 NORMALS[6] = vec3[6](
     vec3(1, 0, 0), vec3(-1, 0, 0),
@@ -49,5 +50,6 @@ void main() {
     vMaterial = material;
     vTint = instanceData.y;
     vSkyLight = instanceData.z;
+    vYaw = instancePosition.w;
     gl_Position = viewProj * vec4(vPosition, 1.0);
 }

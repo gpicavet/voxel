@@ -6,7 +6,7 @@ import { aabbInFrustum } from './utils';
 // from the columns, into "sets" (camera, sun shadow map), each with its own instance buffers.
 
 const INSTANCE_FLOATS = 8; // position + yaw, scale + tint + sky light + sway phase
-const LOD_DISTANCES = [45, 140]; // beyond the last one: coarsest model
+const LOD_DISTANCES = [90, 280]; // beyond the last one: coarsest model
 const BUCKETS = SPECIES_COUNT * TREE_LODS;
 
 export class TreeRenderer {
@@ -46,7 +46,7 @@ export class TreeRenderer {
             gl.vertexAttribDivisor(2, 1);
             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.world.indexBuffer);
             gl.bindVertexArray(null);
-            buckets.push({ vao, instances, data: new Float32Array(1024 * INSTANCE_FLOATS), count: 0, model });
+            buckets.push({ vao, instances, data: new Float32Array(1024 * INSTANCE_FLOATS), count: 0, model, lod: b % TREE_LODS });
         }
         return { buckets, trees: 0, faces: 0 };
     }
@@ -104,6 +104,8 @@ export class TreeRenderer {
             if (bucket.count === 0) continue;
             gl.uniform3fv(locations.modelOrigin, bucket.model.origin);
             gl.uniform1f(locations.voxelSize, bucket.model.voxelSize);
+            // transparent gaps in the leaves of the finest level only (further, the foliage is full)
+            if (locations.cutout) gl.uniform1i(locations.cutout, bucket.lod === 0 ? 1 : 0);
             gl.bindVertexArray(bucket.vao);
             gl.drawElementsInstanced(gl.TRIANGLES, bucket.model.nFaces * 6, gl.UNSIGNED_INT, 0, bucket.count);
         }

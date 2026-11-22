@@ -338,7 +338,7 @@ function init() {
     const underwater = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, underwaterFshader),
         ["veil", ...SKY_UNIFORMS]);
     const treeVertexShader = compileShader(gl, gl.VERTEX_SHADER, treeVshader);
-    const TREE_UNIFORMS = ["viewProj", "modelOrigin", "voxelSize", "windTime"];
+    const TREE_UNIFORMS = ["viewProj", "modelOrigin", "voxelSize", "windTime", "cutout", "voxelAlbedo", "voxelNormals"];
     const treeColor = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeFshader),
         [...TREE_UNIFORMS, "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", "reflectionPass", "seaLevel",
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS, ...TREE_SHADOW_UNIFORMS]);
@@ -412,9 +412,12 @@ function init() {
     gl.uniform1i(color.locations.voxelNormals, 14);
     gl.uniform1i(color.locations.treeShadowMap, 18);
     gl.useProgram(treeColor.program);
-    for (const [name, unit] of [["brickTex", 0], ["coarseTex", 1], ["horizonTex", 2], ["skyLUT", 7], ["cloudNoise", 8], ["treeShadowMap", 18]]) {
+    for (const [name, unit] of [["brickTex", 0], ["coarseTex", 1], ["horizonTex", 2], ["skyLUT", 7], ["cloudNoise", 8], ["treeShadowMap", 18],
+        ["voxelAlbedo", 13], ["voxelNormals", 14]]) {
         gl.uniform1i(treeColor.locations[name], unit);
     }
+    gl.useProgram(treeGbuffer.program);
+    gl.uniform1i(treeGbuffer.locations.voxelAlbedo, 13);
     gl.uniform1f(treeColor.locations.seaLevel, SEA_LEVEL);
     gl.useProgram(color.program);
     gl.uniform1f(color.locations.seaLevel, SEA_LEVEL);
@@ -566,7 +569,7 @@ function init() {
             -c[2] - 400, -c[2] + 400);
         mat4.multiply(treeShadowMatrix, treeLightProj, treeLightView);
 
-        trees.gather("shadow", camPosition, null, TREE_SHADOW_RADIUS * 1.5);
+        trees.gather("shadow", camPosition, null, TREE_SHADOW_RADIUS * 1.5, 1); // full foliage: cheaper, no gaps needed
         gl.bindFramebuffer(gl.FRAMEBUFFER, treeShadowFramebuffer);
         gl.viewport(0, 0, TREE_SHADOW_SIZE, TREE_SHADOW_SIZE);
         gl.clear(gl.DEPTH_BUFFER_BIT);
