@@ -1,7 +1,7 @@
 import alea from 'alea';
 
 // Minecraft-like foliage: one 16 x 16 pixel art texture per face of a leaf voxel, with transparent holes, drawn with crisp
-// pixels. Layers: 0 oak, 1 birch, 2 needles, 3 bush. The holes keep a dark green (seen in the full foliage far away).
+// pixels. Layers: 0 oak, 1 birch, 2 needles (spruce), 3 bush. The holes keep a dark green (seen in the full foliage far away).
 
 const SIZE = 16;
 const LAYERS = 4;
@@ -38,39 +38,13 @@ function makeLayer(random, { clusters, coverage, light, dark, hole, clusterSize 
     return rgba;
 }
 
-function makeNeedles(random) {
-    const dark = [0.10, 0.20, 0.13], light = [0.24, 0.40, 0.25], hole = [0.05, 0.11, 0.07];
-    const rgba = new Float32Array(SIZE * SIZE * 4);
-    for (let i = 0; i < SIZE * SIZE; i++) rgba.set([...hole, 0], i * 4);
-    const set = (x, y, c) => {
-        const i = (((y % SIZE) + SIZE) % SIZE * SIZE + ((x % SIZE) + SIZE) % SIZE) * 4;
-        rgba[i] = c[0]; rgba[i + 1] = c[1]; rgba[i + 2] = c[2]; rgba[i + 3] = 1;
-    };
-    // twigs going down diagonally, needles on both sides
-    for (let t = 0; t < 7; t++) {
-        let x = Math.floor(random() * SIZE), y = Math.floor(random() * SIZE);
-        const dir = random() < 0.5 ? 1 : -1;
-        for (let s = 0; s < 9; s++) {
-            set(x, y, [0.18, 0.13, 0.08]);
-            const shade = random();
-            const c = [dark[0] + (light[0] - dark[0]) * shade, dark[1] + (light[1] - dark[1]) * shade, dark[2] + (light[2] - dark[2]) * shade];
-            set(x - 1, y, c);
-            set(x + 1, y, c);
-            if (random() < 0.6) set(x - 2, y - 1, c);
-            if (random() < 0.6) set(x + 2, y - 1, c);
-            x += random() < 0.6 ? dir : 0;
-            y -= 1;
-        }
-    }
-    return rgba;
-}
-
 export function createLeafTextures(gl, unit) {
     const random = alea('leaves');
     const layers = [
-        makeLayer(random, { clusters: 16, coverage: 0.72, light: [0.36, 0.56, 0.18], dark: [0.11, 0.24, 0.06], hole: [0.07, 0.15, 0.04], clusterSize: [1.2, 2.4] }),
+        makeLayer(random, { clusters: 16, coverage: 0.74, light: [0.42, 0.62, 0.20], dark: [0.13, 0.27, 0.07], hole: [0.08, 0.16, 0.05], clusterSize: [1.2, 2.4] }),
         makeLayer(random, { clusters: 22, coverage: 0.66, light: [0.62, 0.74, 0.30], dark: [0.26, 0.40, 0.12], hole: [0.16, 0.25, 0.08], clusterSize: [0.8, 1.6] }),
-        makeNeedles(random),
+        // needles: small dense tufts, spruce green
+        makeLayer(random, { clusters: 30, coverage: 0.84, light: [0.42, 0.58, 0.22], dark: [0.12, 0.26, 0.10], hole: [0.07, 0.15, 0.06], clusterSize: [0.7, 1.4] }),
         makeLayer(random, { clusters: 18, coverage: 0.8, light: [0.30, 0.48, 0.15], dark: [0.09, 0.20, 0.05], hole: [0.06, 0.13, 0.04], clusterSize: [1.4, 2.6] }),
     ];
     const data = new Uint8Array(SIZE * SIZE * 4 * LAYERS);

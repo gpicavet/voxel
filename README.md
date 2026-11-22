@@ -8,8 +8,9 @@ The world is 28 800 x 28 800 voxels (450 x 450 chunks of 64^3) and 256 high: mou
 Day and night cycle with a physical sky (Rayleigh and Mie scattering), sun and moon shadows, voxel clouds drifting with
 the wind and casting shadows, light shafts (god rays) and valley mist. Realistic textures (512 x 512, albedo and normal map) generated on the GPU at startup.
 Sky light propagated like in Minecraft (caves and overhangs are dark), and ray-traced ambient occlusion within 10 voxels.
-Trees: 5 species (oak, pine, birch, bush, dead tree) made of voxels 4 times smaller than the terrain, generated at startup
-and drawn as instances (free position, rotation, size, tint), with 3 levels of detail, high resolution bark textures and
+Trees: 5 species (oak, spruce, birch, bush, dead tree) in 11 variants, made of voxels 4 times smaller than the terrain,
+grown at startup in a worker (crooked trunks with roots, recursive crooked limbs, flat pads of foliage with hanging
+fringes, spruces with whorls of drooping branches and a bare spire) and drawn as instances (free position, rotation, size, tint), with 3 levels of detail, high resolution bark textures and
 Minecraft-like pixel art foliage (one texture per leaf voxel face, holes cut out up close), wind in the leaves, a shadow map for their shadows,
 ambient occlusion (baked in the models, and a canopy map darkening the ground under the trees and the forest around),
 and reflections in the water; explosions destroy them.

@@ -358,7 +358,13 @@ function init() {
 
     const world = new World(gl);
     const trees = new TreeRenderer(gl, world);
-    const canopy = new CanopyMap(gl, gl.TEXTURE20, trees.crowns);
+    const canopy = new CanopyMap(gl, gl.TEXTURE20, null);
+    world.pool.buildTreeModels(models => {
+        trees.setModels(models);
+        canopy.crowns = trees.crowns;
+        canopy.valid = false; // build it now
+        world.treesVersion = (world.treesVersion || 0) + 1; // and render the tree shadow map again
+    });
 
     // shadow map of the trees (unit 18): depth seen from the light, compared in the shaders
     gl.activeTexture(gl.TEXTURE18);

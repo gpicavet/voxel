@@ -20,7 +20,7 @@ float canopyOcclusion(vec3 p, bool onTree) {
     vec2 edge = min(uv, 1.0 - uv);
     float fade = smoothstep(0.0, 0.06, min(edge.x, edge.y));
     vec4 forest = textureLod(canopyTex, uv, 4.0); // 16 m around: the forest
-    float occlusion = canopyAbove(forest, p.z) * 0.65;
+    float occlusion = canopyAbove(forest, p.z) * (onTree ? 0.4 : 0.65);
     if(!onTree) {
         vec4 near = textureLod(canopyTex, uv, 0.0);
         occlusion = max(occlusion, canopyAbove(near, p.z) * 0.8);

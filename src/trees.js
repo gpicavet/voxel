@@ -1,5 +1,5 @@
-import { buildTreeModels, SPECIES_COUNT, TREE_LODS } from './treeModels';
-import { TREE_FLOATS } from './treePlacement';
+import { TREE_LODS } from './treeModels';
+import { MODEL_COUNT, TREE_FLOATS } from './treePlacement';
 import { aabbInFrustum } from './utils';
 
 // Rendering of the trees: one instanced draw per species and level of detail. The instances are gathered each frame
@@ -7,14 +7,24 @@ import { aabbInFrustum } from './utils';
 
 const INSTANCE_FLOATS = 8; // position + yaw, scale + tint + sky light + sway phase
 const LOD_DISTANCES = [90, 280]; // beyond the last one: coarsest model
-const BUCKETS = SPECIES_COUNT * TREE_LODS;
+const BUCKETS = MODEL_COUNT * TREE_LODS;
 
 export class TreeRenderer {
     /** @param world gives the shared index buffer (ensureIndexCapacity, indexBuffer) and the columns */
     constructor(gl, world) {
         this.gl = gl;
         this.world = world;
-        this.models = buildTreeModels().map(lods => lods.map(model => {
+        this.models = null; // built in a worker: setModels
+        this.crowns = null;
+        this.sets = { camera: { buckets: [], trees: 0, faces: 0 }, shadow: { buckets: [], trees: 0, faces: 0 } };
+        this.min = new Float32Array(3);
+        this.max = new Float32Array(3);
+    }
+
+    /** models of treeModels.js (per model, per level of detail) */
+    setModels(models) {
+        const gl = this.gl, world = this.world;
+        this.models = models.map(lods => lods.map(model => {
             world.ensureIndexCapacity(model.nFaces);
             const buffer = gl.createBuffer();
             gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -23,8 +33,6 @@ export class TreeRenderer {
         }));
         this.crowns = this.models.map(lods => lods[0].crown);
         this.sets = { camera: this.createSet(), shadow: this.createSet() };
-        this.min = new Float32Array(3);
-        this.max = new Float32Array(3);
     }
 
     createSet() {
@@ -59,6 +67,7 @@ export class TreeRenderer {
     gather(setName, eye, planes, maxDistance, minLod = 0) {
         const gl = this.gl;
         const set = this.sets[setName];
+        if (!this.models) return;
         for (const bucket of set.buckets) bucket.count = 0;
         const maxDistance2 = maxDistance * maxDistance;
         set.trees = 0;
@@ -123,6 +132,6 @@ export function treeBounds(data) {
             b[k + 3] = Math.max(b[k + 3], data[o + k]);
         }
     }
-    const margin = 8;
-    return [b[0] - margin, b[1] - margin, b[2] - 1, b[3] + margin, b[4] + margin, b[5] + 30];
+    const margin = 22; // the widest crowns, scaled up
+    return [b[0] - margin, b[1] - margin, b[2] - 1, b[3] + margin, b[4] + margin, b[5] + 35];
 }

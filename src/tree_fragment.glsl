@@ -111,7 +111,7 @@ void main() {
     }
     float skyAccess = 0.02 + 0.98 * pow(0.8, (1.0 - vSkyLight) * 15.0);
     // ambient occlusion: the tree itself (baked: inside and under the crown) and the forest around (canopy map)
-    float occlusion = mix(0.22, 1.0, sqrt(vOpenness)) * (1.0 - canopyOcclusion(vRestPosition, true));
+    float occlusion = mix(0.32, 1.0, sqrt(vOpenness)) * (1.0 - canopyOcclusion(vRestPosition, true));
     vec3 light = ambientLight(n) * vAO * occlusion * skyAccess + lightColor * diffuse * shadow;
     vec3 color = albedo * light;
     fragColor = vec4(toneMap(applyAtmosphere(color, vPosition)), 1.0);

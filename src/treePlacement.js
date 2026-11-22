@@ -7,7 +7,13 @@ import { CHUNK_SIZE, SEA_LEVEL, SEED } from './constants';
 // every time the column is generated.
 
 const CELL = 7;
-export const TREE_FLOATS = 9; // x, y, z (base), yaw, scale, tint, sky light, sway phase, species
+export const TREE_FLOATS = 9; // x, y, z (base), yaw, scale, tint, sky light, sway phase, model
+
+// species: 0 oak, 1 pine, 2 birch, 3 bush, 4 dead tree; each with a few variants (models of treeModels.js)
+export const SPECIES_VARIANTS = [3, 2, 2, 2, 2];
+export const MODEL_SPECIES = SPECIES_VARIANTS.flatMap((n, species) => new Array(n).fill(species));
+export const MODEL_COUNT = MODEL_SPECIES.length;
+const MODEL_FIRST = SPECIES_VARIANTS.map((n, species) => SPECIES_VARIANTS.slice(0, species).reduce((a, b) => a + b, 0));
 const SNOW_LINE = 87;
 
 let forestNoise = null;
@@ -71,7 +77,7 @@ export function placeTrees(cx, cy, region, light, heights, x0, y0, z0, nx, ny, n
                 hash(gx, gy, 7),
                 light[((ix - x0) * ny + (iy - y0)) * nz + (h + 1 - z0)] / 15,
                 hash(gx, gy, 8) * Math.PI * 2,
-                kind);
+                MODEL_FIRST[kind] + Math.floor(hash(gx, gy, 9) * SPECIES_VARIANTS[kind]));
             ids.push(gx * 8192 + gy);
         }
     }
