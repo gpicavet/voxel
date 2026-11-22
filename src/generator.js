@@ -192,5 +192,18 @@ export function createGenerator(seed) {
         return solid === 0 ? 0 : solid === total ? 1 : -1;
     }
 
-    return { surfaceHeight, solidAt, columnHeights, fillChunk };
+    /** surface heights every step voxels, n x n samples from (x0, y0), x varying fastest; outside the world: very low */
+    function heightGrid(x0, y0, n, step) {
+        const grid = new Int16Array(n * n);
+        for (let j = 0; j < n; j++) {
+            for (let i = 0; i < n; i++) {
+                const x = x0 + i * step, y = y0 + j * step;
+                const outside = x < WORLD_MIN_XY || x >= WORLD_MAX_XY || y < WORLD_MIN_XY || y >= WORLD_MAX_XY;
+                grid[j * n + i] = outside ? WORLD_BOTTOM : surfaceHeight(x, y);
+            }
+        }
+        return grid;
+    }
+
+    return { surfaceHeight, solidAt, columnHeights, fillChunk, heightGrid };
 }

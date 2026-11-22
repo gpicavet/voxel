@@ -1,6 +1,6 @@
 import { vec3 } from "gl-matrix";
 import { Chunk } from "./chunk";
-import { runColumnTask } from "./columnTask";
+import { runColumnTask, runHeightGridTask } from "./columnTask";
 import {
     BRICK_BYTES, BRICKS, CHUNK_SIZE, CHUNKS_PER_COLUMN, COARSE, COARSE_BYTES, columnKey, CZ_MAX, CZ_MIN,
     insideWorld, SEA_LEVEL, SEED, WORLD_BOTTOM, WORLD_TOP,
@@ -27,8 +27,9 @@ const REMESH_BUDGET_MS = 4;  // per frame, for meshing modified chunks on the ma
 
 /** Generation and meshing in web workers; on the main thread, one column per frame, if workers are not available. */
 class WorkerPool {
-    constructor(onResult) {
+    constructor(onResult, onHeightGrid) {
         this.onResult = onResult;
+        this.onHeightGrid = onHeightGrid;
         this.workers = [];
         this.inFlight = [];
         try {
@@ -37,6 +38,10 @@ class WorkerPool {
             for (let i = 0; i < count; i++) {
                 const worker = new Worker(url);
                 worker.onmessage = (event) => {
+                    if (event.data.type === 'heightGrid') {
+                        this.onHeightGrid(event.data);
+                        return;
+                    }
                     this.inFlight[i]--;
                     this.onResult(event.data);
                 };
@@ -52,6 +57,15 @@ class WorkerPool {
 
     newFrame() {
         this.mainThreadBusy = false;
+    }
+
+    /** height map of a large area: on the last worker (or on the main thread) */
+    postHeightGrid(task) {
+        if (this.workers.length === 0) {
+            this.onHeightGrid(runHeightGridTask(task).result);
+        } else {
+            this.workers[this.workers.length - 1].postMessage({ type: 'heightGrid', ...task });
+        }
     }
 
     /** @returns false when every worker already has enough work */
@@ -106,7 +120,17 @@ export class World {
         this.multiDraw = gl.getExtension("WEBGL_multi_draw");
         this.indexBuffer = gl.createBuffer();
         this.indexCapacity = 0;
-        this.pool = new WorkerPool(result => this.results.push(result));
+        this.pool = new WorkerPool(result => this.results.push(result), grid => this.applyHeightGrid(grid));
+
+        // horizon: surface heights of the generated terrain every HORIZON_STEP voxels over HORIZON_SIZE x HORIZON_STEP
+        // around the camera (texture unit 2). The shadow rays that leave the loaded window go on against it, instead of
+        // counting as lit: with a low sun, the distant mountains cast their shadows.
+        this.horizonTexture = createHeightTexture(gl, gl.TEXTURE2, HORIZON_SIZE);
+        this.horizonOrigin = new Float32Array(2);
+        this.horizonValid = false;
+        this.horizonCenter = null;
+        this.horizonRequest = 0;
+        this.horizonPending = false;
 
         // shadow textures: unit 0 bricks (1 bit per voxel), unit 1 coarse occupancy
         this.brickTexture = createVoxelTexture(gl, gl.TEXTURE0, WINDOW * BRICKS, WINDOW * BRICKS, CHUNKS_PER_COLUMN * BRICKS);
@@ -173,6 +197,7 @@ export class World {
             this.plan();
             this.moveWindow();
         }
+        this.updateHorizon(camPosition);
 
         this.pool.newFrame();
         while (this.queue.length > 0) {
@@ -366,6 +391,36 @@ export class World {
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.indexBuffer);
         gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
         this.indexCapacity = capacity;
+    }
+
+    // ---------------------------------------------------------------- horizon
+
+    /** ask for a new height map when the camera has moved away from the center of the current one */
+    updateHorizon(camPosition) {
+        if (this.horizonPending) return;
+        if (this.horizonCenter && Math.hypot(camPosition[0] - this.horizonCenter[0], camPosition[1] - this.horizonCenter[1]) < HORIZON_REFRESH) return;
+        const half = (HORIZON_SIZE - 1) / 2 * HORIZON_STEP;
+        const x0 = Math.round(camPosition[0] / HORIZON_STEP) * HORIZON_STEP - half;
+        const y0 = Math.round(camPosition[1] / HORIZON_STEP) * HORIZON_STEP - half;
+        this.horizonPending = true;
+        this.pool.postHeightGrid({ id: ++this.horizonRequest, x0, y0, n: HORIZON_SIZE, step: HORIZON_STEP });
+    }
+
+    applyHeightGrid(grid) {
+        const gl = this.gl;
+        this.horizonPending = false;
+        if (grid.id !== this.horizonRequest) return;
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, this.horizonTexture);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 2);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, grid.n, grid.n, gl.RED_INTEGER, gl.SHORT, grid.heights);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.activeTexture(gl.TEXTURE0);
+        this.horizonOrigin[0] = grid.x0;
+        this.horizonOrigin[1] = grid.y0;
+        const half = (grid.n - 1) / 2 * grid.step;
+        this.horizonCenter = [grid.x0 + half, grid.y0 + half];
+        this.horizonValid = true;
     }
 
     // ---------------------------------------------------------------- shadow window
@@ -591,6 +646,23 @@ function chunkKey(cx, cy, cz) {
 
 function mod(a, n) {
     return ((a % n) + n) % n;
+}
+
+const HORIZON_STEP = 16;
+const HORIZON_SIZE = 257; // samples per side: 4096 voxels
+const HORIZON_REFRESH = 512;
+
+function createHeightTexture(gl, unit, size) {
+    gl.activeTexture(unit);
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R16I, size, size);
+    gl.activeTexture(gl.TEXTURE0);
+    return texture;
 }
 
 function createVoxelTexture(gl, unit, w, h, d) {

@@ -13,6 +13,7 @@ underwater view; craters dug next to the water fill up.
 Controls: arrows to move and turn, `z` / `s` to look up and down, `space` to blow up the terrain,
 `t` (held) to fast-forward time, `w` to change the weather, `g` to switch the light shafts,
 `+` / `-` to change the view distance, `c` to switch the cave culling, `h` to switch the shadows between half and full resolution.
+`v` writes the current view into the URL (`#pos=x,y,z&look=yaw,pitch&time=hours`, add `&pause` to stop the time): reload or share it to come back to the same view.
 The camera collides with the voxels and slides along them.
 The overlay shows fps, GPU time (when `EXT_disjoint_timer_query_webgl2` is available), visible chunks, loaded columns and triangles drawn.
 
