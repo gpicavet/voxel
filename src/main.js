@@ -4,6 +4,8 @@ import { CHUNK_SIZE, SEA_LEVEL } from "./constants";
 import { createCloudNoiseTexture } from "./cloudNoise";
 import { createVoxelTextures } from "./textures";
 import { clockTime, createDaylight, daylight } from "./daylight";
+import { TreeRenderer } from "./trees";
+import { frustumPlanes } from "./utils";
 import { World } from "./world";
 var vshader = require('./vertex.glsl');
 var fshader = require('./fragment.glsl');
@@ -17,6 +19,10 @@ var textureGenFshader = require('./texture_gen_fragment.glsl');
 var waterVshader = require('./water_vertex.glsl');
 var waterFshader = require('./water_fragment.glsl');
 var underwaterFshader = require('./underwater_fragment.glsl');
+var treeVshader = require('./tree_vertex.glsl');
+var treeFshader = require('./tree_fragment.glsl');
+var treeGbufferFshader = require('./tree_gbuffer_fragment.glsl');
+var treeDepthFshader = require('./tree_depth_fragment.glsl');
 
 // per second, so the speed no longer depends on the frame rate (same feel as before at 60 fps)
 const MOVE_SPEED = 60;
@@ -35,6 +41,11 @@ const CLOUD_UNIFORMS = ["cloudNoise", "cloudTime", "cloudCoverage"];
 const ATMOSPHERE_UNIFORMS = ["atmosphereScatter", "screenSize", "atmosphereOn"];
 // weather presets (cloud coverage), w cycles through them
 const WEATHERS = [["fair", 0.35], ["cloudy", 0.55], ["overcast", 0.85], ["clear", 0.0]]; // the first is the default
+// uniforms of tree_shadow.glsl
+const TREE_SHADOW_UNIFORMS = ["treeShadowMap", "treeShadowMatrix", "treeShadowOn"];
+const TREE_SHADOW_SIZE = 2048;
+const TREE_SHADOW_RADIUS = 128; // half side of the area of the tree shadow map, around the camera
+const TREE_SHADOW_PERIOD = 4;   // frames between two renderings of the tree shadow map (the sun moves slowly)
 // uniforms of shadow.glsl
 const SHADOW_UNIFORMS = ["brickTex", "coarseTex", "windowMin", "windowSize", "brickOrigin", "coarseOrigin",
     "horizonTex", "horizonOrigin", "horizonStep", "horizonValid"];
@@ -290,7 +301,7 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals", "reflectionPass", "seaLevel", "aoMask",
+        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals", "reflectionPass", "seaLevel", "aoMask", ...TREE_SHADOW_UNIFORMS,
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
@@ -326,12 +337,41 @@ function init() {
             "hasHalfDepth", "depthRange", "voxelNormals", ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const underwater = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, underwaterFshader),
         ["veil", ...SKY_UNIFORMS]);
+    const treeVertexShader = compileShader(gl, gl.VERTEX_SHADER, treeVshader);
+    const TREE_UNIFORMS = ["viewProj", "modelOrigin", "voxelSize", "windTime"];
+    const treeColor = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeFshader),
+        [...TREE_UNIFORMS, "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", "reflectionPass", "seaLevel",
+            ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS, ...TREE_SHADOW_UNIFORMS]);
+    const treeGbuffer = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeGbufferFshader), TREE_UNIFORMS);
+    const treeDepth = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeDepthFshader), TREE_UNIFORMS);
     const textureGen = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, textureGenFshader), ["layer", "size"]);
     createVoxelTextures(gl, textureGen, gl.TEXTURE13, gl.TEXTURE14);
     let cloudTime = 0;
 
 
     const world = new World(gl);
+    const trees = new TreeRenderer(gl, world);
+
+    // shadow map of the trees (unit 18): depth seen from the light, compared in the shaders
+    gl.activeTexture(gl.TEXTURE18);
+    const treeShadowTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, treeShadowTexture);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.DEPTH_COMPONENT24, TREE_SHADOW_SIZE, TREE_SHADOW_SIZE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+    gl.activeTexture(gl.TEXTURE0);
+    const treeShadowFramebuffer = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, treeShadowFramebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, treeShadowTexture, 0);
+    gl.drawBuffers([gl.NONE]);
+    gl.readBuffer(gl.NONE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const treeShadowMatrix = mat4.create(), treeLightView = mat4.create(), treeLightProj = mat4.create();
+    let treeShadowOn = false;
     // start above the ground at the center of the world
     vec3.set(camPosition, 0.5, 0.5, world.surfaceHeight(0, 0) + 25);
     const startPos = numbers("pos"), startLook = numbers("look");
@@ -343,7 +383,7 @@ function init() {
 
     // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 2 horizon heights, 3 half depth, 4 half face, 5 and 6 shadow masks,
     // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 and 14 voxel textures (albedo, normals), 15 water reflection,
-    // 16 and 17 ambient occlusion masks
+    // 16 and 17 ambient occlusion masks, 18 tree shadow map
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.brickTex, 0);
@@ -370,6 +410,13 @@ function init() {
     gl.uniform1i(color.locations.halfDepth, 3);
     gl.uniform1i(color.locations.voxelAlbedo, 13);
     gl.uniform1i(color.locations.voxelNormals, 14);
+    gl.uniform1i(color.locations.treeShadowMap, 18);
+    gl.useProgram(treeColor.program);
+    for (const [name, unit] of [["brickTex", 0], ["coarseTex", 1], ["horizonTex", 2], ["skyLUT", 7], ["cloudNoise", 8], ["treeShadowMap", 18]]) {
+        gl.uniform1i(treeColor.locations[name], unit);
+    }
+    gl.uniform1f(treeColor.locations.seaLevel, SEA_LEVEL);
+    gl.useProgram(color.program);
     gl.uniform1f(color.locations.seaLevel, SEA_LEVEL);
     gl.useProgram(water.program);
     gl.uniform1i(water.locations.skyLUT, 7);
@@ -491,6 +538,51 @@ function init() {
         gl.uniform1f(program.locations.underwaterDensity, underWater ? 0.06 : 0.0);
     }
 
+    function setTreeShadow(program) {
+        gl.uniformMatrix4fv(program.locations.treeShadowMatrix, false, treeShadowMatrix);
+        gl.uniform1i(program.locations.treeShadowOn, treeShadowOn ? 1 : 0);
+    }
+
+    // frustum planes without the bottom and top ones (trees above or below the screen show in the reflections)
+    const treePlanes = new Float32Array(24);
+    function sidePlanes(matrix) {
+        frustumPlanes(treePlanes, matrix);
+        for (let i = 8; i < 16; i++) treePlanes[i] = (i % 4 === 3) ? 1 : 0;
+        return treePlanes;
+    }
+
+    /** depth of the trees seen from the light, around the camera, every TREE_SHADOW_PERIOD frames */
+    function renderTreeShadows() {
+        const toLight = vec3.negate(vec3.create(), light.lightDir);
+        treeShadowOn = toLight[2] > 0.03;
+        if (!treeShadowOn || frameIndex % TREE_SHADOW_PERIOD !== 0) return;
+        // light space with a fixed orientation; the area is snapped to its texels, so the shadows do not shimmer
+        const up = Math.abs(toLight[2]) > 0.99 ? [0, 1, 0] : [0, 0, 1];
+        mat4.lookAt(treeLightView, [0, 0, 0], light.lightDir, up);
+        const c = vec3.transformMat4(vec3.create(), camPosition, treeLightView);
+        const texel = 2 * TREE_SHADOW_RADIUS / TREE_SHADOW_SIZE;
+        const sx = Math.round(c[0] / texel) * texel, sy = Math.round(c[1] / texel) * texel;
+        mat4.ortho(treeLightProj, sx - TREE_SHADOW_RADIUS, sx + TREE_SHADOW_RADIUS, sy - TREE_SHADOW_RADIUS, sy + TREE_SHADOW_RADIUS,
+            -c[2] - 400, -c[2] + 400);
+        mat4.multiply(treeShadowMatrix, treeLightProj, treeLightView);
+
+        trees.gather("shadow", camPosition, null, TREE_SHADOW_RADIUS * 1.5);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, treeShadowFramebuffer);
+        gl.viewport(0, 0, TREE_SHADOW_SIZE, TREE_SHADOW_SIZE);
+        gl.clear(gl.DEPTH_BUFFER_BIT);
+        gl.enable(gl.POLYGON_OFFSET_FILL);
+        gl.polygonOffset(2, 4);
+        gl.cullFace(gl.FRONT); // back faces in the map: less self shadowing on the lit faces
+        gl.useProgram(treeDepth.program);
+        gl.uniformMatrix4fv(treeDepth.locations.viewProj, false, treeShadowMatrix);
+        gl.uniform1f(treeDepth.locations.windTime, 0);
+        trees.draw("shadow", treeDepth.locations);
+        gl.cullFace(gl.BACK);
+        gl.disable(gl.POLYGON_OFFSET_FILL);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    }
+
     function setShadowWindow(program) {
         gl.uniform3fv(program.locations.windowMin, world.windowMin);
         gl.uniform3fv(program.locations.windowSize, world.windowSize);
@@ -588,6 +680,8 @@ function init() {
         underWater = world.isWater(Math.floor(camPosition[0]), Math.floor(camPosition[1]), Math.floor(camPosition[2] + 0.12));
         const visible = world.cull(viewProjMatrix, camPosition);
         visibleChunks = visible.length;
+        renderTreeShadows();
+        trees.gather("camera", camPosition, sidePlanes(viewProjMatrix), viewDistance());
 
         gl.enable(gl.DEPTH_TEST);
         gl.depthFunc(gl.LESS);
@@ -610,6 +704,10 @@ function init() {
             gl.useProgram(gbuffer.program);
             gl.uniformMatrix4fv(gbuffer.locations.viewProj, false, viewProjMatrix);
             world.draw(visible, camPosition, gbuffer.locations.chunkOrigin);
+            gl.useProgram(treeGbuffer.program);
+            gl.uniformMatrix4fv(treeGbuffer.locations.viewProj, false, viewProjMatrix);
+            gl.uniform1f(treeGbuffer.locations.windTime, waterTime);
+            trees.draw("camera", treeGbuffer.locations);
         }
         if (halfResShadows) {
 
@@ -702,7 +800,30 @@ function init() {
                 shadowTargets.width / gl.drawingBufferWidth, shadowTargets.height / gl.drawingBufferHeight);
             gl.uniform1f(color.locations.fogDensity, 1.2 / viewDistance()); // fog = 0.95 at the view distance
             setShadowWindow(color);
+            setTreeShadow(color);
             return world.draw(chunks, eye, color.locations.chunkOrigin);
+        }
+
+        // trees, shaded like the terrain; mirrored = in the reflection of the water
+        function drawTrees(matrix, eye, mirrored) {
+            gl.useProgram(treeColor.program);
+            gl.uniformMatrix4fv(treeColor.locations.viewProj, false, matrix);
+            gl.uniform1f(treeColor.locations.windTime, waterTime);
+            setSky(treeColor);
+            setClouds(treeColor);
+            setAtmosphere(treeColor);
+            setTreeShadow(treeColor);
+            gl.uniform3fv(treeColor.locations.camPosition, eye);
+            gl.uniform1i(treeColor.locations.halfResShadows, halfResShadows && !mirrored ? 1 : 0);
+            gl.uniform1i(treeColor.locations.reflectionPass, mirrored ? 1 : 0);
+            gl.uniform1i(treeColor.locations.rawOutput, mirrored ? 1 : 0);
+            if (mirrored) gl.uniform1i(treeColor.locations.atmosphereOn, 0);
+            gl.uniform1i(treeColor.locations.shadowMask, 5 + shadowTargets.current);
+            gl.uniform2f(treeColor.locations.maskScale,
+                shadowTargets.width / gl.drawingBufferWidth, shadowTargets.height / gl.drawingBufferHeight);
+            gl.uniform1f(treeColor.locations.fogDensity, 1.2 / viewDistance());
+            setShadowWindow(treeColor);
+            trees.draw("camera", treeColor.locations);
         }
 
         // sky on the far plane: only the pixels the terrain left empty are shaded
@@ -740,6 +861,7 @@ function init() {
             gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
             gl.cullFace(gl.FRONT); // the mirror flips the winding
             drawTerrainColor(world.cullReflection(reflViewProjMatrix, mirroredCamPosition), reflViewProjMatrix, mirroredCamPosition, true);
+            drawTrees(reflViewProjMatrix, mirroredCamPosition, true);
             gl.cullFace(gl.BACK);
             drawSky(reflInvViewProjMatrix, mirroredCamPosition, true);
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -749,6 +871,7 @@ function init() {
         // 3. full resolution color, shadows read from the mask (or traced per pixel)
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         facesDrawn = drawTerrainColor(visible, viewProjMatrix, camPosition, false);
+        drawTrees(viewProjMatrix, camPosition, false);
 
         // 4. sky
         drawSky(invViewProjMatrix, camPosition, false);
@@ -821,6 +944,7 @@ function init() {
                 ` | view ${world.viewRadius} (+/-)` +
                 ` | cave culling ${world.caveCulling ? "on" : "off"} (c)` +
                 ` | ${(facesDrawn * 2 / 1e6).toFixed(2)} M triangles` +
+                ` | trees ${trees.sets.camera.trees} (${(trees.sets.camera.faces * 2 / 1e6).toFixed(2)} M triangles)` +
                 (waterFaces > 0 ? ` | water ${(waterFaces / 1e3).toFixed(0)} k faces` : "") +
                 ` | ${canvas.width}x${canvas.height}` +
                 ` | pos ${Array.from(camPosition, v => v.toFixed(1)).join(" ")}` +

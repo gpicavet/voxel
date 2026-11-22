@@ -10,7 +10,7 @@ const STRIDES = [PP, P, 1];
 const SNOW_LINE = 90;
 
 // Face order: +x, -x, +y, -y, +z, -z. Corners are counter-clockwise seen from outside.
-const FACES = [
+export const FACES = [
     { n: [1, 0, 0], c: [[1, 1, 0], [1, 1, 1], [1, 0, 1], [1, 0, 0]] },
     { n: [-1, 0, 0], c: [[0, 1, 1], [0, 1, 0], [0, 0, 0], [0, 0, 1]] },
     { n: [0, 1, 0], c: [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]] },

@@ -9,6 +9,8 @@ import { createGenerator, P } from "./generator";
 import { buildMesh, buildWaterMesh } from "./mesher";
 import { faceConnectivity } from "./visibility";
 import { LIGHT_MARGIN } from "./skylight";
+import { TREE_FLOATS } from "./treePlacement";
+import { treeBounds } from "./trees";
 import { aabbInFrustum, frustumPlanes } from "./utils";
 import workerSource from "../build/worker.js?raw";
 
@@ -103,6 +105,7 @@ export class World {
         this.generator = createGenerator(SEED);
         this.columns = new Map();
         this.edits = new Map();        // column key -> modified chunks of an unloaded column
+        this.treeRemovals = new Map(); // column key -> ids of the trees destroyed by explosions (kept when unloaded)
         this.viewRadius = HALF_WINDOW; // in columns: 8 = 512 voxels
         this.camColumn = null;
         this.queue = [];               // column requests, nearest last
@@ -289,6 +292,7 @@ export class World {
         } else if (result.version === column.editVersion) {
             // meshed by the worker with the modified chunks around: lit, and up to date
             column.hasMesh = true;
+            this.setTrees(column, result.trees.data, result.trees.ids);
             result.chunks.forEach((data, i) => {
                 const chunk = column.chunks[i];
                 if (data.mesh) {
@@ -304,6 +308,46 @@ export class World {
         // modified again meanwhile: mesh once more
         if (column.needsRemesh) {
             this.queue.push({ cx: column.cx, cy: column.cy, distance: 0, mesh: true });
+        }
+    }
+
+    /** trees of a column, without the ones destroyed by explosions */
+    setTrees(column, data, ids) {
+        const removed = this.treeRemovals.get(column.key);
+        if (removed) {
+            const keep = [];
+            for (let i = 0; i < ids.length; i++) if (!removed.has(ids[i])) keep.push(i);
+            const kept = new Float32Array(keep.length * TREE_FLOATS);
+            keep.forEach((i, k) => kept.set(data.subarray(i * TREE_FLOATS, (i + 1) * TREE_FLOATS), k * TREE_FLOATS));
+            data = kept;
+            ids = Int32Array.from(keep, i => ids[i]);
+        }
+        column.trees = { data, ids, bounds: treeBounds(data) };
+    }
+
+    /** destroy the trees whose trunk is within the explosion */
+    removeTrees(center, radius) {
+        const reach = radius + 8;
+        for (let cx = Math.floor((center[0] - reach) / CHUNK_SIZE); cx <= Math.floor((center[0] + reach) / CHUNK_SIZE); cx++) {
+            for (let cy = Math.floor((center[1] - reach) / CHUNK_SIZE); cy <= Math.floor((center[1] + reach) / CHUNK_SIZE); cy++) {
+                if (!insideWorld(cx, cy)) continue;
+                const column = this.columns.get(columnKey(cx, cy));
+                if (!column || !column.trees) continue;
+                const { data, ids } = column.trees;
+                let removed = this.treeRemovals.get(column.key);
+                let any = false;
+                for (let i = 0; i < ids.length; i++) {
+                    const o = i * TREE_FLOATS;
+                    // distance to the lower trunk (5 voxels)
+                    const dz = center[2] - Math.min(Math.max(center[2], data[o + 2]), data[o + 2] + 5);
+                    if (Math.hypot(center[0] - data[o], center[1] - data[o + 1], dz) < radius + 1) {
+                        if (!removed) this.treeRemovals.set(column.key, removed = new Set());
+                        removed.add(ids[i]);
+                        any = true;
+                    }
+                }
+                if (any) this.setTrees(column, data, ids);
+            }
         }
     }
 
@@ -505,6 +549,7 @@ export class World {
 
     boom(center, radius) {
         if (!center) return;
+        this.removeTrees(center, radius);
         const changed = [];
         const affected = [];
         const lo = [0, 1, 2].map(i => Math.floor((center[i] - radius - 2) / CHUNK_SIZE));

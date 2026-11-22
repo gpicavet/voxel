@@ -34,6 +34,8 @@ out vec4 fragColor;
 @import ./clouds;
 @import ./cloud_shading;
 @import ./atmosphere;
+@import ./surface_atmosphere;
+@import ./tree_shadow;
 
 // start of the shadow ray: on the face plane (an integer coordinate: removes the interpolation error, which grows
 // far from the origin), just in front of the face
@@ -151,6 +153,9 @@ void main() {
         shadow = castShadowRay(rayStart(), toLight) * cloudShadow(vPosition, toLight);
     }
 
+    // shadows of the trees (shadow map)
+    if(shadow > 0.0) shadow *= treeShadow(vPosition, vNormal);
+
     // linear lighting: ambient from the sky (darkened by the occlusion) + sun or moon (only partly darkened by the
     // occlusion, so creases stay readable in the light); the relief of the textures (normal map) catches the light,
     // the shadows follow the voxel faces
@@ -160,32 +165,7 @@ void main() {
     vec3 light = ambientLight(normal) * vAO * occlusion * skyAccess + lightColor * max(dot(normal, toLight), 0.0) * shadow * (0.5 + 0.5 * vAO);
     vec3 color = albedo * light;
 
-    vec3 toSurface = vPosition - camPosition;
-    float dist = length(toSurface);
-    vec3 viewDir = toSurface / dist;
-    // clouds in front, when the camera is above them
-    if(camPosition.z > CLOUD_BOTTOM) {
-        vec3 cloudNormal;
-        ivec3 cloudCellHit;
-        float t = traceClouds(camPosition, viewDir, dist, cloudNormal, cloudCellHit);
-        if(t >= 0.0) color = mix(color, shadeCloud(viewDir, cloudNormal, cloudCellHit), exp(-t / CLOUD_FADE));
-    }
-    // haze of the light shafts: where the sun does not reach it, lit by the sky only (isotropic scattering of the
-    // upper hemisphere: about half the zenith radiance), darker than the sunlit shafts added at the end
-    vec4 shafts = lightShaftsAt();
-    color = mix(skyRadiance(vec3(0.0, 0.0, 1.0)) * 0.5, color, shafts.a);
-    // valley mist, lit like the horizon in that direction
-    float mist = reflectionPass ? 0.0 : 1.0 - exp(-mistDepth(camPosition, viewDir, dist));
-    color = mix(color, skyRadiance(vec3(viewDir.xy, 0.0)), mist);
-    // distance fog with the color of the sky behind the surface: far terrain melts into the horizon, and chunks
-    // appear in the fog rather than at a visible edge
-    float d2 = (dist * fogDensity) * (dist * fogDensity);
-    float fog = 1.0 - exp(-d2 * d2 * d2); // clear up to half the view distance, thick close to it
-    color = mix(color, skyRadiance(viewDir), fog);
-    // camera under the water: everything fades into the water with the distance
-    if(underwaterDensity > 0.0) color = mix(color, underwaterColor(), 1.0 - exp(-dist * underwaterDensity));
-    // sunlit haze last: it is in the air in front, not hidden by the fog that hides the far chunks
-    color += shafts.rgb;
+    color = applyAtmosphere(color, vPosition);
 
     fragColor = vec4(toneMap(color), 1);
 }

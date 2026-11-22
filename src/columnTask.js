@@ -2,6 +2,7 @@ import { CHUNK_SIZE, CZ_MAX, CZ_MIN, SEA_LEVEL, SEED, WORLD_BOTTOM } from './con
 import { createGenerator, P } from './generator';
 import { buildMesh, buildWaterMesh, coarseFromBricks, packBricks } from './mesher';
 import { computeSkylight, LIGHT_MARGIN } from './skylight';
+import { placeTrees } from './treePlacement';
 import { faceConnectivity, uniformConnectivity } from './visibility';
 
 let generator = null;
@@ -93,6 +94,8 @@ export function runColumnTask({ id, cx, cy, mesh, edits = [], version = 0 }) {
     generator.fillRegion(x0, y0, Z0, NX, NY, NZ, regionHeights, region);
     applyEdits(edits, x0, y0);
     computeSkylight(region, NX, NY, NZ, light);
+    const trees = placeTrees(cx, cy, region, light, regionHeights, x0, y0, Z0, NX, NY, NZ);
+    transfer.push(trees.data.buffer, trees.ids.buffer);
 
     // heights of the column and of the padding columns, for the materials and the water
     const heights = new Int16Array(P * P);
@@ -131,5 +134,5 @@ export function runColumnTask({ id, cx, cy, mesh, edits = [], version = 0 }) {
         }
         chunks.push(data);
     }
-    return { result: { id, cx, cy, mesh, version, heights, chunks }, transfer };
+    return { result: { id, cx, cy, mesh, version, heights, chunks, trees }, transfer };
 }
