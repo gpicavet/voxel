@@ -13,6 +13,6 @@ out vec4 fragFace;
 @import ./tree_surface;
 
 void main() {
-    treeTexel(vMaterial, treeUV(vLocal, vLocalNormal, vTint * 7.0)); // the gaps of the leaves stay empty
+    treeTexel(vMaterial, vLocalNormal, treeUV(vLocal, vLocalNormal, vTint * 7.0)); // the gaps of the leaves stay empty
     fragFace = vec4(8.0 / 255.0, 0.0, 0.0, 1.0);
 }

@@ -45,7 +45,10 @@ const WEATHERS = [["fair", 0.35], ["cloudy", 0.55], ["overcast", 0.85], ["clear"
 const TREE_SHADOW_UNIFORMS = ["treeShadowMap", "treeShadowMatrix", "treeShadowOn"];
 const TREE_SHADOW_SIZE = 2048;
 const TREE_SHADOW_RADIUS = 128; // half side of the area of the tree shadow map, around the camera
-const TREE_SHADOW_PERIOD = 4;   // frames between two renderings of the tree shadow map (the sun moves slowly)
+// the tree shadow map is rendered again only when the light turned by this much, the camera moved by this much, or
+// trees appeared or disappeared: in between nothing moves, so the shadows never shimmer
+const TREE_SHADOW_LIGHT_STEP = 0.004; // radians: about every second at the normal speed of the sun
+const TREE_SHADOW_MOVE_STEP = 16;
 // uniforms of shadow.glsl
 const SHADOW_UNIFORMS = ["brickTex", "coarseTex", "windowMin", "windowSize", "brickOrigin", "coarseOrigin",
     "horizonTex", "horizonOrigin", "horizonStep", "horizonValid"];
@@ -372,6 +375,7 @@ function init() {
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     const treeShadowMatrix = mat4.create(), treeLightView = mat4.create(), treeLightProj = mat4.create();
     let treeShadowOn = false;
+    const treeShadowState = { light: null, center: null, version: -1 };
     // start above the ground at the center of the world
     vec3.set(camPosition, 0.5, 0.5, world.surfaceHeight(0, 0) + 25);
     const startPos = numbers("pos"), startLook = numbers("look");
@@ -554,14 +558,21 @@ function init() {
         return treePlanes;
     }
 
-    /** depth of the trees seen from the light, around the camera, every TREE_SHADOW_PERIOD frames */
-    function renderTreeShadows() {
-        const toLight = vec3.negate(vec3.create(), light.lightDir);
-        treeShadowOn = toLight[2] > 0.03;
-        if (!treeShadowOn || frameIndex % TREE_SHADOW_PERIOD !== 0) return;
-        // light space with a fixed orientation; the area is snapped to its texels, so the shadows do not shimmer
-        const up = Math.abs(toLight[2]) > 0.99 ? [0, 1, 0] : [0, 0, 1];
-        mat4.lookAt(treeLightView, [0, 0, 0], light.lightDir, up);
+    /** depth of the trees seen from the light, around the camera, when needed (see TREE_SHADOW_LIGHT_STEP) */
+    function renderTreeShadows(fastTime) {
+        treeShadowOn = -light.lightDir[2] > 0.03;
+        if (!treeShadowOn) return;
+        const state = treeShadowState;
+        const lightTurned = !state.light || fastTime || vec3.angle(state.light, light.lightDir) > TREE_SHADOW_LIGHT_STEP;
+        const cameraMoved = !state.center || vec3.distance(state.center, camPosition) > TREE_SHADOW_MOVE_STEP;
+        if (!lightTurned && !cameraMoved && state.version === world.treesVersion) return;
+        if (lightTurned) state.light = vec3.clone(light.lightDir);
+        state.center = vec3.clone(camPosition);
+        state.version = world.treesVersion;
+        // light space with a fixed orientation between light steps; the area is snapped to its texels, so moving the
+        // camera does not move the shadows
+        const up = Math.abs(state.light[2]) > 0.99 ? [0, 1, 0] : [0, 0, 1];
+        mat4.lookAt(treeLightView, [0, 0, 0], state.light, up);
         const c = vec3.transformMat4(vec3.create(), camPosition, treeLightView);
         const texel = 2 * TREE_SHADOW_RADIUS / TREE_SHADOW_SIZE;
         const sx = Math.round(c[0] / texel) * texel, sy = Math.round(c[1] / texel) * texel;
@@ -683,7 +694,7 @@ function init() {
         underWater = world.isWater(Math.floor(camPosition[0]), Math.floor(camPosition[1]), Math.floor(camPosition[2] + 0.12));
         const visible = world.cull(viewProjMatrix, camPosition);
         visibleChunks = visible.length;
-        renderTreeShadows();
+        renderTreeShadows(timeScale > 1);
         trees.gather("camera", camPosition, sidePlanes(viewProjMatrix), viewDistance());
 
         gl.enable(gl.DEPTH_TEST);

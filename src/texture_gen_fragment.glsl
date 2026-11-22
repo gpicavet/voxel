@@ -5,7 +5,8 @@ precision highp int;
 // Generates one layer of the voxel textures (run once at startup, textures.js): realistic, tileable (every noise is
 // periodic over the texture), with a relief turned into a normal map. Layers: 0 earth, 1 rock, 2 grass, 3 snow, 4 sand,
 // 5 water ripples (only its normal map is used, by water_fragment.glsl), and for the trees: 6 oak bark, 7 birch bark,
-// 8 dead wood, 9 leaves and 10 needles (with transparent gaps in the alpha channel).
+// 8 dead wood, 9 leaves (hanging, for the sides of the voxels) and 10 needles, 11 leaves in every direction (for the top
+// and bottom faces); leaves and needles have transparent gaps in the alpha channel.
 
 uniform int layer;
 uniform float size; // texels per side
@@ -77,12 +78,13 @@ float leafShape(vec2 q, bool needle) {
 
 // leaves on a jittered grid (periodic): the topmost leaf covering uv. Returns its height; its color variation and
 // whether uv is covered in out
-float leaves(vec2 uv, float cells, int perCell, float size, bool needle, out float variation, out float covered) {
+float leaves(vec2 uv, float cells, int perCell, float size, bool needle, bool hanging, out float variation, out float covered, out float stalk) {
     vec2 p = uv * cells;
     vec2 i = floor(p);
     float best = -1.0, height = 0.0;
     variation = 0.0;
     covered = 0.0;
+    stalk = 0.0;
     for(int y = -1; y <= 1; y++) {
         for(int x = -1; x <= 1; x++) {
             vec2 cell = mod(i + vec2(x, y), cells);
@@ -90,15 +92,26 @@ float leaves(vec2 uv, float cells, int perCell, float size, bool needle, out flo
                 if(k >= perCell) break;
                 vec2 seed = cell + float(k) * 13.7;
                 vec2 center = i + vec2(x, y) + hash2(seed);
-                float angle = hash(seed + 5.1) * 6.2831853;
+                // leaves hang, tip down (texture y is up on the sides of the voxels), within +-30 degrees; needles anywhere
+                float angle = hanging ? 1.5707963 + (hash(seed + 5.1) - 0.5) * 1.05 : hash(seed + 5.1) * 6.2831853;
                 float scale = size * (0.75 + 0.5 * hash(seed + 9.3));
                 vec2 d = (p - center) / scale;
                 vec2 q = vec2(cos(angle) * d.x + sin(angle) * d.y, -sin(angle) * d.x + cos(angle) * d.y);
                 float shape = leafShape(q, needle);
                 float order = hash(seed + 2.7);
+                // stalk of the leaf, above its base
+                if(!needle && shape >= 0.0 && q.x > 0.9 && q.x < 1.35 && abs(q.y) < 0.035 && order > best) {
+                    best = order;
+                    covered = 1.0;
+                    stalk = 1.0;
+                    variation = hash(seed + 7.7);
+                    height = 0.45;
+                    continue;
+                }
                 if(shape < 0.0 && order > best) {
                     best = order;
                     covered = 1.0;
+                    stalk = 0.0;
                     variation = hash(seed + 7.7);
                     float dome = sqrt(max(-shape, 0.0)) * (needle ? 2.0 : 0.8);
                     float midrib = smoothstep(0.035, 0.0, abs(q.y)) * 0.25;
@@ -209,19 +222,20 @@ float material(vec2 uv, out vec3 albedo) {
         albedo *= 1.0 - crack * 0.7;
         return height;
     }
-    if(layer == 9) {
+    if(layer == 9 || layer == 11) {
         // leaves: overlapping leaves on transparent gaps, each a bit different, lighter midrib and veins
-        float variation, covered;
-        float height = leaves(uv, 6.0, 3, 0.62, false, variation, covered);
+        float variation, covered, stalk;
+        float height = leaves(uv, 6.0, 3, 0.62, false, layer == 9, variation, covered, stalk);
         gAlpha = covered;
         albedo = mix(vec3(0.06, 0.15, 0.03), vec3(0.20, 0.36, 0.07), variation);
         albedo *= 0.65 + 0.6 * clamp(height - 0.3, 0.0, 1.0);
+        albedo = mix(albedo, vec3(0.14, 0.12, 0.05), stalk);
         return height;
     }
     if(layer == 10) {
         // needles: thin needles in every direction, densely packed, dark green with lighter tips
-        float variation, covered;
-        float height = leaves(uv, 12.0, 4, 1.05, true, variation, covered);
+        float variation, covered, stalk;
+        float height = leaves(uv, 12.0, 4, 1.05, true, false, variation, covered, stalk);
         gAlpha = covered;
         albedo = mix(vec3(0.025, 0.08, 0.035), vec3(0.07, 0.19, 0.08), variation);
         albedo *= 0.7 + 0.5 * clamp(height - 0.3, 0.0, 1.0);
@@ -242,7 +256,7 @@ void main() {
     // normal from the relief (finite differences, wrapping around with the noise)
     float hx = material(uv + vec2(1.0 / size, 0.0), unused);
     float hy = material(uv + vec2(0.0, 1.0 / size), unused);
-    float strength = layer == 3 || layer == 4 ? 2.0 : layer == 2 ? 5.0 : layer == 5 ? 3.0 : layer >= 9 ? 4.0 : 8.0;
+    float strength = layer == 3 || layer == 4 ? 2.0 : layer == 2 ? 5.0 : layer == 5 ? 3.0 : layer >= 9 ? 4.0 : 8.0; // 9, 10, 11: leaves
     vec3 n = normalize(vec3((h - hx) * size * strength / 64.0, (h - hy) * size * strength / 64.0, 1.0));
     // the alpha of the texel itself (material() of the neighbours changed gAlpha)
     vec3 unusedAlbedo;

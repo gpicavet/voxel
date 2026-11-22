@@ -323,6 +323,7 @@ export class World {
             ids = Int32Array.from(keep, i => ids[i]);
         }
         column.trees = { data, ids, bounds: treeBounds(data) };
+        this.treesVersion = (this.treesVersion || 0) + 1; // the shadow map of the trees is rendered again
     }
 
     /** destroy the trees whose trunk is within the explosion */

@@ -15,6 +15,7 @@ uniform bool reflectionPass;
 uniform float seaLevel;
 
 in vec3 vPosition;
+in vec3 vRestPosition;
 in vec3 vNormal;
 in vec3 vLocal;
 flat in vec3 vLocalNormal;
@@ -47,7 +48,7 @@ float hash(vec3 p) {
 // color (linear) and normal (world) of the fragment, from the textures; per tree and per voxel variations
 void treeSurface(bool leaf, out vec3 albedo, out vec3 normal) {
     vec2 uv = treeUV(vLocal, vLocalNormal, vTint * 7.0);
-    vec4 texel = treeTexel(vMaterial, uv);
+    vec4 texel = treeTexel(vMaterial, vLocalNormal, uv);
     albedo = texel.rgb;
     if(vMaterial == 5) albedo *= vec3(1.25, 1.25, 1.05);     // birch leaves: lighter
     if(vMaterial == 3) albedo *= 0.8;                         // needles: darker
@@ -59,7 +60,7 @@ void treeSurface(bool leaf, out vec3 albedo, out vec3 normal) {
     // a little per voxel, so the voxels still read
     albedo *= 0.94 + 0.12 * hash(floor(vLocal - vLocalNormal * 0.5));
 
-    vec3 tn = texture(voxelNormals, vec3(uv, float(TREE_LAYERS[vMaterial]))).xyz * 2.0 - 1.0;
+    vec3 tn = texture(voxelNormals, vec3(uv, treeLayer(vMaterial, vLocalNormal))).xyz * 2.0 - 1.0;
     vec3 n = vLocalNormal;
     vec3 t = abs(n.x) > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
     vec3 b = abs(n.z) > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
@@ -106,7 +107,7 @@ void main() {
     if(diffuse > 0.0 && toLight.z > 0.0) {
         vec2 s = halfResShadows ? maskShadow(toLight)
             : vec2(castShadowRay(vPosition + toLight * 0.3, toLight), cloudShadow(vPosition, toLight));
-        shadow = s.x * s.y * treeShadow(vPosition, n);
+        shadow = s.x * s.y * treeShadow(vRestPosition, n);
     }
     float skyAccess = 0.02 + 0.98 * pow(0.8, (1.0 - vSkyLight) * 15.0);
     vec3 light = ambientLight(n) * vAO * skyAccess + lightColor * diffuse * shadow;

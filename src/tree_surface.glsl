@@ -23,9 +23,15 @@ vec2 treeUV(vec3 local, vec3 localNormal, float offset) {
     return uv / TREE_TILE + offset;
 }
 
+// texture layer of a material on a face: leaves hang on the sides, lie in every direction on the top and bottom faces
+float treeLayer(int material, vec3 localNormal) {
+    bool horizontal = abs(localNormal.z) > 0.5;
+    return float(horizontal && (material == 1 || material == 5 || material == 6) ? 11 : TREE_LAYERS[material]);
+}
+
 // texel of the tree material; discards the transparent gaps of the leaves when cutout
-vec4 treeTexel(int material, vec2 uv) {
-    vec4 texel = texture(voxelAlbedo, vec3(uv, float(TREE_LAYERS[material])));
+vec4 treeTexel(int material, vec3 localNormal, vec2 uv) {
+    vec4 texel = texture(voxelAlbedo, vec3(uv, treeLayer(material, localNormal)));
     if(cutout && isLeaf(material)) {
         // the mipmaps average the alpha: raise it with the mip level, so the foliage keeps its coverage far away
         vec2 texels = uv * vec2(textureSize(voxelAlbedo, 0).xy);

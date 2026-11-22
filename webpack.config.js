@@ -43,5 +43,10 @@ module.exports = [
             compress: true,
             port: 8000,
         },
+        // a single file demo (the worker is inlined): no point in splitting it
+        performance: {
+            maxAssetSize: 1024 * 1024,
+            maxEntrypointSize: 1024 * 1024,
+        },
     },
 ];
