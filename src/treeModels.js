@@ -1,5 +1,6 @@
 import alea from 'alea';
 import { FACES } from './mesher';
+import { MODEL_COUNT, MODEL_SPECIES } from './treePlacement';
 
 // Tree models, generated at startup (no file): voxels of TREE_VOXEL (4 times smaller than the terrain voxels),
 // meshed once with their ambient occlusion, in 3 levels of detail (voxels of 0.25, 0.5 and 1). The trees of the world
@@ -12,9 +13,7 @@ export const TREE_LODS = 3;
 export const BARK = 0, OAK_LEAVES = 1, BIRCH_BARK = 2, NEEDLES = 3, DEAD_WOOD = 4, BIRCH_LEAVES = 5, BUSH_LEAVES = 6;
 const WOOD = new Set([BARK, BIRCH_BARK, DEAD_WOOD]);
 
-// species, in the order of treePlacement.js
-export const OAK = 0, PINE = 1, BIRCH = 2, BUSH = 3, DEAD = 4;
-export const SPECIES_COUNT = 5;
+// species and their variants: treePlacement.js (SPECIES_VARIANTS, MODEL_COUNT)
 
 class Grid {
     constructor(nx, ny, nz) {
@@ -29,6 +28,7 @@ class Grid {
         this.v[(x * this.ny + y) * this.nz + z] = material + 1;
     }
     setIfEmpty(x, y, z, material) {
+        x = Math.round(x); y = Math.round(y); z = Math.round(z);
         if (this.get(x, y, z) === 0) this.set(x, y, z, material);
     }
     get(x, y, z) {
@@ -72,119 +72,303 @@ function blob(grid, random, c, rx, ry, rz, material, density = 0.75) {
     }
 }
 
-function trunk(grid, cx, cy, height, radius, material, flare = 0) {
-    for (let z = 0; z < height; z++) {
-        const r = radius + (z < 4 ? flare * (1 - z / 4) : 0);
-        disc(grid, cx, cy, z, r, material);
-    }
+function normalize(v) {
+    const l = Math.hypot(v[0], v[1], v[2]) || 1;
+    return [v[0] / l, v[1] / l, v[2] / l];
 }
 
-function oak(random) {
-    const g = new Grid(48, 48, 60);
-    const c = 24, trunkHeight = 17 + Math.floor(random() * 4);
-    trunk(g, c, c, trunkHeight + 8, 1.7, BARK, 1.2);
-    const top = [c, c, trunkHeight + 8];
-    for (let i = 0; i < 4; i++) {
-        const a = random() * Math.PI * 2;
-        branch(g, [c, c, trunkHeight - 2 + i * 2], [c + Math.cos(a) * 9, c + Math.sin(a) * 9, trunkHeight + 8 + random() * 4], 1, BARK);
-    }
-    blob(g, random, [top[0], top[1], top[2] + 4], 11, 11, 8, OAK_LEAVES);
-    for (let i = 0; i < 6; i++) {
-        const a = i / 6 * Math.PI * 2 + random();
-        const d = 6 + random() * 4;
-        blob(g, random, [c + Math.cos(a) * d, c + Math.sin(a) * d, top[2] + random() * 6 - 1], 6 + random() * 3, 6 + random() * 3, 5 + random() * 2, OAK_LEAVES);
-    }
-    return g;
+function direction(azimuth, elevation) {
+    return [Math.cos(azimuth) * Math.cos(elevation), Math.sin(azimuth) * Math.cos(elevation), Math.sin(elevation)];
 }
 
-function pine(random) {
-    const g = new Grid(36, 36, 72);
-    const c = 18, height = 64;
-    trunk(g, c, c, height - 4, 1.3, BARK, 0.8);
-    // tiers of drooping branches, smaller towards the top
-    for (let z = 10; z < height; z++) {
-        const level = (z - 10) / (height - 10);
-        const tier = ((z - 10) % 7) / 7; // 0 at the bottom of a tier
-        const r = 15 * Math.pow(1 - level, 0.9) * (0.55 + 0.45 * (1 - tier)) + 1;
-        for (let x = Math.floor(c - r - 1); x <= Math.ceil(c + r + 1); x++) {
-            for (let y = Math.floor(c - r - 1); y <= Math.ceil(c + r + 1); y++) {
-                const d = Math.hypot(x - c, y - c) / r;
-                if (d > 1.1) continue;
-                if (random() < (d < 0.75 ? 1 : d < 1 ? 0.7 : 0.25)) g.setIfEmpty(x, y, z, NEEDLES);
+/**
+ * A crooked branch: straight segments whose direction drifts slowly (bends, not noise), radius tapering from r0 to r1.
+ * rise pulls it up (> 0) or lets it droop (< 0).
+ */
+function crooked(grid, random, start, dir, length, r0, r1, { segments = 6, wobble = 0.25, rise = 0, material = BARK } = {}) {
+    let p = start.slice(), d = normalize(dir);
+    let drift = [(random() - 0.5) * wobble, (random() - 0.5) * wobble, 0];
+    const step = length / segments;
+    const points = [p.slice()];
+    for (let i = 0; i < segments; i++) {
+        const r = r0 + (r1 - r0) * (i / segments);
+        const next = [p[0] + d[0] * step, p[1] + d[1] * step, p[2] + d[2] * step];
+        branch(grid, p, next, Math.max(r, 0.5), material);
+        points.push(next);
+        drift = [drift[0] * 0.6 + (random() - 0.5) * wobble, drift[1] * 0.6 + (random() - 0.5) * wobble, drift[2] * 0.6 + (random() - 0.5) * wobble * 0.5];
+        d = normalize([d[0] + drift[0], d[1] + drift[1], d[2] + drift[2] + rise]);
+        p = next;
+    }
+    return { end: p, dir: d, points };
+}
+
+/** recursive limbs; the ends of the last ones go to terminals (where the foliage grows) */
+function limbs(grid, random, start, dir, length, radius, depth, terminals, opts) {
+    const segment = crooked(grid, random, start, dir, length, radius, radius * 0.65,
+        { segments: 5, wobble: opts.wobble, rise: opts.rise, material: opts.material });
+    if (depth === 0 || radius < 0.7) {
+        terminals.push(segment.end);
+        return;
+    }
+    const children = opts.children || (depth >= 2 ? 3 : 2);
+    for (let k = 0; k < children; k++) {
+        const from = k === 0 ? segment.end : segment.points[Math.floor(2 + random() * (segment.points.length - 2))];
+        const azimuth = Math.atan2(segment.dir[1], segment.dir[0]) + (random() - 0.5) * 1.8;
+        const elevation = Math.asin(Math.max(-1, Math.min(1, segment.dir[2]))) + (random() - 0.35) * 0.6;
+        limbs(grid, random, from, direction(azimuth, elevation), length * (0.55 + random() * 0.2), radius * 0.62, depth - 1, terminals, opts);
+    }
+    if (opts.padsAlong && depth >= 1) terminals.push(segment.points[Math.floor(segment.points.length * 0.6)]);
+}
+
+/**
+ * Pad of foliage: flattened, domed on top, flat below, with an irregular outline and an irregular fringe of leaves
+ * hanging from its edge (droop voxels at most).
+ */
+function clumpHash(x, y, z, seed) {
+    let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(z, 1440670441) + seed) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+function pad(grid, random, c, rx, rz, material, droop, density = 0.85) {
+    const harmonics = [random() * 6.28, random() * 6.28, random() * 6.28];
+    const seed = Math.floor(random() * 1e9);
+    const radiusAt = angle => rx * (1 + 0.18 * Math.sin(3 * angle + harmonics[0]) + 0.12 * Math.sin(5 * angle + harmonics[1]) + 0.08 * Math.sin(2 * angle + harmonics[2]));
+    const bottom = c[2] - rz * 0.55;
+    for (let x = Math.floor(c[0] - rx * 1.4); x <= Math.ceil(c[0] + rx * 1.4); x++) {
+        for (let y = Math.floor(c[1] - rx * 1.4); y <= Math.ceil(c[1] + rx * 1.4); y++) {
+            const dx = x + 0.5 - c[0], dy = y + 0.5 - c[1];
+            const q = Math.hypot(dx, dy) / radiusAt(Math.atan2(dy, dx));
+            if (q > 1.05) continue;
+            const height = rz * Math.sqrt(Math.max(0, 1 - q * q)); // dome
+            for (let z = Math.floor(bottom); z <= Math.ceil(c[2] + height); z++) {
+                const above = z + 0.5 - c[2];
+                if (above > height || z + 0.5 < bottom) continue;
+                const edge = Math.max(q, above / Math.max(height, 0.5));
+                // solid core (the texture of the foliage has the holes); ragged outer layer made of whole clumps of
+                // 2 x 2 x 2 voxels (like leaf blocks), not of scattered voxels
+                if (edge < 0.8 || clumpHash(x >> 1, y >> 1, z >> 1, seed) < density * 0.7) grid.setIfEmpty(x, y, z, material);
+            }
+            // hanging fringe near the edge, by clumps of 2 x 2 columns
+            if (q > 0.6 && clumpHash(x >> 1, y >> 1, 7, seed) < 0.4) {
+                const hang = 1 + Math.floor(clumpHash(x >> 1, y >> 1, 9, seed) * droop);
+                for (let z = Math.floor(bottom) - 1; z >= Math.floor(bottom) - hang; z--) grid.setIfEmpty(x, y, z, material);
             }
         }
     }
-    return g;
 }
 
-function birch(random) {
-    const g = new Grid(30, 30, 58);
-    const c = 15, height = 44 + Math.floor(random() * 6);
-    trunk(g, c, c, height, 1.0, BIRCH_BARK, 0.5);
-    for (let i = 0; i < 4; i++) {
-        const a = random() * Math.PI * 2, z = 26 + i * 4;
-        branch(g, [c, c, z], [c + Math.cos(a) * 5, c + Math.sin(a) * 5, z + 6], 0.6, BIRCH_BARK);
+/** roots spreading from the base, partly in the ground */
+function roots(grid, random, base, count, length, radius, material) {
+    for (let i = 0; i < count; i++) {
+        const azimuth = (i / count) * Math.PI * 2 + random() * 0.8;
+        crooked(grid, random, [base[0], base[1], 3], [Math.cos(azimuth), Math.sin(azimuth), -0.45], length * (0.7 + random() * 0.5), radius, 0.6,
+            { segments: 3, wobble: 0.3, material });
     }
-    blob(g, random, [c, c, height - 6], 7.5, 7.5, 12, BIRCH_LEAVES, 0.65);
-    blob(g, random, [c + 3, c - 2, height - 14], 5, 5, 6, BIRCH_LEAVES, 0.6);
-    return g;
 }
 
-function bush(random) {
-    const g = new Grid(26, 26, 16);
-    const c = 13;
-    for (let i = 0; i < 3; i++) {
-        const a = random() * Math.PI * 2;
-        branch(g, [c, c, 0], [c + Math.cos(a) * 4, c + Math.sin(a) * 4, 6], 0.6, BARK);
+const GRID = [124, 124, 100];
+const C = 62;
+
+function broadleaf(random, p) {
+    const g = new Grid(...GRID);
+    const lean = [(random() - 0.5) * p.lean, (random() - 0.5) * p.lean, 1];
+    const trunk = crooked(g, random, [C, C, 0], lean, p.trunkLength, p.trunkRadius, p.trunkRadius * 0.7,
+        { segments: 6, wobble: p.trunkWobble, rise: 0.05, material: p.bark });
+    if (p.roots) roots(g, random, [C, C], p.roots, p.trunkRadius * 2.2, p.trunkRadius * 0.6, p.bark);
+    const terminals = [trunk.end];
+    const start = Math.floor(trunk.points.length * p.limbStart);
+    const azimuth0 = random() * Math.PI * 2;
+    for (let i = 0; i < p.limbs; i++) {
+        const from = trunk.points[Math.min(trunk.points.length - 1, start + Math.floor(random() * (trunk.points.length - start)))];
+        const azimuth = azimuth0 + (i / p.limbs) * Math.PI * 2 + (random() - 0.5) * 0.7;
+        const elevation = p.elevation[0] + random() * (p.elevation[1] - p.elevation[0]);
+        limbs(g, random, from, direction(azimuth, elevation), p.limbLength * (0.8 + random() * 0.4), p.trunkRadius * p.limbRadius,
+            p.depth, terminals, { wobble: p.limbWobble, rise: p.rise, material: p.bark, padsAlong: p.padsAlong, children: p.children });
     }
-    blob(g, random, [c, c, 6], 10, 9, 6, BUSH_LEAVES, 0.8);
-    blob(g, random, [c + 4, c + 3, 4], 6, 6, 4, BUSH_LEAVES, 0.8);
-    return g;
-}
-
-function dead(random) {
-    const g = new Grid(40, 40, 52);
-    const c = 20, height = 34;
-    trunk(g, c, c, height, 1.5, DEAD_WOOD, 1.0);
-    for (let i = 0; i < 6; i++) {
-        const a = random() * Math.PI * 2, z = 16 + random() * 16, length = 8 + random() * 8;
-        const end = [c + Math.cos(a) * length, c + Math.sin(a) * length, z + 4 + random() * 10];
-        branch(g, [c, c, z], end, 0.9, DEAD_WOOD);
-        // fork
-        const b = a + (random() - 0.5) * 1.5;
-        branch(g, end, [end[0] + Math.cos(b) * 4, end[1] + Math.sin(b) * 4, end[2] + 4], 0.5, DEAD_WOOD);
+    if (p.leaves !== null) {
+        for (const t of terminals) {
+            const rx = p.pad[0] + random() * (p.pad[1] - p.pad[0]);
+            pad(g, random, [t[0], t[1], t[2] + 1], rx, p.padHeight * (0.8 + random() * 0.4), p.leaves, p.droop);
+        }
     }
-    return g;
+    return { grid: g, base: [C, C] };
 }
 
-/** half resolution: a voxel is wood if any child is wood (trunks stay continuous), leaves if 3 of 8 are leaves */
-function downsample(grid) {
-    const out = new Grid(Math.ceil(grid.nx / 2), Math.ceil(grid.ny / 2), Math.ceil(grid.nz / 2));
-    const counts = new Uint8Array(8);
+// variants of each species: see SPECIES_VARIANTS of treePlacement.js
+const OAKS = [
+    // grand oak: wide spreading crown of many pads
+    { trunkLength: 20, trunkRadius: 3.2, trunkWobble: 0.18, lean: 0.25, roots: 5, limbs: 5, limbStart: 0.55, elevation: [0.25, 0.75],
+        limbLength: 20, limbRadius: 0.55, limbWobble: 0.3, rise: 0.035, depth: 2, children: 2, padsAlong: true, pad: [6.5, 9], padHeight: 3.4, droop: 3,
+        bark: BARK, leaves: OAK_LEAVES },
+    // smaller oak
+    { trunkLength: 16, trunkRadius: 2.4, trunkWobble: 0.22, lean: 0.35, roots: 4, limbs: 4, limbStart: 0.5, elevation: [0.35, 0.85],
+        limbLength: 15, limbRadius: 0.55, limbWobble: 0.32, rise: 0.04, depth: 2, children: 2, padsAlong: true, pad: [5, 7], padHeight: 3, droop: 3,
+        bark: BARK, leaves: OAK_LEAVES },
+    // tall oak, steeper limbs
+    { trunkLength: 26, trunkRadius: 2.6, trunkWobble: 0.15, lean: 0.2, roots: 4, limbs: 5, limbStart: 0.6, elevation: [0.7, 1.15],
+        limbLength: 14, limbRadius: 0.5, limbWobble: 0.28, rise: 0.03, depth: 2, children: 2, padsAlong: true, pad: [5, 7], padHeight: 3.2, droop: 2,
+        bark: BARK, leaves: OAK_LEAVES },
+];
+const BIRCHES = [
+    { trunkLength: 40, trunkRadius: 1.3, trunkWobble: 0.12, lean: 0.25, roots: 0, limbs: 6, limbStart: 0.45, elevation: [0.75, 1.2],
+        limbLength: 9, limbRadius: 0.6, limbWobble: 0.3, rise: 0.02, depth: 1, padsAlong: true, pad: [3, 4.5], padHeight: 3, droop: 4,
+        bark: BIRCH_BARK, leaves: BIRCH_LEAVES },
+    { trunkLength: 32, trunkRadius: 1.1, trunkWobble: 0.18, lean: 0.4, roots: 0, limbs: 5, limbStart: 0.4, elevation: [0.6, 1.1],
+        limbLength: 8, limbRadius: 0.65, limbWobble: 0.32, rise: 0.02, depth: 1, padsAlong: true, pad: [2.8, 4], padHeight: 2.8, droop: 4,
+        bark: BIRCH_BARK, leaves: BIRCH_LEAVES },
+];
+const BUSHES = [
+    { trunkLength: 3, trunkRadius: 1.0, trunkWobble: 0.3, lean: 0.6, roots: 0, limbs: 4, limbStart: 0.0, elevation: [0.25, 0.7],
+        limbLength: 6, limbRadius: 0.8, limbWobble: 0.35, rise: 0.02, depth: 1, padsAlong: false, pad: [4, 5.5], padHeight: 2.6, droop: 1,
+        bark: BARK, leaves: BUSH_LEAVES },
+    { trunkLength: 2, trunkRadius: 0.9, trunkWobble: 0.3, lean: 0.6, roots: 0, limbs: 3, limbStart: 0.0, elevation: [0.3, 0.8],
+        limbLength: 5, limbRadius: 0.8, limbWobble: 0.35, rise: 0.02, depth: 1, padsAlong: false, pad: [3.5, 5], padHeight: 2.4, droop: 1,
+        bark: BARK, leaves: BUSH_LEAVES },
+];
+const DEADS = [
+    { trunkLength: 26, trunkRadius: 2.4, trunkWobble: 0.3, lean: 0.4, roots: 4, limbs: 5, limbStart: 0.45, elevation: [0.3, 1.0],
+        limbLength: 16, limbRadius: 0.5, limbWobble: 0.45, rise: 0.03, depth: 2, padsAlong: false, pad: [0, 0], padHeight: 0, droop: 0,
+        bark: DEAD_WOOD, leaves: null },
+    { trunkLength: 20, trunkRadius: 2.0, trunkWobble: 0.4, lean: 0.6, roots: 3, limbs: 3, limbStart: 0.5, elevation: [0.4, 1.1],
+        limbLength: 12, limbRadius: 0.55, limbWobble: 0.5, rise: 0.02, depth: 1, padsAlong: false, pad: [0, 0], padHeight: 0, droop: 0,
+        bark: DEAD_WOOD, leaves: null },
+];
+
+/**
+ * One branch of a spruce: a flat shelf of needles from the trunk outwards, narrowing towards the tip, bending down to the
+ * sides and drooping more and more towards the tip (more for the low branches), with a hanging tip.
+ */
+function spruceBranch(g, random, start, azimuth, length, level) {
+    const dir = [Math.cos(azimuth), Math.sin(azimuth)], side = [-Math.sin(azimuth), Math.cos(azimuth)];
+    const droop = 0.18 + (1 - level) * 0.32;
+    let z = start[2];
+    let tip = start;
+    for (let s = 1; s <= length; s++) {
+        const t = s / length;
+        z -= droop * t * 1.4;
+        const px = start[0] + dir[0] * s, py = start[1] + dir[1] * s;
+        if (t < 0.45) g.set(px, py, z, BARK); // woody twig near the trunk
+        const width = 0.6 + 1.9 * (1 - t);
+        for (let w = -Math.ceil(width); w <= Math.ceil(width); w++) {
+            if (Math.abs(w) > width + (random() - 0.5) * 0.6) continue;
+            const qx = px + side[0] * w, qy = py + side[1] * w, qz = z - Math.abs(w) * 0.4;
+            g.setIfEmpty(qx, qy, qz, NEEDLES);
+            if (Math.abs(w) < width * 0.7 && random() < 0.85) g.setIfEmpty(qx, qy, qz + 1, NEEDLES); // thicker shelf
+        }
+        tip = [px, py, z];
+    }
+    const hang = 1 + Math.floor(random() * (1 + (1 - level) * 2));
+    for (let k = 1; k <= hang; k++) g.setIfEmpty(tip[0], tip[1], tip[2] - k, NEEDLES);
+}
+
+/** spruce: slightly crooked trunk ending in a bare spire, whorls of separate drooping branches, a narrow cone */
+function pine(random, variant) {
+    const g = new Grid(...GRID);
+    const height = variant === 0 ? 68 : 54;
+    const trunk = crooked(g, random, [C, C, 0], [(random() - 0.5) * 0.1, (random() - 0.5) * 0.1, 1], height, 1.6, 0.5,
+        { segments: 8, wobble: 0.05, rise: 0.05, material: BARK });
+    const centerAt = z => {
+        for (let i = 1; i < trunk.points.length; i++) {
+            const a = trunk.points[i - 1], b = trunk.points[i];
+            if (b[2] >= z) {
+                const t = (z - a[2]) / Math.max(b[2] - a[2], 1e-3);
+                return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+            }
+        }
+        const last = trunk.points[trunk.points.length - 1];
+        return [last[0], last[1]];
+    };
+    const foliageTop = height - 7; // the spire stays bare
+    let z = 8 + Math.floor(random() * 3);
+    while (z < foliageTop) {
+        const level = (z - 8) / (foliageTop - 8); // 0 at the bottom, 1 at the top
+        const length = 3 + 17 * Math.pow(1 - level, 1.05);
+        const count = 5 + Math.floor(random() * 3);
+        const azimuth0 = random() * Math.PI * 2;
+        const [cx, cy] = centerAt(z);
+        for (let i = 0; i < count; i++) {
+            const azimuth = azimuth0 + (i / count) * Math.PI * 2 + (random() - 0.5) * 0.6;
+            spruceBranch(g, random, [cx, cy, z], azimuth, length * (0.75 + random() * 0.45), level);
+        }
+        z += 3 + Math.floor(random() * 2) + (level < 0.35 ? 1 : 0);
+    }
+    // small tuft around the base of the spire
+    const [tx, ty] = centerAt(foliageTop);
+    for (let k = 0; k < 3; k++) for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) g.setIfEmpty(tx + dx, ty + dy, foliageTop + k, NEEDLES);
+    return { grid: g, base: [C, C] };
+}
+
+/** smallest grid holding the voxels and the base */
+function crop(model) {
+    const { grid, base } = model;
+    let x0 = base[0], y0 = base[1], x1 = base[0], y1 = base[1], z1 = 0;
+    for (let x = 0; x < grid.nx; x++) {
+        for (let y = 0; y < grid.ny; y++) {
+            for (let z = 0; z < grid.nz; z++) {
+                if (grid.v[(x * grid.ny + y) * grid.nz + z] === 0) continue;
+                x0 = Math.min(x0, x); x1 = Math.max(x1, x);
+                y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+                z1 = Math.max(z1, z);
+            }
+        }
+    }
+    const out = new Grid(Math.min(x1 - x0 + 1, 127), Math.min(y1 - y0 + 1, 127), Math.min(z1 + 1, 127));
+    for (let x = 0; x < out.nx; x++)
+        for (let y = 0; y < out.ny; y++)
+            for (let z = 0; z < out.nz; z++)
+                out.v[(x * out.ny + y) * out.nz + z] = grid.v[((x + x0) * grid.ny + (y + y0)) * grid.nz + z];
+    return { grid: out, base: [base[0] + 0.5 - x0, base[1] + 0.5 - y0] };
+}
+
+/**
+ * Coarser level of detail, straight from the finest grid (blocks of f x f x f voxels): wood when at least woodMin voxels
+ * of the block are wood (any at the first level, so the trunks and limbs stay continuous; a sizeable part further, so the
+ * thin twigs do not turn into big blocks of wood over the foliage), else leaves when at least leafMin are leaves
+ * (thresholds measured to keep the projected area of the foliage, see the commit message), of the most common kind.
+ */
+function downsample(grid, f, leafMin, woodMin) {
+    const out = new Grid(Math.ceil(grid.nx / f), Math.ceil(grid.ny / f), Math.ceil(grid.nz / f));
+    const counts = new Uint16Array(8);
     for (let x = 0; x < out.nx; x++) {
         for (let y = 0; y < out.ny; y++) {
             for (let z = 0; z < out.nz; z++) {
                 counts.fill(0);
-                let solid = 0, wood = -1;
-                for (let i = 0; i < 8; i++) {
-                    const m = grid.get(2 * x + (i & 1), 2 * y + ((i >> 1) & 1), 2 * z + (i >> 2));
-                    if (m === 0) continue;
-                    solid++;
-                    counts[m - 1]++;
-                    if (WOOD.has(m - 1)) wood = m - 1;
+                let leaves = 0, wood = 0, woodKind = 0;
+                for (let i = 0; i < f; i++) {
+                    for (let j = 0; j < f; j++) {
+                        for (let k = 0; k < f; k++) {
+                            const m = grid.get(f * x + i, f * y + j, f * z + k);
+                            if (m === 0) continue;
+                            if (WOOD.has(m - 1)) {
+                                wood++;
+                                woodKind = m;
+                            } else {
+                                leaves++;
+                                counts[m - 1]++;
+                            }
+                        }
+                    }
                 }
-                if (wood >= 0) {
-                    out.v[(x * out.ny + y) * out.nz + z] = wood + 1;
-                } else if (solid >= 3) {
+                let value = 0;
+                if (wood >= woodMin) {
+                    value = woodKind;
+                } else if (leaves >= leafMin) {
                     let best = 0;
                     for (let m = 1; m < 8; m++) if (counts[m] > counts[best]) best = m;
-                    out.v[(x * out.ny + y) * out.nz + z] = best + 1;
+                    value = best + 1;
+                } else if (wood > 0 && leaves === 0) {
+                    value = woodKind; // a branch alone in the air
                 }
+                out.v[(x * out.ny + y) * out.nz + z] = value;
             }
         }
     }
     return out;
 }
+
+// per level of detail after the first: [leaves, wood] thresholds of downsample
+const LOD_THRESHOLDS = [null, [2, 1], [8, 6]];
 
 const LEAVES = new Set([OAK_LEAVES, NEEDLES, BIRCH_LEAVES, BUSH_LEAVES]);
 
@@ -263,8 +447,8 @@ function opennessField(grid, leafTransmittance) {
  * Faces of the voxels next to an empty voxel, with ambient occlusion per corner. Same vertex format as the terrain:
  * x, y, z (7 bits each) | face (3 bits) | ambient occlusion (2 bits) | material (3 bits) | sky openness (3 bits): the
  * part of the sky seen through the tree itself (baked self occlusion: inside and under the crown, the trunk under it)
- * cutout (finest level, leaves with transparent gaps): also a second layer of leaves under the surface, and the branches
- * inside the crowns, seen through the gaps.
+ * cutout (finest level, foliage with transparent holes): also a second layer of leaves under the surface, and the
+ * branches inside the crowns, seen through the holes.
  */
 function meshGrid(grid, cutout, leafTransmittance) {
     const { nx, ny, nz } = grid;
@@ -278,7 +462,8 @@ function meshGrid(grid, cutout, leafTransmittance) {
         const n = grid.get(nxv, nyv, nzv);
         if (n === 0) return true;
         if (!cutout || !LEAVES.has(n - 1)) return false;
-        // wood inside the leaves shows through the gaps; second layer of leaves, facing the surface ones
+        // wood inside the leaves shows through the holes; second layer of leaves, facing the surface ones
+        // (measured faster than drawing the foliage double sided)
         if (!LEAVES.has(m - 1)) return true;
         return depthAt(x, y, z) === 2 && depthAt(nxv, nyv, nzv) === 1;
     };
@@ -345,29 +530,33 @@ function crownOf(grid, cx, cy, voxelSize) {
 }
 
 /**
- * @returns per species, per level of detail: { vertices, nFaces, origin (model voxels: center of the base), voxelSize, height }
+ * @returns per model (species and variant, see treePlacement.js), per level of detail:
+ * { vertices, nFaces, origin (model voxels: center of the base), voxelSize, height, crown }
  */
 export function buildTreeModels(seed = 'trees') {
     const random = alea(seed + '/models');
-    const makers = [oak, pine, birch, bush, dead];
-    return makers.map(make => {
-        let grid = make(random);
-        const center = [grid.nx / 2, grid.ny / 2];
+    const variants = [OAKS, null, BIRCHES, BUSHES, DEADS];
+    const count = [0, 0, 0, 0, 0];
+    const models = [];
+    for (let m = 0; m < MODEL_COUNT; m++) {
+        const species = MODEL_SPECIES[m], variant = count[species]++;
+        const { grid: finest, base } = crop(species === 1 ? pine(random, variant) : broadleaf(random, variants[species][variant]));
         const lods = [];
         for (let lod = 0; lod < TREE_LODS; lod++) {
-            if (lod > 0) grid = downsample(grid);
             const scale = 1 << lod;
+            const grid = lod === 0 ? finest : downsample(finest, scale, ...LOD_THRESHOLDS[lod]);
             // bigger voxels of leaves block more of the sky
             const vertices = meshGrid(grid, lod === 0, Math.pow(0.45, scale));
             lods.push({
-                crown: crownOf(grid, center[0] / scale, center[1] / scale, TREE_VOXEL * scale),
+                crown: crownOf(grid, base[0] / scale, base[1] / scale, TREE_VOXEL * scale),
                 vertices,
                 nFaces: vertices.length / 4,
-                origin: [center[0] / scale, center[1] / scale, 0],
+                origin: [base[0] / scale, base[1] / scale, 0],
                 voxelSize: TREE_VOXEL * scale,
                 height: grid.nz * TREE_VOXEL * scale,
             });
         }
-        return lods;
-    });
+        models.push(lods);
+    }
+    return models;
 }

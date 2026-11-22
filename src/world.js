@@ -1,6 +1,7 @@
 import { vec3 } from "gl-matrix";
 import { Chunk } from "./chunk";
 import { runColumnTask, runHeightGridTask } from "./columnTask";
+import { buildTreeModels } from "./treeModels";
 import {
     BRICK_BYTES, BRICKS, CHUNK_SIZE, CHUNKS_PER_COLUMN, COARSE, COARSE_BYTES, columnKey, CZ_MAX, CZ_MIN,
     insideWorld, SEA_LEVEL, SEED, WORLD_BOTTOM, WORLD_TOP,
@@ -40,6 +41,10 @@ class WorkerPool {
             for (let i = 0; i < count; i++) {
                 const worker = new Worker(url);
                 worker.onmessage = (event) => {
+                    if (event.data.type === 'treeModels') {
+                        this.onTreeModels(event.data.models);
+                        return;
+                    }
                     if (event.data.type === 'heightGrid') {
                         this.onHeightGrid(event.data);
                         return;
@@ -59,6 +64,16 @@ class WorkerPool {
 
     newFrame() {
         this.mainThreadBusy = false;
+    }
+
+    /** tree models (treeModels.js): built once, on the first worker (or on the main thread) */
+    buildTreeModels(callback) {
+        this.onTreeModels = callback;
+        if (this.workers.length === 0) {
+            callback(buildTreeModels());
+        } else {
+            this.workers[0].postMessage({ type: 'treeModels' });
+        }
     }
 
     /** height map of a large area: on the last worker (or on the main thread) */

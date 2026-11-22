@@ -1,4 +1,4 @@
-import { TREE_FLOATS } from './treePlacement';
+import { MODEL_SPECIES, TREE_FLOATS } from './treePlacement';
 
 // Canopy map: what the foliage of the trees hides of the sky, on a grid of 1 m around the camera (texture unit 20).
 // Per cell: density x crown bottom, density x crown top, density, trunk contact. Weighting the heights by the density
@@ -8,13 +8,14 @@ import { TREE_FLOATS } from './treePlacement';
 const SIZE = 512;           // cells per side (1 m)
 const RECENTER = 64;        // the map follows the camera by steps of this many meters
 const MIN_INTERVAL = 300;   // ms between two rebuilds when trees appear or disappear (streaming)
-const DENSITY = [0.9, 0.85, 0.65, 0.85, 0]; // oak, pine, birch, bush, dead tree (no foliage)
+const SPECIES_DENSITY = [0.85, 0.85, 0.6, 0.85, 0]; // oak, pine, birch, bush, dead tree (no foliage)
+const DENSITY = MODEL_SPECIES.map(species => SPECIES_DENSITY[species]);
 const CONTACT_RADIUS = 1.6; // darker ground around the trunks, within this distance
 
 export class CanopyMap {
     constructor(gl, unit, crowns) {
         this.gl = gl;
-        this.crowns = crowns; // per species: { radius, bottom, top } in meters at scale 1, or null
+        this.crowns = crowns; // per model: { radius, bottom, top } in meters at scale 1, or null
         this.data = new Float32Array(SIZE * SIZE * 4);
         this.origin = new Float32Array(2);
         this.size = SIZE;
@@ -39,7 +40,7 @@ export class CanopyMap {
         const half = SIZE / 2;
         const far = !this.valid || Math.abs(camPosition[0] - (this.origin[0] + half)) > RECENTER
             || Math.abs(camPosition[1] - (this.origin[1] + half)) > RECENTER;
-        const changed = world.treesVersion !== this.version && now - this.lastBuild > MIN_INTERVAL;
+        const changed = (world.treesVersion !== this.version || !this.valid) && now - this.lastBuild > MIN_INTERVAL;
         if (!far && !changed) return;
         this.version = world.treesVersion;
         this.lastBuild = now;
@@ -52,6 +53,7 @@ export class CanopyMap {
 
     build(world) {
         const gl = this.gl, data = this.data;
+        if (!this.crowns) return; // the tree models are not built yet
         const [ox, oy] = this.origin;
         data.fill(0);
         for (const column of world.columns.values()) {
@@ -62,15 +64,15 @@ export class CanopyMap {
             const d = trees.data;
             for (let i = 0; i < trees.ids.length; i++) {
                 const o = i * TREE_FLOATS;
-                const species = d[o + 8], crown = this.crowns[species];
+                const model = d[o + 8], crown = this.crowns[model];
                 const tx = d[o] - ox, ty = d[o + 1] - oy, tz = d[o + 2], scale = d[o + 4];
-                if (crown && DENSITY[species] > 0) {
+                if (crown && DENSITY[model] > 0) {
                     const r = crown.radius * scale, bottom = tz + crown.bottom * scale, top = tz + crown.top * scale;
                     for (let y = Math.max(0, Math.floor(ty - r)); y <= Math.min(SIZE - 1, Math.ceil(ty + r)); y++) {
                         for (let x = Math.max(0, Math.floor(tx - r)); x <= Math.min(SIZE - 1, Math.ceil(tx + r)); x++) {
                             const q = ((x + 0.5 - tx) ** 2 + (y + 0.5 - ty) ** 2) / (r * r);
                             if (q >= 1) continue;
-                            const w = DENSITY[species] * Math.sqrt(1 - q); // thinner at the edge of the crown
+                            const w = DENSITY[model] * Math.sqrt(1 - q); // thinner at the edge of the crown
                             const c = (y * SIZE + x) * 4;
                             data[c] += w * bottom;
                             data[c + 1] += w * top;
