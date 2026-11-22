@@ -321,34 +321,54 @@ function crop(model) {
     return { grid: out, base: [base[0] + 0.5 - x0, base[1] + 0.5 - y0] };
 }
 
-/** half resolution: a voxel is wood if any child is wood (trunks stay continuous), leaves if 3 of 8 are leaves */
-function downsample(grid) {
-    const out = new Grid(Math.ceil(grid.nx / 2), Math.ceil(grid.ny / 2), Math.ceil(grid.nz / 2));
-    const counts = new Uint8Array(8);
+/**
+ * Coarser level of detail, straight from the finest grid (blocks of f x f x f voxels): wood when at least woodMin voxels
+ * of the block are wood (any at the first level, so the trunks and limbs stay continuous; a sizeable part further, so the
+ * thin twigs do not turn into big blocks of wood over the foliage), else leaves when at least leafMin are leaves
+ * (thresholds measured to keep the projected area of the foliage, see the commit message), of the most common kind.
+ */
+function downsample(grid, f, leafMin, woodMin) {
+    const out = new Grid(Math.ceil(grid.nx / f), Math.ceil(grid.ny / f), Math.ceil(grid.nz / f));
+    const counts = new Uint16Array(8);
     for (let x = 0; x < out.nx; x++) {
         for (let y = 0; y < out.ny; y++) {
             for (let z = 0; z < out.nz; z++) {
                 counts.fill(0);
-                let solid = 0, wood = -1;
-                for (let i = 0; i < 8; i++) {
-                    const m = grid.get(2 * x + (i & 1), 2 * y + ((i >> 1) & 1), 2 * z + (i >> 2));
-                    if (m === 0) continue;
-                    solid++;
-                    counts[m - 1]++;
-                    if (WOOD.has(m - 1)) wood = m - 1;
+                let leaves = 0, wood = 0, woodKind = 0;
+                for (let i = 0; i < f; i++) {
+                    for (let j = 0; j < f; j++) {
+                        for (let k = 0; k < f; k++) {
+                            const m = grid.get(f * x + i, f * y + j, f * z + k);
+                            if (m === 0) continue;
+                            if (WOOD.has(m - 1)) {
+                                wood++;
+                                woodKind = m;
+                            } else {
+                                leaves++;
+                                counts[m - 1]++;
+                            }
+                        }
+                    }
                 }
-                if (wood >= 0) {
-                    out.v[(x * out.ny + y) * out.nz + z] = wood + 1;
-                } else if (solid >= 3) {
+                let value = 0;
+                if (wood >= woodMin) {
+                    value = woodKind;
+                } else if (leaves >= leafMin) {
                     let best = 0;
                     for (let m = 1; m < 8; m++) if (counts[m] > counts[best]) best = m;
-                    out.v[(x * out.ny + y) * out.nz + z] = best + 1;
+                    value = best + 1;
+                } else if (wood > 0 && leaves === 0) {
+                    value = woodKind; // a branch alone in the air
                 }
+                out.v[(x * out.ny + y) * out.nz + z] = value;
             }
         }
     }
     return out;
 }
+
+// per level of detail after the first: [leaves, wood] thresholds of downsample
+const LOD_THRESHOLDS = [null, [2, 1], [8, 6]];
 
 const LEAVES = new Set([OAK_LEAVES, NEEDLES, BIRCH_LEAVES, BUSH_LEAVES]);
 
@@ -520,11 +540,11 @@ export function buildTreeModels(seed = 'trees') {
     const models = [];
     for (let m = 0; m < MODEL_COUNT; m++) {
         const species = MODEL_SPECIES[m], variant = count[species]++;
-        let { grid, base } = crop(species === 1 ? pine(random, variant) : broadleaf(random, variants[species][variant]));
+        const { grid: finest, base } = crop(species === 1 ? pine(random, variant) : broadleaf(random, variants[species][variant]));
         const lods = [];
         for (let lod = 0; lod < TREE_LODS; lod++) {
-            if (lod > 0) grid = downsample(grid);
             const scale = 1 << lod;
+            const grid = lod === 0 ? finest : downsample(finest, scale, ...LOD_THRESHOLDS[lod]);
             // bigger voxels of leaves block more of the sky
             const vertices = meshGrid(grid, lod === 0, Math.pow(0.45, scale));
             lods.push({

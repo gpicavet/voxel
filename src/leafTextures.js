@@ -13,6 +13,8 @@ function makeLayer(random, { clusters, coverage, light, dark, hole, clusterSize 
         rgba[i] = c[0]; rgba[i + 1] = c[1]; rgba[i + 2] = c[2]; rgba[i + 3] = 1;
     };
     const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    // holes: seen only on the full foliage of the far levels of detail, close to the shaded leaves behind them
+    hole = mix(hole, dark, 0.7);
     for (let i = 0; i < SIZE * SIZE; i++) rgba.set([...hole, 0], i * 4);
 
     const covered = () => {
