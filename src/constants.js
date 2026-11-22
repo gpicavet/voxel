@@ -19,6 +19,9 @@ export const WORLD_TOP = (CZ_MAX + 1) * CHUNK_SIZE; // above: air
 // bottom layers that caves and explosions never remove (nothing is drawn below them)
 export const BEDROCK_TOP = WORLD_BOTTOM + 4;
 
+// water: the air below this level and above the generated ground is water (lakes in the valleys, ~17 % of the world)
+export const SEA_LEVEL = 28;
+
 // highest possible surface, below WORLD_TOP so that mountains are never cut
 export const MAX_HEIGHT = 120;
 

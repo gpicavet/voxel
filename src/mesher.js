@@ -1,8 +1,8 @@
-import { BRICK_BYTES, BRICKS, CHUNK_SIZE, COARSE, COARSE_BYTES, COARSE_POW } from './constants';
+import { BRICK_BYTES, BRICKS, CHUNK_SIZE, COARSE, COARSE_BYTES, COARSE_POW, SEA_LEVEL } from './constants';
 import { P } from './generator';
 
 // Materials, decoded in vertex.glsl
-export const EARTH = 0, ROCK = 1, GRASS = 2, SNOW = 3;
+export const EARTH = 0, ROCK = 1, GRASS = 2, SNOW = 3, SAND = 4;
 
 const SIZE = CHUNK_SIZE;
 const PP = P * P;
@@ -41,6 +41,9 @@ FACES.forEach((face, f) => {
 // One growable list of packed vertices per face direction, reused between chunks.
 const buckets = FACES.map(() => ({ data: new Uint32Array(1 << 16), len: 0 }));
 const aoScratch = new Uint8Array(4);
+const waterBucket = { data: new Uint32Array(1 << 14), len: 0 };
+const waterFlags = new Uint8Array(P * P * P);
+const waterQueue = new Int32Array(P * P * P);
 
 function push(bucket, v) {
     if (bucket.len === bucket.data.length) {
@@ -59,6 +62,8 @@ function push(bucket, v) {
 function material(heights, x, y, wx, wy, wz) {
     const hi = (x + 1) * P + (y + 1);
     const depth = heights[hi] - 1 - wz;
+    // lake beds and beaches
+    if (heights[hi] <= SEA_LEVEL + 1 && depth >= 0 && depth <= 3) return SAND;
     const slope = Math.max(Math.abs(heights[hi + P] - heights[hi - P]), Math.abs(heights[hi + 1] - heights[hi - 1]));
     const steep = slope >= 3;
     if (depth === 0) {
@@ -72,7 +77,7 @@ function material(heights, x, y, wx, wy, wz) {
 
 /**
  * Build the mesh of a padded chunk. A vertex is a single uint32:
- * x, y, z in the chunk (7 bits each) | face direction (3 bits) | ambient occlusion (2 bits) | material (2 bits)
+ * x, y, z in the chunk (7 bits each) | face direction (3 bits) | ambient occlusion (2 bits) | material (3 bits)
  * Each face is 4 vertices; the triangles come from an index buffer shared by all chunks.
  * Faces are grouped by direction so that the directions facing away from the camera can be skipped.
  * @param padded voxels of the chunk and of one voxel around, index ((x + 1) * P + (y + 1)) * P + (z + 1)
@@ -135,6 +140,68 @@ export function buildMesh(padded, heights, origin) {
         offs += buckets[f].len;
     }
     return { vertices, faceFirst, faceCount, nFaces: total >> 2 };
+}
+
+/**
+ * Mesh of the water of a padded chunk: the faces of the water voxels that touch air. The water of a lake fills all the
+ * air below SEA_LEVEL connected to its surface: flood fill from the surface of the lake columns (generated ground below
+ * SEA_LEVEL), so that a crater dug in the bed or the shore fills up, and a closed cave stays dry. The fill reaches one
+ * voxel into the neighbour chunks (the padding), so a crater across a chunk border fills on both sides.
+ * Same vertex format as buildMesh, all 4 corners per face.
+ * @returns null when the chunk has no water face
+ */
+export function buildWaterMesh(padded, heights, origin) {
+    const [ox, oy, oz] = origin;
+    const surface = SEA_LEVEL - 1 - oz + 1; // padded z index of the highest water voxel
+    if (surface < 0 || surface > SIZE + 1) return null; // the chunk does not hold the water surface
+    const water = waterFlags;
+    water.fill(0);
+    let tail = 0;
+    for (let i = 0; i < P * P; i++) {
+        const idx = i * P + surface;
+        if (heights[i] < SEA_LEVEL && padded[idx] === 0) {
+            water[idx] = 1;
+            waterQueue[tail++] = idx;
+        }
+    }
+    if (tail === 0) return null;
+    for (let head = 0; head < tail; head++) {
+        const idx = waterQueue[head];
+        const x = (idx / PP) | 0, y = ((idx / P) | 0) % P, z = idx % P;
+        if (x > 0) tail = flow(idx - PP, tail);
+        if (x < P - 1) tail = flow(idx + PP, tail);
+        if (y > 0) tail = flow(idx - P, tail);
+        if (y < P - 1) tail = flow(idx + P, tail);
+        if (z > 0) tail = flow(idx - 1, tail);
+        if (z < surface) tail = flow(idx + 1, tail);
+    }
+    function flow(j, tail) {
+        if (water[j] === 0 && padded[j] === 0) {
+            water[j] = 1;
+            waterQueue[tail++] = j;
+        }
+        return tail;
+    }
+
+    waterBucket.len = 0;
+    const zEnd = Math.min(surface, SIZE); // local z range of the water in the chunk: 0 .. zEnd - 1
+    for (let x = 0; x < SIZE; x++) {
+        for (let y = 0; y < SIZE; y++) {
+            for (let z = 0; z < zEnd; z++) {
+                const pi = ((x + 1) * P + (y + 1)) * P + (z + 1);
+                if (water[pi] === 0) continue;
+                const base = x | (y << 7) | (z << 14);
+                for (let f = 0; f < 5; f++) { // no face below the water
+                    const j = pi + FACE_NEIGHBOR[f];
+                    // no face against the ground or between two water voxels
+                    if (padded[j] !== 0 || water[j] !== 0) continue;
+                    for (let k = 0; k < 4; k++) push(waterBucket, (base + CORNER_BITS[f * 4 + k]) | (f << 21) | (3 << 24));
+                }
+            }
+        }
+    }
+    if (waterBucket.len === 0) return null;
+    return { vertices: waterBucket.data.slice(0, waterBucket.len), nFaces: waterBucket.len >> 2 };
 }
 
 /**

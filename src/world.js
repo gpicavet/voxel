@@ -3,10 +3,10 @@ import { Chunk } from "./chunk";
 import { runColumnTask } from "./columnTask";
 import {
     BRICK_BYTES, BRICKS, CHUNK_SIZE, CHUNKS_PER_COLUMN, COARSE, COARSE_BYTES, columnKey, CZ_MAX, CZ_MIN,
-    insideWorld, SEED, WORLD_BOTTOM, WORLD_TOP,
+    insideWorld, SEA_LEVEL, SEED, WORLD_BOTTOM, WORLD_TOP,
 } from "./constants";
 import { createGenerator, P } from "./generator";
-import { buildMesh } from "./mesher";
+import { buildMesh, buildWaterMesh } from "./mesher";
 import { faceConnectivity } from "./visibility";
 import { aabbInFrustum, frustumPlanes } from "./utils";
 import workerSource from "../build/worker.js?raw";
@@ -150,6 +150,18 @@ export class World {
         return this.generator.surfaceHeight(x, y);
     }
 
+    /**
+     * Is the voxel water? Approximation of buildWaterMesh for the camera: in a lake column, air with only air above it up
+     * to the sea level (a dug pocket on the shore, filled by the mesher, does not count).
+     */
+    isWater(x, y, z) {
+        if (z >= SEA_LEVEL || this.surfaceHeight(x, y) >= SEA_LEVEL) return false;
+        for (let k = z; k < SEA_LEVEL; k++) {
+            if (this.getVoxel(x, y, k) !== 0) return false;
+        }
+        return true;
+    }
+
     // ---------------------------------------------------------------- streaming
 
     /** load, mesh and unload columns around the camera; call once per frame */
@@ -269,9 +281,13 @@ export class World {
                 const chunk = column.chunks[i];
                 if (chunk.modified || this.hasModifiedNeighbor(chunk)) {
                     this.remeshQueue.add(chunk);
-                } else if (data.mesh) {
-                    this.ensureIndexCapacity(data.mesh.nFaces);
-                    chunk.upload(gl, data.mesh, this.indexBuffer);
+                } else {
+                    if (data.mesh) {
+                        this.ensureIndexCapacity(data.mesh.nFaces);
+                        chunk.upload(gl, data.mesh, this.indexBuffer);
+                    }
+                    if (data.waterMesh) this.ensureIndexCapacity(data.waterMesh.nFaces);
+                    chunk.uploadWater(gl, data.waterMesh, this.indexBuffer);
                 }
             });
         }
@@ -327,6 +343,9 @@ export class World {
         chunk.connectivity = faceConnectivity(padded); // the voxels changed: so may the openings
         this.ensureIndexCapacity(mesh.nFaces);
         chunk.upload(this.gl, mesh, this.indexBuffer);
+        const water = buildWaterMesh(padded, column.heights, chunk.pos);
+        if (water) this.ensureIndexCapacity(water.nFaces);
+        chunk.uploadWater(this.gl, water, this.indexBuffer);
     }
 
     /** grow the index buffer shared by all chunks: 2 triangles (6 indices) per face of 4 vertices */
@@ -499,6 +518,27 @@ export class World {
             }
         }
         if (this.visitedFrame.size > 100000) this.visitedFrame.clear();
+    }
+
+    /**
+     * Chunks for the planar reflection of the water: meshed, above the water level, inside the frustum of the mirrored
+     * view, from the nearest to the farthest seen from the mirrored camera. No cave culling (the mirrored camera is
+     * under the ground).
+     */
+    cullReflection(viewProj, camPosition) {
+        const planes = new Float32Array(24);
+        frustumPlanes(planes, viewProj);
+        const visible = [];
+        for (const column of this.columns.values()) {
+            if (!column.hasMesh || !column.chunks) continue;
+            for (const chunk of column.chunks) {
+                if (chunk.nFaces > 0 && chunk.aabbMax[2] > SEA_LEVEL && aabbInFrustum(planes, chunk.aabbMin, chunk.aabbMax)) {
+                    chunk.reflectionDist2 = vec3.sqrDist(chunk.centerPos, camPosition);
+                    visible.push(chunk);
+                }
+            }
+        }
+        return visible.sort((c1, c2) => c1.reflectionDist2 - c2.reflectionDist2);
     }
 
     /** meshed chunks inside the camera frustum (and reached by the cave culling), from the nearest to the farthest */

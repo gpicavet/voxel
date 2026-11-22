@@ -1,7 +1,8 @@
 import { mat4, vec3 } from "gl-matrix";
 import { moveWithCollisions } from "./collision";
-import { CHUNK_SIZE } from "./constants";
+import { CHUNK_SIZE, SEA_LEVEL } from "./constants";
 import { createCloudNoiseTexture } from "./cloudNoise";
+import { createVoxelTextures } from "./textures";
 import { clockTime, createDaylight, daylight } from "./daylight";
 import { World } from "./world";
 var vshader = require('./vertex.glsl');
@@ -12,6 +13,10 @@ var skyVshader = require('./sky_vertex.glsl');
 var skyFshader = require('./sky_fragment.glsl');
 var skyLutFshader = require('./sky_lut_fragment.glsl');
 var atmosphereFshader = require('./atmosphere_fragment.glsl');
+var textureGenFshader = require('./texture_gen_fragment.glsl');
+var waterVshader = require('./water_vertex.glsl');
+var waterFshader = require('./water_fragment.glsl');
+var underwaterFshader = require('./underwater_fragment.glsl');
 
 // per second, so the speed no longer depends on the frame rate (same feel as before at 60 fps)
 const MOVE_SPEED = 60;
@@ -24,7 +29,7 @@ const CAMERA_HALF_SIZE = vec3.fromValues(0.3, 0.3, 0.3);
 // sharper on high density screens, capped because every pixel runs the shadow ray
 const MAX_PIXEL_RATIO = 2;
 // uniforms of common.glsl
-const SKY_UNIFORMS = ["skyLUT", "sunDir", "lightDir", "lightColor", "exposure"];
+const SKY_UNIFORMS = ["skyLUT", "sunDir", "lightDir", "lightColor", "exposure", "rawOutput", "underwaterDensity"];
 // uniforms of clouds.glsl and atmosphere.glsl
 const CLOUD_UNIFORMS = ["cloudNoise", "cloudTime", "cloudCoverage"];
 const ATMOSPHERE_UNIFORMS = ["atmosphereScatter", "screenSize", "atmosphereOn"];
@@ -255,7 +260,7 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity",
+        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals", "reflectionPass", "seaLevel",
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
@@ -285,6 +290,13 @@ function init() {
     // clouds and light shafts need float render targets
     const atmosphereEnabled = floatTargets;
     createCloudNoiseTexture(gl, gl.TEXTURE8);
+    const water = createProgram(gl, compileShader(gl, gl.VERTEX_SHADER, waterVshader), compileShader(gl, gl.FRAGMENT_SHADER, waterFshader),
+        ["viewProj", "chunkOrigin", "seaLevel", "camPosition", "fogDensity", "waterTime", "reflectionTex", "reflectionOn", "halfDepth",
+            "hasHalfDepth", "depthRange", "voxelNormals", ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
+    const underwater = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, underwaterFshader),
+        ["veil", ...SKY_UNIFORMS]);
+    const textureGen = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, textureGenFshader), ["layer", "size"]);
+    createVoxelTextures(gl, textureGen, gl.TEXTURE13, gl.TEXTURE14);
     let cloudTime = 0;
 
 
@@ -292,7 +304,8 @@ function init() {
     // start above the ground at the center of the world
     vec3.set(camPosition, 0.5, 0.5, world.surfaceHeight(0, 0) + 25);
 
-    // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 3 half depth, 4 half face, 5 and 6 shadow masks
+    // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 3 half depth, 4 half face, 5 and 6 shadow masks,
+    // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 and 14 voxel textures (albedo, normals), 15 water reflection
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.brickTex, 0);
@@ -312,6 +325,20 @@ function init() {
     gl.uniform1i(atmosphere.locations.halfDepth, 3);
     gl.useProgram(color.program);
     gl.uniform1i(color.locations.halfDepth, 3);
+    gl.uniform1i(color.locations.voxelAlbedo, 13);
+    gl.uniform1i(color.locations.voxelNormals, 14);
+    gl.uniform1f(color.locations.seaLevel, SEA_LEVEL);
+    gl.useProgram(water.program);
+    gl.uniform1i(water.locations.skyLUT, 7);
+    gl.uniform1i(water.locations.cloudNoise, 8);
+    gl.uniform1i(water.locations.brickTex, 0);
+    gl.uniform1i(water.locations.coarseTex, 1);
+    gl.uniform1i(water.locations.halfDepth, 3);
+    gl.uniform1i(water.locations.reflectionTex, 15);
+    gl.uniform1i(water.locations.voxelNormals, 14);
+    gl.uniform1f(water.locations.seaLevel, SEA_LEVEL);
+    gl.useProgram(underwater.program);
+    gl.uniform1i(underwater.locations.skyLUT, 7);
     gl.useProgram(shadow.program);
     gl.uniform1i(shadow.locations.halfDepth, 3);
     gl.uniform1i(shadow.locations.halfFace, 4);
@@ -332,6 +359,25 @@ function init() {
         mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, NEAR, farPlane());
     }
 
+    // planar reflection of the water, rendered mirrored at half the CSS resolution (unit 15), linear HDR
+    var reflection = null;
+    function createReflectionTarget() {
+        if (!floatTargets) return null;
+        const width = Math.max(1, Math.ceil(window.innerWidth / 2)), height = Math.max(1, Math.ceil(window.innerHeight / 2));
+        const texture = createTexture2D(gl, gl.TEXTURE15, gl.RGBA16F, width, height);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        const depth = gl.createRenderbuffer();
+        gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, width, height);
+        const framebuffer = createFramebuffer(gl, texture, null);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.activeTexture(gl.TEXTURE0);
+        return { width, height, texture, depth, framebuffer };
+    }
+
     function resize() {
         const ratio = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
         canvas.style.width = window.innerWidth + "px";
@@ -344,6 +390,12 @@ function init() {
             deleteShadowTargets(gl, shadowTargets);
         }
         shadowTargets = createShadowTargets(gl, gl.drawingBufferWidth, gl.drawingBufferHeight);
+        if (reflection) {
+            gl.deleteFramebuffer(reflection.framebuffer);
+            gl.deleteTexture(reflection.texture);
+            gl.deleteRenderbuffer(reflection.depth);
+        }
+        reflection = createReflectionTarget();
         if (atmosphereEnabled) {
             if (atmosphereTargets) {
                 deleteAtmosphereTargets(gl, atmosphereTargets);
@@ -362,6 +414,13 @@ function init() {
     var camDir = vec3.create();
     var camAt = vec3.create();
     var move = vec3.create();
+    // mirror about the water plane z = SEA_LEVEL
+    var mirrorMatrix = mat4.fromValues(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, 0, 0, 0, 2 * SEA_LEVEL, 1);
+    var reflViewProjMatrix = mat4.create();
+    var reflInvViewProjMatrix = mat4.create();
+    var mirroredCamPosition = vec3.create();
+    var waterTime = 0;
+    var underWater = false;
 
     var hourAngle = -1.0; // about 8 in the morning
     var light = createDaylight();
@@ -384,6 +443,7 @@ function init() {
         gl.uniform3fv(program.locations.lightDir, light.lightDir);
         gl.uniform3fv(program.locations.lightColor, light.lightColor);
         gl.uniform1f(program.locations.exposure, light.exposure);
+        gl.uniform1f(program.locations.underwaterDensity, underWater ? 0.06 : 0.0);
     }
 
     function setShadowWindow(program) {
@@ -395,7 +455,7 @@ function init() {
 
     const gpuTimer = createGpuTimer(gl);
     const statsElement = document.getElementById("stats");
-    let frames = 0, statsTime = performance.now(), visibleChunks = 0, facesDrawn = 0;
+    let frames = 0, statsTime = performance.now(), visibleChunks = 0, facesDrawn = 0, waterFaces = 0;
 
 
     gl.enable(gl.DEPTH_TEST);
@@ -417,6 +477,7 @@ function init() {
         const timeScale = keysDown["t"] ? FAST_TIME : 1;
         hourAngle += SUN_SPEED * dt * timeScale;
         cloudTime += dt * timeScale;
+        waterTime += dt;
         daylight(light, hourAngle);
         const night = light.sunDir[2] < -0.05; // the moon is the main light (see daylight.js)
         // shadows of the previous frames are wrong when time runs fast, or when the moon takes over
@@ -476,6 +537,7 @@ function init() {
         }
         world.update(camPosition);
 
+        underWater = world.isWater(Math.floor(camPosition[0]), Math.floor(camPosition[1]), Math.floor(camPosition[2] + 0.12));
         const visible = world.cull(viewProjMatrix, camPosition);
         visibleChunks = visible.length;
 
@@ -565,37 +627,117 @@ function init() {
             atmosphereTargets.historyValid = true;
         }
 
+        // terrain with full shading; mirrored = the reflection of the water (no mask shadows, no light shafts)
+        function drawTerrainColor(chunks, matrix, eye, mirrored) {
+            gl.useProgram(color.program);
+            gl.uniformMatrix4fv(color.locations.viewProj, false, matrix);
+            setSky(color);
+            setClouds(color);
+            setAtmosphere(color);
+            gl.uniform3fv(color.locations.camPosition, eye);
+            gl.uniform1i(color.locations.halfResShadows, halfResShadows && !mirrored ? 1 : 0);
+            gl.uniform1i(color.locations.reflectionPass, mirrored ? 1 : 0);
+            gl.uniform1i(color.locations.rawOutput, mirrored ? 1 : 0);
+            if (mirrored) gl.uniform1i(color.locations.atmosphereOn, 0);
+            gl.uniform1i(color.locations.shadowMask, 5 + shadowTargets.current);
+            gl.uniform2f(color.locations.depthRange, NEAR, farPlane());
+            gl.uniform2f(color.locations.maskScale,
+                shadowTargets.width / gl.drawingBufferWidth, shadowTargets.height / gl.drawingBufferHeight);
+            gl.uniform1f(color.locations.fogDensity, 1.2 / viewDistance()); // fog = 0.95 at the view distance
+            setShadowWindow(color);
+            return world.draw(chunks, eye, color.locations.chunkOrigin);
+        }
+
+        // sky on the far plane: only the pixels the terrain left empty are shaded
+        function drawSky(inverseMatrix, eye, mirrored) {
+            gl.useProgram(sky.program);
+            gl.uniformMatrix4fv(sky.locations.invViewProj, false, inverseMatrix);
+            gl.uniform3fv(sky.locations.camPosition, eye);
+            setSky(sky);
+            setClouds(sky);
+            setAtmosphere(sky);
+            gl.uniform1i(sky.locations.rawOutput, mirrored ? 1 : 0);
+            if (mirrored) gl.uniform1i(sky.locations.atmosphereOn, 0);
+            gl.uniform3fv(sky.locations.moonDir, light.moonDir);
+            gl.uniform3fv(sky.locations.sunDiskColor, vec3.scale(vec3.create(), light.sunColor, 40));
+            gl.uniform3fv(sky.locations.moonDiskColor, vec3.scale(vec3.create(), light.moonColor, 25));
+            gl.uniform1f(sky.locations.starVisibility, light.starVisibility);
+            gl.depthMask(false);
+            gl.depthFunc(gl.LEQUAL);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            gl.depthMask(true);
+            gl.depthFunc(gl.LESS);
+        }
+
+        const waterChunks = visible.filter(chunk => chunk.nWaterFaces > 0);
+        waterFaces = waterChunks.reduce((sum, chunk) => sum + chunk.nWaterFaces, 0);
+
+        // planar reflection: the scene mirrored about the water plane, seen from the camera (only above the water)
+        const reflectionOn = reflection !== null && waterChunks.length > 0 && camPosition[2] > SEA_LEVEL;
+        if (reflectionOn) {
+            mat4.multiply(reflViewProjMatrix, viewProjMatrix, mirrorMatrix);
+            mat4.invert(reflInvViewProjMatrix, reflViewProjMatrix);
+            vec3.set(mirroredCamPosition, camPosition[0], camPosition[1], 2 * SEA_LEVEL - camPosition[2]);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, reflection.framebuffer);
+            gl.viewport(0, 0, reflection.width, reflection.height);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+            gl.cullFace(gl.FRONT); // the mirror flips the winding
+            drawTerrainColor(world.cullReflection(reflViewProjMatrix, mirroredCamPosition), reflViewProjMatrix, mirroredCamPosition, true);
+            gl.cullFace(gl.BACK);
+            drawSky(reflInvViewProjMatrix, mirroredCamPosition, true);
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+        }
+
         // 3. full resolution color, shadows read from the mask (or traced per pixel)
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-        gl.useProgram(color.program);
-        gl.uniformMatrix4fv(color.locations.viewProj, false, viewProjMatrix);
-        setSky(color);
-        setClouds(color);
-        setAtmosphere(color);
-        gl.uniform3fv(color.locations.camPosition, camPosition);
-        gl.uniform1i(color.locations.halfResShadows, halfResShadows ? 1 : 0);
-        gl.uniform1i(color.locations.shadowMask, 5 + shadowTargets.current);
-        gl.uniform2f(color.locations.depthRange, NEAR, farPlane());
-        gl.uniform2f(color.locations.maskScale,
-            shadowTargets.width / gl.drawingBufferWidth, shadowTargets.height / gl.drawingBufferHeight);
-        gl.uniform1f(color.locations.fogDensity, 1.2 / viewDistance()); // fog = 0.95 at the view distance
-        setShadowWindow(color);
-        facesDrawn = world.draw(visible, camPosition, color.locations.chunkOrigin);
+        facesDrawn = drawTerrainColor(visible, viewProjMatrix, camPosition, false);
 
-        // 4. sky last, on the far plane: only the pixels the terrain left empty are shaded
-        gl.useProgram(sky.program);
-        gl.uniformMatrix4fv(sky.locations.invViewProj, false, invViewProjMatrix);
-        gl.uniform3fv(sky.locations.camPosition, camPosition);
-        setSky(sky);
-        setClouds(sky);
-        setAtmosphere(sky);
-        gl.uniform3fv(sky.locations.moonDir, light.moonDir);
-        gl.uniform3fv(sky.locations.sunDiskColor, vec3.scale(vec3.create(), light.sunColor, 40));
-        gl.uniform3fv(sky.locations.moonDiskColor, vec3.scale(vec3.create(), light.moonColor, 25));
-        gl.uniform1f(sky.locations.starVisibility, light.starVisibility);
-        gl.depthMask(false);
-        gl.depthFunc(gl.LEQUAL);
-        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        // 4. sky
+        drawSky(invViewProjMatrix, camPosition, false);
+
+        // 5. water, transparent over the terrain and the sky (premultiplied alpha), both sides visible
+        if (waterChunks.length > 0) {
+            gl.useProgram(water.program);
+            gl.uniformMatrix4fv(water.locations.viewProj, false, viewProjMatrix);
+            gl.uniform3fv(water.locations.camPosition, camPosition);
+            gl.uniform1f(water.locations.fogDensity, 1.2 / viewDistance());
+            gl.uniform1f(water.locations.waterTime, waterTime);
+            gl.uniform1i(water.locations.reflectionOn, reflectionOn ? 1 : 0);
+            gl.uniform1i(water.locations.hasHalfDepth, halfResShadows || atmosphereOn ? 1 : 0);
+            gl.uniform2f(water.locations.depthRange, NEAR, farPlane());
+            setSky(water);
+            gl.uniform1i(water.locations.rawOutput, 0);
+            setClouds(water);
+            setAtmosphere(water);
+            setShadowWindow(water);
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+            gl.depthMask(false);
+            gl.disable(gl.CULL_FACE);
+            for (const chunk of waterChunks) {
+                gl.uniform3fv(water.locations.chunkOrigin, chunk.pos);
+                chunk.drawWater(gl);
+            }
+            gl.bindVertexArray(null);
+            gl.enable(gl.CULL_FACE);
+            gl.depthMask(true);
+            gl.disable(gl.BLEND);
+        }
+
+        // 6. under the water: a veil over everything
+        if (underWater) {
+            gl.useProgram(underwater.program);
+            setSky(underwater);
+            gl.uniform1i(underwater.locations.rawOutput, 0);
+            gl.uniform1f(underwater.locations.veil, 0.25);
+            gl.disable(gl.DEPTH_TEST);
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            gl.disable(gl.BLEND);
+            gl.enable(gl.DEPTH_TEST);
+        }
 
         gpuTimer.end();
         mat4.copy(prevViewProjMatrix, viewProjMatrix);
@@ -614,6 +756,7 @@ function init() {
                 ` | view ${world.viewRadius} (+/-)` +
                 ` | cave culling ${world.caveCulling ? "on" : "off"} (c)` +
                 ` | ${(facesDrawn * 2 / 1e6).toFixed(2)} M triangles` +
+                (waterFaces > 0 ? ` | water ${(waterFaces / 1e3).toFixed(0)} k faces` : "") +
                 ` | ${canvas.width}x${canvas.height}` +
                 ` | pos ${Array.from(camPosition, v => v.toFixed(1)).join(" ")}` +
                 ` | shadows ${halfResShadows ? "half" : "full"} res (h)` +
