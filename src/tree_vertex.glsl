@@ -21,6 +21,7 @@ flat out int vMaterial;
 flat out float vTint;
 flat out float vSkyLight;
 flat out float vYaw;
+out float vOpenness; // sky seen through the tree itself (baked in the model)
 
 const vec3 NORMALS[6] = vec3[6](
     vec3(1, 0, 0), vec3(-1, 0, 0),
@@ -53,5 +54,6 @@ void main() {
     vTint = instanceData.y;
     vSkyLight = instanceData.z;
     vYaw = instancePosition.w;
+    vOpenness = float(data >> 29u) / 7.0;
     gl_Position = viewProj * vec4(vPosition, 1.0);
 }

@@ -11,6 +11,7 @@ Sky light propagated like in Minecraft (caves and overhangs are dark), and ray-t
 Trees: 5 species (oak, pine, birch, bush, dead tree) made of voxels 4 times smaller than the terrain, generated at startup
 and drawn as instances (free position, rotation, size, tint), with 3 levels of detail, high resolution bark textures and
 Minecraft-like pixel art foliage (one texture per leaf voxel face, holes cut out up close), wind in the leaves, a shadow map for their shadows,
+ambient occlusion (baked in the models, and a canopy map darkening the ground under the trees and the forest around),
 and reflections in the water; explosions destroy them.
 Lakes in the valleys (sea level 28) with planar reflections, waves, Fresnel, sun glint, depth-based transparency and an
 underwater view; craters dug next to the water fill up.

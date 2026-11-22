@@ -30,6 +30,7 @@ layout(location = 1) out vec4 outDepth;
 @import ./shadow;
 @import ./common;
 @import ./clouds;
+@import ./tree_shadow;
 
 const float FAR = 60000.0;
 const int SHAFT_STEPS = 10;
@@ -101,7 +102,7 @@ void main() {
             vec3 p = camPosition + dir * (float(i) + jitter) * dt;
             float haze = HAZE_DENSITY * exp(-max(p.z, 0.0) / HAZE_HEIGHT);
             float visible = coarseVisibility(p, toLight, SHAFT_OCCLUSION_STEPS);
-            if(visible > 0.0) visible *= cloudShadow(p, toLight);
+            if(visible > 0.0) visible *= cloudShadow(p, toLight) * treeShadow(p, vec3(0.0)); // terrain, clouds, foliage
             float stepTransmittance = exp(-haze * dt);
             scatter += transmittance * sunLight * visible * (1.0 - stepTransmittance);
             transmittance *= stepTransmittance;

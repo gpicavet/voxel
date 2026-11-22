@@ -5,6 +5,7 @@ import { createCloudNoiseTexture } from "./cloudNoise";
 import { createLeafTextures } from "./leafTextures";
 import { createVoxelTextures } from "./textures";
 import { clockTime, createDaylight, daylight } from "./daylight";
+import { CanopyMap } from "./canopy";
 import { TreeRenderer } from "./trees";
 import { frustumPlanes } from "./utils";
 import { World } from "./world";
@@ -44,6 +45,7 @@ const ATMOSPHERE_UNIFORMS = ["atmosphereScatter", "screenSize", "atmosphereOn"];
 const WEATHERS = [["fair", 0.35], ["cloudy", 0.55], ["overcast", 0.85], ["clear", 0.0]]; // the first is the default
 // uniforms of tree_shadow.glsl
 const TREE_SHADOW_UNIFORMS = ["treeShadowMap", "treeShadowMatrix", "treeShadowOn"];
+const CANOPY_UNIFORMS = ["canopyTex", "canopyOrigin", "canopySize", "canopyOn"];
 const TREE_SHADOW_SIZE = 2048;
 const TREE_SHADOW_RADIUS = 128; // half side of the area of the tree shadow map, around the camera
 // the tree shadow map is rendered again only when the light turned by this much, the camera moved by this much, or
@@ -305,7 +307,7 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals", "reflectionPass", "seaLevel", "aoMask", ...TREE_SHADOW_UNIFORMS,
+        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals", "reflectionPass", "seaLevel", "aoMask", ...TREE_SHADOW_UNIFORMS, ...CANOPY_UNIFORMS,
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
@@ -318,7 +320,7 @@ function init() {
         ["sunDir", "moonDir", "moonSky", "lutSize"]);
     const atmosphere = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, atmosphereFshader),
         ["halfDepth", "historyScatter", "historyDepth", "invViewProj", "prevViewProj", "camPosition", "frameIndex", "historyValid", "lightShafts", "shaftDistance",
-            ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS]);
+            ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...TREE_SHADOW_UNIFORMS]);
 
     // sky radiance texture (unit 7): half floats when they can be rendered to
     const floatTargets = !!gl.getExtension("EXT_color_buffer_float");
@@ -345,7 +347,7 @@ function init() {
     const TREE_UNIFORMS = ["viewProj", "modelOrigin", "voxelSize", "windTime", "cutout", "voxelAlbedo", "voxelNormals", "leafTextures"];
     const treeColor = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeFshader),
         [...TREE_UNIFORMS, "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", "reflectionPass", "seaLevel",
-            ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS, ...TREE_SHADOW_UNIFORMS]);
+            ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS, ...TREE_SHADOW_UNIFORMS, ...CANOPY_UNIFORMS]);
     const treeGbuffer = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeGbufferFshader), TREE_UNIFORMS);
     const treeDepth = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeDepthFshader), TREE_UNIFORMS);
     const textureGen = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, textureGenFshader), ["layer", "size"]);
@@ -356,6 +358,7 @@ function init() {
 
     const world = new World(gl);
     const trees = new TreeRenderer(gl, world);
+    const canopy = new CanopyMap(gl, gl.TEXTURE20, trees.crowns);
 
     // shadow map of the trees (unit 18): depth seen from the light, compared in the shaders
     gl.activeTexture(gl.TEXTURE18);
@@ -389,7 +392,7 @@ function init() {
 
     // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 2 horizon heights, 3 half depth, 4 half face, 5 and 6 shadow masks,
     // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 and 14 voxel textures (albedo, normals), 15 water reflection,
-    // 16 and 17 ambient occlusion masks, 18 tree shadow map, 19 foliage (pixel art)
+    // 16 and 17 ambient occlusion masks, 18 tree shadow map, 19 foliage (pixel art), 20 canopy map
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.brickTex, 0);
@@ -409,6 +412,7 @@ function init() {
         gl.uniform1i(program.locations.cloudNoise, 8);
     }
     gl.useProgram(atmosphere.program);
+    gl.uniform1i(atmosphere.locations.treeShadowMap, 18);
     gl.uniform1i(atmosphere.locations.brickTex, 0);
     gl.uniform1i(atmosphere.locations.coarseTex, 1);
     gl.uniform1i(atmosphere.locations.halfDepth, 3);
@@ -417,9 +421,10 @@ function init() {
     gl.uniform1i(color.locations.voxelAlbedo, 13);
     gl.uniform1i(color.locations.voxelNormals, 14);
     gl.uniform1i(color.locations.treeShadowMap, 18);
+    gl.uniform1i(color.locations.canopyTex, 20);
     gl.useProgram(treeColor.program);
     for (const [name, unit] of [["brickTex", 0], ["coarseTex", 1], ["horizonTex", 2], ["skyLUT", 7], ["cloudNoise", 8], ["treeShadowMap", 18],
-        ["voxelAlbedo", 13], ["voxelNormals", 14], ["leafTextures", 19]]) {
+        ["voxelAlbedo", 13], ["voxelNormals", 14], ["leafTextures", 19], ["canopyTex", 20]]) {
         gl.uniform1i(treeColor.locations[name], unit);
     }
     gl.useProgram(treeGbuffer.program);
@@ -551,6 +556,11 @@ function init() {
     function setTreeShadow(program) {
         gl.uniformMatrix4fv(program.locations.treeShadowMatrix, false, treeShadowMatrix);
         gl.uniform1i(program.locations.treeShadowOn, treeShadowOn ? 1 : 0);
+    }
+    function setCanopy(program) {
+        gl.uniform2fv(program.locations.canopyOrigin, canopy.origin);
+        gl.uniform1f(program.locations.canopySize, canopy.size);
+        gl.uniform1i(program.locations.canopyOn, canopy.valid ? 1 : 0);
     }
 
     // frustum planes without the bottom and top ones (trees above or below the screen show in the reflections)
@@ -698,6 +708,7 @@ function init() {
         const visible = world.cull(viewProjMatrix, camPosition);
         visibleChunks = visible.length;
         renderTreeShadows(timeScale > 1);
+        canopy.update(world, camPosition);
         trees.gather("camera", camPosition, sidePlanes(viewProjMatrix), viewDistance());
 
         gl.enable(gl.DEPTH_TEST);
@@ -791,6 +802,7 @@ function init() {
             setSky(atmosphere);
             setClouds(atmosphere);
             setShadowWindow(atmosphere);
+            setTreeShadow(atmosphere);
             gl.drawArrays(gl.TRIANGLES, 0, 3);
             gl.enable(gl.DEPTH_TEST);
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -818,6 +830,7 @@ function init() {
             gl.uniform1f(color.locations.fogDensity, 1.2 / viewDistance()); // fog = 0.95 at the view distance
             setShadowWindow(color);
             setTreeShadow(color);
+            setCanopy(color);
             return world.draw(chunks, eye, color.locations.chunkOrigin);
         }
 
@@ -830,6 +843,7 @@ function init() {
             setClouds(treeColor);
             setAtmosphere(treeColor);
             setTreeShadow(treeColor);
+            setCanopy(treeColor);
             gl.uniform3fv(treeColor.locations.camPosition, eye);
             gl.uniform1i(treeColor.locations.halfResShadows, halfResShadows && !mirrored ? 1 : 0);
             gl.uniform1i(treeColor.locations.reflectionPass, mirrored ? 1 : 0);

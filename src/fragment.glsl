@@ -36,6 +36,7 @@ out vec4 fragColor;
 @import ./atmosphere;
 @import ./surface_atmosphere;
 @import ./tree_shadow;
+@import ./canopy;
 
 // start of the shadow ray: on the face plane (an integer coordinate: removes the interpolation error, which grows
 // far from the origin), just in front of the face
@@ -162,6 +163,8 @@ void main() {
     // sky light: the sky only lights what it reaches (Minecraft-like propagation, 0.8 per voxel: caves are dark)
     float skyAccess = 0.02 + 0.98 * pow(0.8, (1.0 - vSkyLight) * 15.0);
     // ambient occlusion: the 3 voxels of the corner (vertices, sharp contact) and the voxels within 10 (ray traced)
+    // and the foliage of the trees above and around (canopy map)
+    occlusion *= 1.0 - canopyOcclusion(vPosition, false);
     vec3 light = ambientLight(normal) * vAO * occlusion * skyAccess + lightColor * max(dot(normal, toLight), 0.0) * shadow * (0.5 + 0.5 * vAO);
     vec3 color = albedo * light;
 

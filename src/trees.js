@@ -21,6 +21,7 @@ export class TreeRenderer {
             gl.bufferData(gl.ARRAY_BUFFER, model.vertices, gl.STATIC_DRAW);
             return { ...model, buffer };
         }));
+        this.crowns = this.models.map(lods => lods[0].crown);
         this.sets = { camera: this.createSet(), shadow: this.createSet() };
         this.min = new Float32Array(3);
         this.max = new Float32Array(3);

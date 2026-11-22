@@ -213,16 +213,65 @@ function leafDepth(grid) {
     return depth;
 }
 
+// directions of the sky openness rays: cosine distributed over the upper hemisphere (the sky lights from above)
+const OPENNESS_RAYS = 20;
+const OPENNESS_DIRS = (() => {
+    const dirs = [];
+    for (let i = 0; i < OPENNESS_RAYS; i++) {
+        const u = (i + 0.5) / OPENNESS_RAYS, phi = i * 2.399963; // golden angle
+        const r = Math.sqrt(u);
+        dirs.push([r * Math.cos(phi), r * Math.sin(phi), Math.sqrt(1 - u)]);
+    }
+    return dirs;
+})();
+
+/**
+ * Sky openness of the voxels (computed on demand): the part of the sky seen from the voxel center through the tree
+ * itself. Wood stops the rays, each voxel of leaves lets leafTransmittance through (the holes of the foliage).
+ */
+function opennessField(grid, leafTransmittance) {
+    const { nx, ny, nz } = grid;
+    const cache = new Float32Array(nx * ny * nz).fill(-1);
+    return (x, y, z) => {
+        if (x < 0 || y < 0 || z < 0 || x >= nx || y >= ny || z >= nz) return 1;
+        const i = (x * ny + y) * nz + z;
+        if (cache[i] >= 0) return cache[i];
+        let sum = 0;
+        for (const [dx, dy, dz] of OPENNESS_DIRS) {
+            let t = 1, px = x + 0.5, py = y + 0.5, pz = z + 0.5;
+            let last = i;
+            for (;;) {
+                px += dx * 0.9; py += dy * 0.9; pz += dz * 0.9;
+                const vx = Math.floor(px), vy = Math.floor(py), vz = Math.floor(pz);
+                if (vx < 0 || vy < 0 || vx >= nx || vy >= ny || vz >= nz) break; // out of the tree: open sky
+                const j = (vx * ny + vy) * nz + vz;
+                if (j === last) continue;
+                last = j;
+                const m = grid.v[j];
+                if (m === 0) continue;
+                if (!LEAVES.has(m - 1)) { t = 0; break; }
+                t *= leafTransmittance;
+                if (t < 0.02) { t = 0; break; }
+            }
+            sum += t;
+        }
+        return cache[i] = sum / OPENNESS_RAYS;
+    };
+}
+
 /**
  * Faces of the voxels next to an empty voxel, with ambient occlusion per corner. Same vertex format as the terrain:
- * x, y, z (7 bits each) | face (3 bits) | ambient occlusion (2 bits) | material (3 bits)
+ * x, y, z (7 bits each) | face (3 bits) | ambient occlusion (2 bits) | material (3 bits) | sky openness (3 bits): the
+ * part of the sky seen through the tree itself (baked self occlusion: inside and under the crown, the trunk under it)
  * cutout (finest level, leaves with transparent gaps): also a second layer of leaves under the surface, and the branches
  * inside the crowns, seen through the gaps.
  */
-function meshGrid(grid, cutout) {
+function meshGrid(grid, cutout, leafTransmittance) {
     const { nx, ny, nz } = grid;
     const vertices = [];
     const solid = (x, y, z) => grid.get(x, y, z) !== 0;
+    const wood = (x, y, z) => { const m = grid.get(x, y, z); return m !== 0 && !LEAVES.has(m - 1); };
+    const openness = opennessField(grid, leafTransmittance);
     const depth = cutout ? leafDepth(grid) : null;
     const depthAt = (x, y, z) => depth[(x * ny + y) * nz + z];
     const visibleAgainst = (m, x, y, z, nxv, nyv, nzv) => {
@@ -243,27 +292,56 @@ function meshGrid(grid, cutout) {
                     if (!visibleAgainst(m, x, y, z, x + fx, y + fy, z + fz)) return;
                     const axis = face.n.findIndex(v => v !== 0);
                     const [u, v] = [0, 1, 2].filter(a => a !== axis);
+                    const sky = [];
                     const ao = face.c.map(c => {
                         const du = c[u] ? 1 : -1, dv = c[v] ? 1 : -1;
-                        const at = (ou, ov) => {
+                        const cell = (ou, ov) => {
                             const p = [x + fx, y + fy, z + fz];
                             p[u] += ou;
                             p[v] += ov;
-                            return solid(p[0], p[1], p[2]) ? 1 : 0;
+                            return p;
                         };
+                        const at = (ou, ov) => { const p = cell(ou, ov); return solid(p[0], p[1], p[2]) ? 1 : 0; };
                         const s1 = at(du, 0), s2 = at(0, dv), co = at(du, dv);
+                        // smooth openness per corner: mean of the voxels around it that are not wood
+                        let sum = 0, n = 0;
+                        for (const [ou, ov] of [[0, 0], [du, 0], [0, dv], [du, dv]]) {
+                            const p = cell(ou, ov);
+                            if (wood(p[0], p[1], p[2])) continue;
+                            sum += openness(p[0], p[1], p[2]);
+                            n++;
+                        }
+                        sky.push(n > 0 ? Math.round(sum / n * 7) : 0);
                         return (s1 && s2) ? 0 : 3 - (s1 + s2 + co);
                     });
                     const start = (ao[0] + ao[2] < ao[1] + ao[3]) ? 1 : 0;
                     for (let j = 0; j < 4; j++) {
                         const k = (start + j) & 3, c = face.c[k];
-                        vertices.push(((x + c[0]) | ((y + c[1]) << 7) | ((z + c[2]) << 14) | (f << 21) | (ao[k] << 24) | ((m - 1) << 26)) >>> 0);
+                        vertices.push(((x + c[0]) | ((y + c[1]) << 7) | ((z + c[2]) << 14) | (f << 21) | (ao[k] << 24) | ((m - 1) << 26) | (sky[k] << 29)) >>> 0);
                     }
                 });
             }
         }
     }
     return new Uint32Array(vertices);
+}
+
+/** extent of the foliage (meters, from the base): radius, bottom and top, for the canopy map (canopy.js) */
+function crownOf(grid, cx, cy, voxelSize) {
+    let radius = 0, bottom = Infinity, top = 0;
+    for (let x = 0; x < grid.nx; x++) {
+        for (let y = 0; y < grid.ny; y++) {
+            for (let z = 0; z < grid.nz; z++) {
+                const m = grid.v[(x * grid.ny + y) * grid.nz + z];
+                if (m === 0 || !LEAVES.has(m - 1)) continue;
+                radius = Math.max(radius, Math.hypot(x + 0.5 - cx, y + 0.5 - cy));
+                bottom = Math.min(bottom, z);
+                top = Math.max(top, z + 1);
+            }
+        }
+    }
+    if (bottom === Infinity) return null; // no foliage (dead tree)
+    return { radius: radius * voxelSize * 0.85, bottom: bottom * voxelSize, top: top * voxelSize };
 }
 
 /**
@@ -279,8 +357,10 @@ export function buildTreeModels(seed = 'trees') {
         for (let lod = 0; lod < TREE_LODS; lod++) {
             if (lod > 0) grid = downsample(grid);
             const scale = 1 << lod;
-            const vertices = meshGrid(grid, lod === 0);
+            // bigger voxels of leaves block more of the sky
+            const vertices = meshGrid(grid, lod === 0, Math.pow(0.45, scale));
             lods.push({
+                crown: crownOf(grid, center[0] / scale, center[1] / scale, TREE_VOXEL * scale),
                 vertices,
                 nFaces: vertices.length / 4,
                 origin: [center[0] / scale, center[1] / scale, 0],
