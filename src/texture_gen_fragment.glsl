@@ -4,7 +4,8 @@ precision highp int;
 
 // Generates one layer of the voxel textures (run once at startup, textures.js): realistic, tileable (every noise is
 // periodic over the texture), with a relief turned into a normal map. Layers: 0 earth, 1 rock, 2 grass, 3 snow, 4 sand,
-// 5 water ripples (only its normal map is used, by water_fragment.glsl).
+// 5 water ripples (only its normal map is used, by water_fragment.glsl), and for the trees: 6 oak bark, 7 birch bark,
+// 8 dead wood (the foliage is pixel art: leafTextures.js).
 
 uniform int layer;
 uniform float size; // texels per side
@@ -127,6 +128,39 @@ float material(vec2 uv, out vec3 albedo) {
         // small waves: rounded crests in all directions
         float height = fbm(uv, vec2(5.0), 5) * 0.65 + fbm(uv + 0.5, vec2(17.0), 3) * 0.35;
         albedo = vec3(0.0);
+        return height;
+    }
+    if(layer == 6) {
+        // oak bark: vertical plates separated by deep furrows, broken across from time to time
+        float warp = uv.x * 10.0 + (fbm(uv, vec2(3.0, 6.0), 4) - 0.5) * 3.0;
+        float plates = smoothstep(0.05, 0.45, abs(sin(warp * 3.14159265)));
+        float breaks = smoothstep(0.82, 0.92, vnoise(uv, vec2(10.0, 7.0)));
+        float grain = vnoise(uv, vec2(96.0, 24.0));
+        float height = plates * (1.0 - breaks * 0.6) * 0.75 + grain * 0.25;
+        albedo = mix(vec3(0.08, 0.06, 0.045), vec3(0.30, 0.25, 0.20), height);
+        albedo *= 0.85 + 0.3 * fbm(uv, vec2(5.0), 3);
+        float moss = smoothstep(0.6, 0.75, fbm(uv + 0.3, vec2(4.0, 8.0), 4)) * (1.0 - plates);
+        albedo = mix(albedo, vec3(0.16, 0.22, 0.07), moss * 0.6);
+        return height;
+    }
+    if(layer == 7) {
+        // birch bark: white, horizontal dark lenticels, black patches, a little peeling
+        float lenticel = smoothstep(0.78, 0.86, vnoise(uv, vec2(12.0, 90.0))) * smoothstep(0.4, 0.7, vnoise(uv + 0.2, vec2(24.0, 6.0)));
+        float blotch = smoothstep(0.66, 0.74, fbm(uv, vec2(3.0, 5.0), 5));
+        float grain = vnoise(uv, vec2(40.0, 160.0));
+        float height = 0.6 + grain * 0.15 - lenticel * 0.4 - blotch * 0.2;
+        albedo = mix(vec3(0.78, 0.76, 0.72), vec3(0.92, 0.90, 0.86), grain);
+        albedo = mix(albedo, vec3(0.86, 0.72, 0.58), smoothstep(0.7, 0.8, fbm(uv + 0.6, vec2(6.0, 12.0), 3)) * 0.35); // peeling
+        albedo = mix(albedo, vec3(0.06, 0.05, 0.05), max(lenticel * 0.85, blotch));
+        return height;
+    }
+    if(layer == 8) {
+        // dead wood: silver gray, fine vertical grain, a few deep cracks
+        float grain = vnoise(uv, vec2(80.0, 4.0)) * 0.6 + vnoise(uv, vec2(160.0, 10.0)) * 0.4;
+        float crack = smoothstep(0.035, 0.0, abs(fract(uv.x * 5.0 + (fbm(uv, vec2(2.0, 4.0), 3) - 0.5) * 0.6) - 0.5) - 0.465);
+        float height = grain * 0.7 + 0.3 - crack * 0.6;
+        albedo = mix(vec3(0.30, 0.28, 0.25), vec3(0.58, 0.55, 0.50), grain);
+        albedo *= 1.0 - crack * 0.7;
         return height;
     }
     // snow: soft drifts, wind ripples, bluish hollows

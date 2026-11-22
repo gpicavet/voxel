@@ -40,6 +40,7 @@ const float AO_DISTANCE = 200.0;
 // every REFRESH_PERIOD frames, so sun motion and destructions show up), and so are newly visible surfaces.
 // Whole tiles keep the pixels traced together by the GPU coherent.
 const int REFRESH_PERIOD = 8;
+const int TREE_FACE = 7; // face id of the tree pixels (tree_gbuffer_fragment.glsl)
 
 float reusedShadow(vec3 pos, int face, float plane, out bool found) {
     found = false;
@@ -126,8 +127,24 @@ void main() {
         fragAO = vec4(1.0);
         return;
     }
-    vec3 normal = NORMALS[face];
     vec3 sunDir = -lightDir;
+    if(face == TREE_FACE) {
+        // a tree (not in the voxel textures): its terrain shadow from its surface, no normal, no occlusion here
+        vec4 treePoint = invViewProj * vec4((vec2(p) + 0.5) / vec2(textureSize(halfDepth, 0)) * 2.0 - 1.0, texelFetch(halfDepth, p, 0).r * 2.0 - 1.0, 1.0);
+        vec3 treePos = treePoint.xyz / treePoint.w;
+        float treeLit = 0.0, treeCloud = 1.0;
+        if(sunDir.z > 0.0) {
+            treeCloud = cloudShadow(treePos, sunDir);
+            bool found = false;
+            bool refresh = refreshAll || ((p.x >> 3) + (p.y >> 3) * 3 + frameIndex) % REFRESH_PERIOD == 0;
+            if(!refresh) treeLit = reusedShadow(treePos, TREE_FACE, 0.0, found);
+            if(!found) treeLit = castShadowRay(treePos + sunDir * 0.3, sunDir);
+        }
+        fragMask = vec4(treeLit, float(TREE_FACE + 1) / 255.0, 0.0, treeCloud);
+        fragAO = vec4(1.0);
+        return;
+    }
+    vec3 normal = NORMALS[face];
 
     // world position of the surface, from the depth buffer
     float depth = texelFetch(halfDepth, p, 0).r;
