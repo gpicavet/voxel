@@ -1,11 +1,11 @@
 // Realistic voxel textures, generated on the GPU at startup (texture_gen_fragment.glsl, no image file):
 // albedo and normal map, 512 x 512, one layer per material (0 earth, 1 rock, 2 grass, 3 snow, 4 sand), the normal map
-// of the small waves of the water (5), and the trees: 6 oak bark, 7 birch bark, 8 dead wood, 9 hanging leaves (sides),
-// 10 needles, 11 leaves in every direction (top and bottom faces); leaves and needles have transparent gaps in alpha.
+// of the small waves of the water (5), and the bark of the trees: 6 oak, 7 birch, 8 dead wood (the foliage is pixel art,
+// leafTextures.js).
 // They tile without seams; the terrain shader maps one texture on 4 x 4 voxels.
 
 export const TEXTURE_SIZE = 512;
-const LAYERS = 12;
+const LAYERS = 9;
 
 function createArray(gl, unit, internalFormat) {
     gl.activeTexture(unit);

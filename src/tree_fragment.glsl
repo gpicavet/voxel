@@ -47,20 +47,18 @@ float hash(vec3 p) {
 
 // color (linear) and normal (world) of the fragment, from the textures; per tree and per voxel variations
 void treeSurface(bool leaf, out vec3 albedo, out vec3 normal) {
-    vec2 uv = treeUV(vLocal, vLocalNormal, vTint * 7.0);
-    vec4 texel = treeTexel(vMaterial, vLocalNormal, uv);
-    albedo = texel.rgb;
-    if(vMaterial == 5) albedo *= vec3(1.25, 1.25, 1.05);     // birch leaves: lighter
-    if(vMaterial == 3) albedo *= 0.8;                         // needles: darker
-    if(vMaterial == 6) albedo *= vec3(0.85, 0.9, 0.85);      // bush leaves: darker
+    vec3 texel = treeTexel(vMaterial, vLocal, vLocalNormal, vTint * 7.0).rgb;
+    albedo = texel;
+    vec3 tn = vec3(0.0, 0.0, 1.0); // the pixel art foliage is flat
     if(leaf) {
         // every tree a bit different: from fresh green to yellowish, lighter or darker
         albedo = mix(albedo, albedo * vec3(1.25, 1.08, 0.7), vTint * 0.4) * (0.88 + 0.24 * vTint);
+    } else {
+        // bark: a little per voxel, so the voxels still read, and the relief of the texture
+        albedo *= 0.94 + 0.12 * hash(floor(vLocal - vLocalNormal * 0.5));
+        vec2 uv = treeUV(vLocal, vLocalNormal, vTint * 7.0);
+        tn = texture(voxelNormals, vec3(uv, float(BARK_LAYERS[vMaterial]))).xyz * 2.0 - 1.0;
     }
-    // a little per voxel, so the voxels still read
-    albedo *= 0.94 + 0.12 * hash(floor(vLocal - vLocalNormal * 0.5));
-
-    vec3 tn = texture(voxelNormals, vec3(uv, treeLayer(vMaterial, vLocalNormal))).xyz * 2.0 - 1.0;
     vec3 n = vLocalNormal;
     vec3 t = abs(n.x) > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
     vec3 b = abs(n.z) > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);

@@ -2,6 +2,7 @@ import { mat4, vec3 } from "gl-matrix";
 import { moveWithCollisions } from "./collision";
 import { CHUNK_SIZE, SEA_LEVEL } from "./constants";
 import { createCloudNoiseTexture } from "./cloudNoise";
+import { createLeafTextures } from "./leafTextures";
 import { createVoxelTextures } from "./textures";
 import { clockTime, createDaylight, daylight } from "./daylight";
 import { TreeRenderer } from "./trees";
@@ -341,7 +342,7 @@ function init() {
     const underwater = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, underwaterFshader),
         ["veil", ...SKY_UNIFORMS]);
     const treeVertexShader = compileShader(gl, gl.VERTEX_SHADER, treeVshader);
-    const TREE_UNIFORMS = ["viewProj", "modelOrigin", "voxelSize", "windTime", "cutout", "voxelAlbedo", "voxelNormals"];
+    const TREE_UNIFORMS = ["viewProj", "modelOrigin", "voxelSize", "windTime", "cutout", "voxelAlbedo", "voxelNormals", "leafTextures"];
     const treeColor = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeFshader),
         [...TREE_UNIFORMS, "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", "reflectionPass", "seaLevel",
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS, ...TREE_SHADOW_UNIFORMS]);
@@ -349,6 +350,7 @@ function init() {
     const treeDepth = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeDepthFshader), TREE_UNIFORMS);
     const textureGen = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, textureGenFshader), ["layer", "size"]);
     createVoxelTextures(gl, textureGen, gl.TEXTURE13, gl.TEXTURE14);
+    createLeafTextures(gl, gl.TEXTURE19);
     let cloudTime = 0;
 
 
@@ -387,7 +389,7 @@ function init() {
 
     // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 2 horizon heights, 3 half depth, 4 half face, 5 and 6 shadow masks,
     // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 and 14 voxel textures (albedo, normals), 15 water reflection,
-    // 16 and 17 ambient occlusion masks, 18 tree shadow map
+    // 16 and 17 ambient occlusion masks, 18 tree shadow map, 19 foliage (pixel art)
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.brickTex, 0);
@@ -417,11 +419,12 @@ function init() {
     gl.uniform1i(color.locations.treeShadowMap, 18);
     gl.useProgram(treeColor.program);
     for (const [name, unit] of [["brickTex", 0], ["coarseTex", 1], ["horizonTex", 2], ["skyLUT", 7], ["cloudNoise", 8], ["treeShadowMap", 18],
-        ["voxelAlbedo", 13], ["voxelNormals", 14]]) {
+        ["voxelAlbedo", 13], ["voxelNormals", 14], ["leafTextures", 19]]) {
         gl.uniform1i(treeColor.locations[name], unit);
     }
     gl.useProgram(treeGbuffer.program);
     gl.uniform1i(treeGbuffer.locations.voxelAlbedo, 13);
+    gl.uniform1i(treeGbuffer.locations.leafTextures, 19);
     gl.uniform1f(treeColor.locations.seaLevel, SEA_LEVEL);
     gl.useProgram(color.program);
     gl.uniform1f(color.locations.seaLevel, SEA_LEVEL);
