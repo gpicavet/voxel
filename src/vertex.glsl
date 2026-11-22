@@ -1,12 +1,14 @@
 #version 300 es
 
 // x, y, z in the chunk (7 bits each) | face direction (3 bits) | ambient occlusion (2 bits) | material (3 bits)
+// | sky light (3 bits)
 layout(location=0) in uint data;
 
 uniform mat4 viewProj;
 uniform vec3 chunkOrigin;
 
 out float vAO;
+out float vSkyLight; // 0 (no sky reaches it) .. 1 (open sky)
 out vec3 vPosition;
 out vec3 vNormal;
 flat out int vFace;
@@ -32,5 +34,6 @@ void main() {
     vMaterial = material;
     vLocal = local;
     vAO = AO[ao];
+    vSkyLight = float((data >> 29) & 7u) / 7.0;
     gl_Position = viewProj * vec4(vPosition, 1.0);
 }

@@ -58,6 +58,7 @@ let halfResShadows = true;
 let viewRadiusChange = 0;
 let caveCullingToggle = false;
 let maskHistoryStale = false;
+let aoHistoryStale = false; // the occlusion does not depend on the sun: only reset when the mask stops being updated
 let writeViewToUrl = false;
 let weather = 0;
 let lightShafts = true;
@@ -67,6 +68,7 @@ function onkeydown(event) {
     if (event.key === "h") {
         halfResShadows = !halfResShadows;
         maskHistoryStale = true;
+        aoHistoryStale = true;
     }
     if (event.key === "w") {
         weather = (weather + 1) % WEATHERS.length;
@@ -154,15 +156,26 @@ function createShadowTargets(gl, screenWidth, screenHeight) {
     const height = Math.max(1, Math.ceil(screenHeight / 2));
     const depth = createTexture2D(gl, gl.TEXTURE3, gl.DEPTH_COMPONENT24, width, height);
     const face = createTexture2D(gl, gl.TEXTURE4, gl.R8, width, height);
-    // two masks: one is written while the other (previous frame) is read, then they swap
+    // two masks (shadows, units 5 and 6; ambient occlusion, units 16 and 17): one is written while the other
+    // (previous frame) is read, then they swap
     const masks = [createTexture2D(gl, gl.TEXTURE5, gl.RGBA8, width, height), createTexture2D(gl, gl.TEXTURE6, gl.RGBA8, width, height)];
+    const aoMasks = [createTexture2D(gl, gl.TEXTURE16, gl.R8, width, height), createTexture2D(gl, gl.TEXTURE17, gl.R8, width, height)];
     gl.activeTexture(gl.TEXTURE0);
+    const maskFramebuffers = masks.map((mask, i) => {
+        const framebuffer = createFramebuffer(gl, mask, null);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, aoMasks[i], 0);
+        gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        return framebuffer;
+    });
     return {
-        width, height, depth, face, masks,
+        width, height, depth, face, masks, aoMasks,
         current: 0, // index of the mask written this frame
         historyValid: false,
+        aoHistoryValid: false,
         geometryFramebuffer: createFramebuffer(gl, face, depth),
-        maskFramebuffers: masks.map(mask => createFramebuffer(gl, mask, null)),
+        maskFramebuffers,
     };
 }
 
@@ -214,6 +227,7 @@ function deleteShadowTargets(gl, targets) {
     gl.deleteTexture(targets.depth);
     gl.deleteTexture(targets.face);
     targets.masks.forEach(mask => gl.deleteTexture(mask));
+    targets.aoMasks.forEach(mask => gl.deleteTexture(mask));
 }
 
 /** GPU time of a frame, when EXT_disjoint_timer_query_webgl2 is available (not on Firefox and Safari) */
@@ -276,12 +290,13 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals", "reflectionPass", "seaLevel",
+        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals", "reflectionPass", "seaLevel", "aoMask",
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin"]);
     const shadow = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, shadowFshader),
-        ["invViewProj", "lightDir", "halfDepth", "halfFace", "historyMask", "prevViewProj", "frameIndex", "refreshAll", ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS]);
+        ["invViewProj", "lightDir", "halfDepth", "halfFace", "historyMask", "prevViewProj", "frameIndex", "refreshAll", "historyAO", "aoHistoryValid", "camPosition",
+            ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS]);
     const sky = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, skyFshader),
         ["invViewProj", "camPosition", "moonDir", "sunDiskColor", "moonDiskColor", "starVisibility", ...SKY_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const skyLut = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, skyLutFshader),
@@ -327,7 +342,8 @@ function init() {
     }
 
     // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 2 horizon heights, 3 half depth, 4 half face, 5 and 6 shadow masks,
-    // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 and 14 voxel textures (albedo, normals), 15 water reflection
+    // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 and 14 voxel textures (albedo, normals), 15 water reflection,
+    // 16 and 17 ambient occlusion masks
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.brickTex, 0);
@@ -581,6 +597,10 @@ function init() {
             shadowTargets.historyValid = false;
             maskHistoryStale = false;
         }
+        if (aoHistoryStale) {
+            shadowTargets.aoHistoryValid = false;
+            aoHistoryStale = false;
+        }
         const atmosphereOn = atmosphereEnabled;
         if (halfResShadows || atmosphereOn) {
             // 1. half resolution: depth and face direction of the nearest surface (cheap fragment shader)
@@ -604,11 +624,15 @@ function init() {
             gl.uniform1i(shadow.locations.historyMask, 6 - current); // units 5 and 6 hold masks 0 and 1
             gl.uniform1i(shadow.locations.frameIndex, frameIndex);
             gl.uniform1i(shadow.locations.refreshAll, shadowTargets.historyValid ? 0 : 1);
+            gl.uniform1i(shadow.locations.historyAO, 17 - current); // units 16 and 17 hold the occlusion 0 and 1
+            gl.uniform1i(shadow.locations.aoHistoryValid, shadowTargets.aoHistoryValid ? 1 : 0);
+            gl.uniform3fv(shadow.locations.camPosition, camPosition);
             setClouds(shadow);
             setShadowWindow(shadow);
             gl.drawArrays(gl.TRIANGLES, 0, 3);
             gl.enable(gl.DEPTH_TEST);
             shadowTargets.historyValid = true;
+            shadowTargets.aoHistoryValid = true;
         }
         if (halfResShadows || atmosphereOn) {
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -672,6 +696,7 @@ function init() {
             gl.uniform1i(color.locations.rawOutput, mirrored ? 1 : 0);
             if (mirrored) gl.uniform1i(color.locations.atmosphereOn, 0);
             gl.uniform1i(color.locations.shadowMask, 5 + shadowTargets.current);
+            gl.uniform1i(color.locations.aoMask, 16 + shadowTargets.current);
             gl.uniform2f(color.locations.depthRange, NEAR, farPlane());
             gl.uniform2f(color.locations.maskScale,
                 shadowTargets.width / gl.drawingBufferWidth, shadowTargets.height / gl.drawingBufferHeight);

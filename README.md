@@ -7,6 +7,7 @@ The world is 28 800 x 28 800 voxels (450 x 450 chunks of 64^3) and 256 high: mou
 
 Day and night cycle with a physical sky (Rayleigh and Mie scattering), sun and moon shadows, voxel clouds drifting with
 the wind and casting shadows, light shafts (god rays) and valley mist. Realistic textures (512 x 512, albedo and normal map) generated on the GPU at startup.
+Sky light propagated like in Minecraft (caves and overhangs are dark), and ray-traced ambient occlusion within 10 voxels.
 Lakes in the valleys (sea level 28) with planar reflections, waves, Fresnel, sun glint, depth-based transparency and an
 underwater view; craters dug next to the water fill up.
 
