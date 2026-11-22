@@ -7,14 +7,47 @@ uniform vec3 windowMin;       // world position of the window corner (z = bottom
 uniform vec3 windowSize;      // in voxels
 uniform ivec3 brickOrigin;    // texel of the window corner in each texture
 uniform ivec3 coarseOrigin;
+// horizon: surface heights of the generated terrain every horizonStep voxels, far around the camera (world.js)
+precision highp isampler2D;
+uniform isampler2D horizonTex;
+uniform vec2 horizonOrigin;   // world xy of the first sample
+uniform float horizonStep;
+uniform bool horizonValid;
 
 const int COARSE_POW = 3; // must match constants.js
 const int MAX_STEPS = 256;
+const float MAX_TERRAIN = 121.0; // highest generated surface + 1 (MAX_HEIGHT of constants.js)
+const int HORIZON_STEPS = 320;   // 8 voxels each: 2560 voxels
+
+// The ray left the loaded window sideways, at world position p, below the highest terrain: go on against the height map
+// of the generated terrain (bilinear, ignores caves and overhangs), until it rises above all the terrain or leaves the map.
+float horizonVisibility(vec3 p, vec3 rd) {
+    float horizontal = length(rd.xy);
+    if(!horizonValid || horizontal < 1e-4) return 1.0;
+    float dt = 8.0 / horizontal;
+    vec2 last = vec2(textureSize(horizonTex, 0) - 2);
+    for(int i = 1; i <= HORIZON_STEPS; i++) {
+        vec3 q = p + rd * (float(i) * dt);
+        if(q.z >= MAX_TERRAIN) return 1.0;
+        vec2 g = (q.xy - horizonOrigin) / horizonStep;
+        if(any(lessThan(g, vec2(0.0))) || any(greaterThan(g, last))) return 1.0;
+        ivec2 c = ivec2(g);
+        vec2 f = g - vec2(c);
+        float h = mix(mix(float(texelFetch(horizonTex, c, 0).r), float(texelFetch(horizonTex, c + ivec2(1, 0), 0).r), f.x),
+            mix(float(texelFetch(horizonTex, c + ivec2(0, 1), 0).r), float(texelFetch(horizonTex, c + ivec2(1, 1), 0).r), f.x), f.y);
+        if(q.z < h) return 0.0;
+    }
+    return 1.0;
+}
 
 // Voxel traversal towards the light: every voxel crossed by the ray is tested (no fixed step that could
-// miss a corner), empty 8^3 then 2^3 blocks are crossed in one step, and the ray stops as soon as it
-// leaves the window. Returns 1 when lit, 0 in the shadow.
+// miss a corner), empty 8^3 then 2^3 blocks are crossed in one step. A ray that leaves the loaded window sideways, or
+// runs too long along the slopes (low sun), goes on against the coarse height map of the terrain: the distant mountains
+// cast their shadows at sunset, and neighbouring rays never alternate between lit and dark (bright streaks).
+// Returns 1 when lit, 0 in the shadow.
 float castShadowRay(vec3 startPos, vec3 rd) {
+    // light at or below the horizon: blocked by the terrain all around (the rays would run flat across the world)
+    if(rd.z <= 0.0) return 0.0;
     rd = mix(rd, vec3(1e-6), lessThan(abs(rd), vec3(1e-6)));
     vec3 invRd = 1.0 / rd;
     vec3 towards = step(0.0, rd); // 1 on the axes where the ray goes up
@@ -28,8 +61,12 @@ float castShadowRay(vec3 startPos, vec3 rd) {
         if(pos.z < 0.0) {
             return 0.0; // below the world: rock
         }
-        if(any(lessThan(pos.xy, vec2(0.0))) || any(greaterThanEqual(pos, windowSize))) {
-            return 1.0; // above the world, or out of the loaded window: lit
+        if(pos.z >= windowSize.z) {
+            return 1.0; // above the world: lit
+        }
+        if(any(lessThan(pos.xy, vec2(0.0))) || any(greaterThanEqual(pos.xy, windowSize.xy))) {
+            // out of the loaded window: the terrain further away decides
+            return horizonVisibility(pos + windowMin, rd);
         }
         ivec3 cell = ivec3(pos);
 
@@ -54,7 +91,9 @@ float castShadowRay(vec3 startPos, vec3 rd) {
         t = min(min(tExit.x, tExit.y), tExit.z) + 1e-3;
     }
 
-    return 1.0;
+    // still close to the terrain after MAX_STEPS: a grazing ray (low sun) running along the slopes; the coarse height
+    // map decides from there, like for the rays that leave the window
+    return horizonVisibility(ro + rd * t + windowMin, rd);
 }
 
 // Cheaper visibility of the light from a point in the air, for the light shafts: only the 8^3 coarse occupancy

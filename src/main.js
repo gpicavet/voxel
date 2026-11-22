@@ -36,9 +36,21 @@ const ATMOSPHERE_UNIFORMS = ["atmosphereScatter", "screenSize", "atmosphereOn"];
 // weather presets (cloud coverage), w cycles through them
 const WEATHERS = [["fair", 0.35], ["cloudy", 0.55], ["overcast", 0.85], ["clear", 0.0]]; // the first is the default
 // uniforms of shadow.glsl
-const SHADOW_UNIFORMS = ["brickTex", "coarseTex", "windowMin", "windowSize", "brickOrigin", "coarseOrigin"];
+const SHADOW_UNIFORMS = ["brickTex", "coarseTex", "windowMin", "windowSize", "brickOrigin", "coarseOrigin",
+    "horizonTex", "horizonOrigin", "horizonStep", "horizonValid"];
 
 let camTheta = 0, camPhi = -0.35; // looking a bit down
+
+// view from the URL: #pos=x,y,z&look=yaw,pitch (degrees)&time=hh.h (hours)&pause (time stopped)
+// "v" writes the current view into the URL, to come back to it or share it
+const viewParams = new URLSearchParams(window.location.hash.slice(1));
+function numbers(name) {
+    const value = viewParams.get(name);
+    if (!value) return null;
+    const list = value.split(",").map(Number);
+    return list.every(Number.isFinite) ? list : null;
+}
+let timePaused = viewParams.has("pause");
 let camPosition = vec3.create();
 let keysDown = {};
 // shadow rays traced at half resolution (4 times fewer rays), or one per pixel
@@ -46,6 +58,7 @@ let halfResShadows = true;
 let viewRadiusChange = 0;
 let caveCullingToggle = false;
 let maskHistoryStale = false;
+let writeViewToUrl = false;
 let weather = 0;
 let lightShafts = true;
 
@@ -60,6 +73,9 @@ function onkeydown(event) {
     }
     if (event.key === "g") {
         lightShafts = !lightShafts;
+    }
+    if (event.key === "v") {
+        writeViewToUrl = true;
     }
     if (event.key === "c") {
         caveCullingToggle = true;
@@ -303,13 +319,24 @@ function init() {
     const world = new World(gl);
     // start above the ground at the center of the world
     vec3.set(camPosition, 0.5, 0.5, world.surfaceHeight(0, 0) + 25);
+    const startPos = numbers("pos"), startLook = numbers("look");
+    if (startPos && startPos.length === 3) vec3.set(camPosition, ...startPos);
+    if (startLook && startLook.length === 2) {
+        camTheta = startLook[0] * Math.PI / 180;
+        camPhi = startLook[1] * Math.PI / 180;
+    }
 
-    // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 3 half depth, 4 half face, 5 and 6 shadow masks,
+    // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 2 horizon heights, 3 half depth, 4 half face, 5 and 6 shadow masks,
     // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 and 14 voxel textures (albedo, normals), 15 water reflection
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.brickTex, 0);
         gl.uniform1i(program.locations.coarseTex, 1);
+    }
+    // horizon height map (unit 2) for every program tracing shadow rays
+    for (const program of [color, shadow, atmosphere, water]) {
+        gl.useProgram(program.program);
+        gl.uniform1i(program.locations.horizonTex, 2);
     }
     for (const program of [color, sky, atmosphere]) {
         gl.useProgram(program.program);
@@ -423,6 +450,8 @@ function init() {
     var underWater = false;
 
     var hourAngle = -1.0; // about 8 in the morning
+    const startTime = numbers("time");
+    if (startTime) hourAngle = (startTime[0] - 12) / 24 * 2 * Math.PI;
     var light = createDaylight();
     var wasNight = null;
     var lastTime = performance.now();
@@ -451,6 +480,9 @@ function init() {
         gl.uniform3fv(program.locations.windowSize, world.windowSize);
         gl.uniform3iv(program.locations.brickOrigin, world.brickOrigin);
         gl.uniform3iv(program.locations.coarseOrigin, world.coarseOrigin);
+        gl.uniform2fv(program.locations.horizonOrigin, world.horizonOrigin);
+        gl.uniform1f(program.locations.horizonStep, 16);
+        gl.uniform1i(program.locations.horizonValid, world.horizonValid ? 1 : 0);
     }
 
     const gpuTimer = createGpuTimer(gl);
@@ -475,7 +507,7 @@ function init() {
         lastTime = time;
 
         const timeScale = keysDown["t"] ? FAST_TIME : 1;
-        hourAngle += SUN_SPEED * dt * timeScale;
+        if (!timePaused || timeScale > 1) hourAngle += SUN_SPEED * dt * timeScale;
         cloudTime += dt * timeScale;
         waterTime += dt;
         daylight(light, hourAngle);
@@ -742,6 +774,14 @@ function init() {
         gpuTimer.end();
         mat4.copy(prevViewProjMatrix, viewProjMatrix);
         frameIndex++;
+
+        if (writeViewToUrl) {
+            writeViewToUrl = false;
+            const hours = ((hourAngle / (2 * Math.PI)) * 24 + 12 + 240) % 24;
+            const deg = a => (a * 180 / Math.PI).toFixed(1);
+            history.replaceState(null, "", `#pos=${Array.from(camPosition, v => v.toFixed(1)).join(",")}` +
+                `&look=${deg(camTheta)},${deg(camPhi)}&time=${hours.toFixed(2)}${timePaused ? "&pause" : ""}`);
+        }
 
         frames++;
         const now = performance.now();

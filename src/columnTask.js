@@ -6,6 +6,13 @@ import { faceConnectivity, uniformConnectivity } from './visibility';
 let generator = null;
 const padded = new Uint8Array(P * P * P);
 
+/** surface heights of a large area, for the shadow rays that leave the loaded window (see world.js) */
+export function runHeightGridTask({ id, x0, y0, n, step }) {
+    if (!generator) generator = createGenerator(SEED);
+    const heights = generator.heightGrid(x0, y0, n, step);
+    return { result: { type: 'heightGrid', id, x0, y0, n, step, heights }, transfer: [heights.buffer] };
+}
+
 /**
  * Generate the chunks of a column (and mesh them when asked).
  * Runs in the workers, or on the main thread when workers are not available.

@@ -25,8 +25,8 @@ export function atmosphereTransmittance(out, dir) {
     const zenith = 90 - Math.max(0, elevation);
     // relative air mass (Kasten & Young 1989): 1 at the zenith, about 38 at the horizon
     const airMass = 1 / (Math.cos(zenith * Math.PI / 180) + 0.50572 * Math.pow(96.07995 - zenith, -1.6364));
-    // below the horizon the body sets behind the terrain of the planet: fade out over a degree or two
-    const visible = Math.min(1, Math.max(0, (elevation + 2) / 3));
+    // the disk sets behind the horizon: no direct light once it is below (the shadow rays would run flat or downwards)
+    const visible = smoothstep(-0.3, 1.0, elevation);
     for (let i = 0; i < 3; i++) {
         out[i] = Math.exp(-(RAYLEIGH_DEPTH[i] + MIE_DEPTH + OZONE_DEPTH[i]) * airMass) * visible;
     }
