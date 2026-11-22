@@ -8,6 +8,7 @@ import {
 import { createGenerator, P } from "./generator";
 import { buildMesh, buildWaterMesh } from "./mesher";
 import { faceConnectivity } from "./visibility";
+import { LIGHT_MARGIN } from "./skylight";
 import { aabbInFrustum, frustumPlanes } from "./utils";
 import workerSource from "../build/worker.js?raw";
 
@@ -23,7 +24,6 @@ const ZERO_COARSE = new Uint8Array(COARSE_BYTES);
 const FULL_COARSE = new Uint8Array(COARSE_BYTES).fill(1);
 
 const RESULT_BUDGET_MS = 6;  // per frame, for uploading generated columns
-const REMESH_BUDGET_MS = 4;  // per frame, for meshing modified chunks on the main thread
 
 /** Generation and meshing in web workers; on the main thread, one column per frame, if workers are not available. */
 class WorkerPool {
@@ -107,7 +107,6 @@ export class World {
         this.camColumn = null;
         this.queue = [];               // column requests, nearest last
         this.results = [];
-        this.remeshQueue = new Set();
         this.nextRequestId = 1;
         this.planes = new Float32Array(24);
         this.visible = [];
@@ -204,31 +203,28 @@ export class World {
             const request = this.queue[this.queue.length - 1];
             const key = columnKey(request.cx, request.cy);
             let column = this.columns.get(key);
-            if (column && (column.pending || column.hasMesh || (column.chunks && !request.mesh))) {
-                this.queue.pop(); // already requested, or nothing left to do
+            // already requested (applyResult asks again if needed), or nothing left to do
+            if (column && (column.pending || (column.chunks && !request.mesh) || (column.hasMesh && !column.needsRemesh))) {
+                this.queue.pop();
                 continue;
             }
             const id = this.nextRequestId++;
-            if (!this.pool.post({ id, cx: request.cx, cy: request.cy, mesh: request.mesh })) break;
+            const version = column ? column.editVersion : 0;
+            const edits = request.mesh ? this.collectEdits(request.cx, request.cy) : [];
+            if (!this.pool.post({ id, cx: request.cx, cy: request.cy, mesh: request.mesh, edits, version })) break;
             this.queue.pop();
             if (!column) {
-                column = { key, cx: request.cx, cy: request.cy, chunks: null, heights: null, hasMesh: false };
+                column = { key, cx: request.cx, cy: request.cy, chunks: null, heights: null, hasMesh: false, editVersion: 0, needsRemesh: false };
                 this.columns.set(key, column);
             }
             column.pending = true;
             column.requestId = id;
+            if (request.mesh) column.needsRemesh = false;
         }
 
         const resultDeadline = performance.now() + RESULT_BUDGET_MS;
         while (this.results.length > 0 && performance.now() < resultDeadline) {
             this.applyResult(this.results.shift());
-        }
-
-        const remeshDeadline = performance.now() + REMESH_BUDGET_MS;
-        for (const chunk of this.remeshQueue) {
-            if (performance.now() > remeshDeadline) break;
-            this.remeshQueue.delete(chunk);
-            this.remesh(chunk);
         }
     }
 
@@ -256,14 +252,8 @@ export class World {
                 const column = this.columns.get(columnKey(cx, cy));
                 if (!column) {
                     this.queue.push({ cx, cy, distance, mesh });
-                } else if (mesh && !column.hasMesh && !column.pending) {
-                    if (column.chunks.some(chunk => chunk.modified)) {
-                        // the workers only know the generated voxels: mesh on the main thread
-                        column.hasMesh = true;
-                        for (const chunk of column.chunks) this.remeshQueue.add(chunk);
-                    } else {
-                        this.queue.push({ cx, cy, distance, mesh });
-                    }
+                } else if (mesh && (!column.hasMesh || column.needsRemesh) && !column.pending) {
+                    this.queue.push({ cx, cy, distance, mesh });
                 }
             }
         }
@@ -288,10 +278,6 @@ export class World {
                 return chunk;
             });
             this.uploadToWindow(column);
-            if (edited) {
-                // the neighbours were meshed with the generated voxels of this column
-                for (const chunk of column.chunks) this.remeshNeighbors(chunk);
-            }
         }
 
         if (!result.mesh) {
@@ -300,22 +286,45 @@ export class World {
             if (Math.hypot(column.cx - ccx, column.cy - ccy) <= this.viewRadius) {
                 this.queue.push({ cx: column.cx, cy: column.cy, distance: 0, mesh: true });
             }
-        } else {
+        } else if (result.version === column.editVersion) {
+            // meshed by the worker with the modified chunks around: lit, and up to date
             column.hasMesh = true;
             result.chunks.forEach((data, i) => {
                 const chunk = column.chunks[i];
-                if (chunk.modified || this.hasModifiedNeighbor(chunk)) {
-                    this.remeshQueue.add(chunk);
+                if (data.mesh) {
+                    this.ensureIndexCapacity(data.mesh.nFaces);
+                    chunk.upload(gl, data.mesh, this.indexBuffer);
                 } else {
-                    if (data.mesh) {
-                        this.ensureIndexCapacity(data.mesh.nFaces);
-                        chunk.upload(gl, data.mesh, this.indexBuffer);
-                    }
-                    if (data.waterMesh) this.ensureIndexCapacity(data.waterMesh.nFaces);
-                    chunk.uploadWater(gl, data.waterMesh, this.indexBuffer);
+                    chunk.freeMesh(gl);
                 }
+                if (data.waterMesh) this.ensureIndexCapacity(data.waterMesh.nFaces);
+                chunk.uploadWater(gl, data.waterMesh, this.indexBuffer);
             });
         }
+        // modified again meanwhile: mesh once more
+        if (column.needsRemesh) {
+            this.queue.push({ cx: column.cx, cy: column.cy, distance: 0, mesh: true });
+        }
+    }
+
+    /** modified chunks of the column and of the 8 around, for the workers (they change its faces and its light) */
+    collectEdits(cx, cy) {
+        const edits = [];
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                if (!insideWorld(cx + dx, cy + dy)) continue;
+                const key = columnKey(cx + dx, cy + dy);
+                const column = this.columns.get(key);
+                const chunks = column && column.chunks ? column.chunks : this.edits.get(key);
+                if (!chunks) continue;
+                for (const chunk of chunks) {
+                    if (chunk && chunk.modified) {
+                        edits.push({ cx: chunk.cx, cy: chunk.cy, cz: chunk.cz, uniform: chunk.uniform, bricks: chunk.bricks });
+                    }
+                }
+            }
+        }
+        return edits;
     }
 
     unloadColumn(column) {
@@ -323,7 +332,6 @@ export class World {
         if (column.chunks) {
             for (const chunk of column.chunks) {
                 chunk.freeMesh(gl);
-                this.remeshQueue.delete(chunk);
             }
             if (column.chunks.some(chunk => chunk.modified)) {
                 this.edits.set(column.key, column.chunks.map(chunk => chunk.modified ? chunk : null));
@@ -332,22 +340,11 @@ export class World {
         this.columns.delete(column.key);
     }
 
-    hasModifiedNeighbor(chunk) {
-        for (const [dx, dy, dz] of NEIGHBORS) {
-            const neighbor = this.chunkAt(chunk.cx + dx, chunk.cy + dy, chunk.cz + dz);
-            if (neighbor && neighbor.modified) return true;
-        }
-        return false;
-    }
-
-    remeshNeighbors(chunk) {
-        for (const [dx, dy, dz] of NEIGHBORS) {
-            const neighbor = this.chunkAt(chunk.cx + dx, chunk.cy + dy, chunk.cz + dz);
-            if (neighbor && neighbor.vertexArray) this.remeshQueue.add(neighbor);
-        }
-    }
-
-    /** mesh a chunk on the main thread, from the real voxels of the chunk and of its neighbours */
+    /**
+     * Mesh a chunk on the main thread, from the real voxels of the chunk and of its neighbours: right after an
+     * explosion, so the crater shows at once. Without the sky light (open sky everywhere): the workers send the lit
+     * mesh a moment later.
+     */
     remesh(chunk) {
         const column = this.columns.get(columnKey(chunk.cx, chunk.cy));
         if (!column || !column.chunks || !column.hasMesh) return;
@@ -527,11 +524,24 @@ export class World {
         }
         if (changed.length === 0) return;
         for (const chunk of affected) {
-            this.remeshQueue.delete(chunk);
             this.remesh(chunk);
         }
         const columns = new Set(changed.map(chunk => this.columns.get(columnKey(chunk.cx, chunk.cy))));
         for (const column of columns) this.uploadToWindow(column);
+
+        // the light changes up to 15 voxels around: the workers mesh again the columns there, with the light;
+        // meshes requested before this explosion are dropped (version)
+        const reach = radius + LIGHT_MARGIN;
+        for (let cx = Math.floor((center[0] - reach) / CHUNK_SIZE); cx <= Math.floor((center[0] + reach) / CHUNK_SIZE); cx++) {
+            for (let cy = Math.floor((center[1] - reach) / CHUNK_SIZE); cy <= Math.floor((center[1] + reach) / CHUNK_SIZE); cy++) {
+                if (!insideWorld(cx, cy)) continue;
+                const column = this.columns.get(columnKey(cx, cy));
+                if (!column || !column.chunks || !column.hasMesh) continue;
+                column.editVersion++;
+                column.needsRemesh = true;
+                this.queue.push({ cx, cy, distance: 0, mesh: true });
+            }
+        }
     }
 
     // ---------------------------------------------------------------- rendering
@@ -638,7 +648,6 @@ export class World {
     }
 }
 
-const NEIGHBORS = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
 
 function chunkKey(cx, cy, cz) {
     return columnKey(cx, cy) * CHUNKS_PER_COLUMN + (cz - CZ_MIN);

@@ -10,6 +10,7 @@ uniform vec3 camPosition;
 uniform bool halfResShadows;
 uniform sampler2D shadowMask; // written by shadow_fragment.glsl at half resolution
 uniform vec2 maskScale;       // mask size / screen size
+uniform sampler2D aoMask;     // ray traced ambient occlusion, same texels as shadowMask
 uniform sampler2D halfDepth;  // depth of the half resolution pass
 uniform vec2 depthRange;      // near and far planes
 uniform float fogDensity;     // set from the view distance, so that chunks appear in the fog
@@ -19,6 +20,7 @@ uniform float seaLevel;
 uniform sampler2DArray voxelNormals; // tangent space normal maps of the same layers
 
 in float vAO;
+in float vSkyLight;
 in vec3 vPosition;
 in vec3 vNormal;
 flat in int vFace;
@@ -48,28 +50,29 @@ float linearDepth(float z) {
     return depthRange.x * depthRange.y / (depthRange.y - z * (depthRange.y - depthRange.x));
 }
 
-// Shadow of this pixel from the half resolution mask: bilinear blend of the 4 nearest mask texels,
-// keeping only the ones on the same face plane, so shadows never leak across voxel edges.
-// x: terrain shadow, y: cloud shadow
-vec2 maskShadow(vec3 toLight) {
+// Shadow and occlusion of this pixel from the half resolution masks: bilinear blend of the 4 nearest texels,
+// keeping only the ones on the same face plane, so they never leak across voxel edges.
+// x: terrain shadow, y: cloud shadow, z: ambient occlusion. The shadow rays (fallback) only when needed.
+vec3 maskShadow(vec3 toLight, bool needShadow) {
     vec2 h = gl_FragCoord.xy * maskScale - 0.5;
     vec2 f = fract(h);
     ivec2 base = ivec2(floor(h));
     ivec2 maxTexel = textureSize(shadowMask, 0) - 1;
     float plane = mod(floor(vPosition[vFace >> 1] + 0.5), 256.0);
 
-    vec2 sum = vec2(0.0), anySum = vec2(0.0);
+    vec3 sum = vec3(0.0), anySum = vec3(0.0);
     float weightSum = 0.0, farthest = 0.0, anyWeight = 0.0;
     for(int j = 0; j <= 1; j++) {
         for(int i = 0; i <= 1; i++) {
             ivec2 texel = clamp(base + ivec2(i, j), ivec2(0), maxTexel);
             vec4 m = texelFetch(shadowMask, texel, 0);
+            vec3 value = vec3(m.ra, texelFetch(aoMask, texel, 0).r);
             farthest = max(farthest, texelFetch(halfDepth, texel, 0).r);
             float w = max(mix(1.0 - f.x, f.x, float(i)) * mix(1.0 - f.y, f.y, float(j)), 1e-3);
-            anySum += m.ra * w;
+            anySum += value * w;
             anyWeight += w;
             if(int(m.g * 255.0 + 0.5) - 1 == vFace && floor(m.b * 255.0 + 0.5) == plane) {
-                sum += m.ra * w;
+                sum += value * w;
                 weightSum += w;
             }
         }
@@ -80,10 +83,11 @@ vec2 maskShadow(vec3 toLight) {
         // all the surfaces around it will be covered (overdraw): no ray either. Nearby, it is a silhouette or a thin
         // detail: trace the ray.
         float dist = linearDepth(gl_FragCoord.z);
-        if(dist > NEAR_FALLBACK || dist > linearDepth(farthest) * 1.0002 + 0.05) {
-            return anySum / anyWeight;
+        vec3 neighbours = anySum / anyWeight;
+        if(!needShadow || dist > NEAR_FALLBACK || dist > linearDepth(farthest) * 1.0002 + 0.05) {
+            return neighbours;
         }
-        return vec2(castShadowRay(rayStart(), toLight), anySum.y / anyWeight);
+        return vec3(castShadowRay(rayStart(), toLight), neighbours.yz);
     }
     return sum / weightSum;
 }
@@ -138,16 +142,22 @@ void main() {
     surface(albedo, normal);
 
     // faces turned away from the light are in the shadow anyway: no ray
-    float shadow = 0.0;
-    if(ndotl > 0.0) {
-        vec2 s = halfResShadows ? maskShadow(toLight) : vec2(castShadowRay(rayStart(), toLight), cloudShadow(vPosition, toLight));
-        shadow = s.x * s.y; // terrain x clouds
+    float shadow = 0.0, occlusion = 1.0;
+    if(halfResShadows) {
+        vec3 s = maskShadow(toLight, ndotl > 0.0);
+        shadow = ndotl > 0.0 ? s.x * s.y : 0.0; // terrain x clouds
+        occlusion = s.z;
+    } else if(ndotl > 0.0) {
+        shadow = castShadowRay(rayStart(), toLight) * cloudShadow(vPosition, toLight);
     }
 
     // linear lighting: ambient from the sky (darkened by the occlusion) + sun or moon (only partly darkened by the
     // occlusion, so creases stay readable in the light); the relief of the textures (normal map) catches the light,
     // the shadows follow the voxel faces
-    vec3 light = ambientLight(normal) * vAO + lightColor * max(dot(normal, toLight), 0.0) * shadow * (0.5 + 0.5 * vAO);
+    // sky light: the sky only lights what it reaches (Minecraft-like propagation, 0.8 per voxel: caves are dark)
+    float skyAccess = 0.02 + 0.98 * pow(0.8, (1.0 - vSkyLight) * 15.0);
+    // ambient occlusion: the 3 voxels of the corner (vertices, sharp contact) and the voxels within 10 (ray traced)
+    vec3 light = ambientLight(normal) * vAO * occlusion * skyAccess + lightColor * max(dot(normal, toLight), 0.0) * shadow * (0.5 + 0.5 * vAO);
     vec3 color = albedo * light;
 
     vec3 toSurface = vPosition - camPosition;

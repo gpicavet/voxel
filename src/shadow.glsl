@@ -116,3 +116,38 @@ float coarseVisibility(vec3 startPos, vec3 rd, int maxSteps) {
     }
     return 1.0;
 }
+
+// Ambient occlusion ray: distance to the first solid voxel along rd, up to maxDist (voxels); maxDist when none.
+float occlusionDistance(vec3 startPos, vec3 rd, float maxDist) {
+    rd = mix(rd, vec3(1e-6), lessThan(abs(rd), vec3(1e-6)));
+    vec3 invRd = 1.0 / rd;
+    vec3 towards = step(0.0, rd);
+    vec3 ro = startPos - windowMin;
+    ivec3 brickMask = textureSize(brickTex, 0) - 1;
+    ivec3 coarseMask = textureSize(coarseTex, 0) - 1;
+    float t = 0.0;
+    for(int i = 0; i < 48; i++) {
+        if(t >= maxDist) return maxDist;
+        vec3 pos = ro + rd * t;
+        if(pos.z < 0.0) return t;
+        if(pos.z >= windowSize.z || any(lessThan(pos.xy, vec2(0.0))) || any(greaterThanEqual(pos.xy, windowSize.xy))) return maxDist;
+        ivec3 cell = ivec3(pos);
+        int boxPow;
+        if(texelFetch(coarseTex, ((cell >> COARSE_POW) + coarseOrigin) & coarseMask, 0).r == 0u) {
+            boxPow = COARSE_POW;
+        } else {
+            uint brick = texelFetch(brickTex, ((cell >> 1) + brickOrigin) & brickMask, 0).r;
+            if(brick == 0u) {
+                boxPow = 1;
+            } else if(((brick >> uint((cell.x & 1) | ((cell.y & 1) << 1) | ((cell.z & 1) << 2))) & 1u) != 0u) {
+                return t;
+            } else {
+                boxPow = 0;
+            }
+        }
+        vec3 boxMin = vec3((cell >> boxPow) << boxPow);
+        vec3 tExit = (boxMin + towards * float(1 << boxPow) - ro) * invRd;
+        t = min(min(tExit.x, tExit.y), tExit.z) + 1e-3;
+    }
+    return maxDist;
+}

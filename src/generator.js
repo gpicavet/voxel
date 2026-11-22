@@ -192,6 +192,84 @@ export function createGenerator(seed) {
         return solid === 0 ? 0 : solid === total ? 1 : -1;
     }
 
+    /** surface heights of a box of columns: nx x ny values, index x * ny + y */
+    function regionHeights(x0, y0, nx, ny) {
+        const heights = new Int16Array(nx * ny);
+        for (let x = 0; x < nx; x++) {
+            for (let y = 0; y < ny; y++) {
+                heights[x * ny + y] = surfaceHeight(x0 + x, y0 + y);
+            }
+        }
+        return heights;
+    }
+
+    // grids of fillRegion, kept between calls of the same size
+    let regionGrids = null, regionGridSize = 0;
+
+    /**
+     * Voxels of a box (index (x * ny + y) * nz + z, 1 = solid) into out: the same voxels as fillChunk and solidAt
+     * (same noise grid, same interpolation).
+     * @param heights regionHeights of the box columns
+     */
+    function fillRegion(x0, y0, z0, nx, ny, nz, heights, out) {
+        let maxHeight = -Infinity;
+        for (let i = 0; i < heights.length; i++) maxHeight = Math.max(maxHeight, heights[i]);
+        const g0x = Math.floor(x0 / GRID), g0y = Math.floor(y0 / GRID), g0z = Math.floor(z0 / GRID);
+        const sx = Math.floor((x0 + nx - 1) / GRID) - g0x + 2, sy = Math.floor((y0 + ny - 1) / GRID) - g0y + 2;
+        const zTop = Math.min(z0 + nz - 1, maxHeight - 1); // highest voxel that can be solid
+        const sz = Math.max(Math.floor(zTop / GRID) - g0z + 2, 2);
+        const size = sx * sy * sz;
+        if (size > regionGridSize) {
+            regionGrids = [new Float64Array(size), new Float64Array(size), new Float64Array(size)];
+            regionGridSize = size;
+        }
+        const params = [[tunnelA, TUNNEL_SCALE, TUNNEL_SCALE_Z], [tunnelB, TUNNEL_SCALE, TUNNEL_SCALE_Z], [cavern, CAVERN_SCALE, CAVERN_SCALE]];
+        params.forEach(([noise, scale, scaleZ], n) => {
+            const grid = regionGrids[n];
+            let i = 0;
+            for (let gx = 0; gx < sx; gx++)
+                for (let gy = 0; gy < sy; gy++)
+                    for (let gz = 0; gz < sz; gz++)
+                        grid[i++] = gridValue(noise, scale, scaleZ, g0x + gx, g0y + gy, g0z + gz);
+        });
+        const [ga, gb, gc] = regionGrids;
+        const S2 = sy * sz;
+        const interpolate = (grid, gi, fx, fy, fz) => trilerp(
+            grid[gi], grid[gi + S2], grid[gi + sz], grid[gi + S2 + sz],
+            grid[gi + 1], grid[gi + S2 + 1], grid[gi + sz + 1], grid[gi + S2 + sz + 1], fx, fy, fz);
+
+        for (let x = 0; x < nx; x++) {
+            const wx = x0 + x;
+            const outsideX = wx < WORLD_MIN_XY || wx >= WORLD_MAX_XY;
+            const gx = Math.floor(wx / GRID), fx = (wx - gx * GRID) / GRID;
+            for (let y = 0; y < ny; y++) {
+                const wy = y0 + y;
+                const outside = outsideX || wy < WORLD_MIN_XY || wy >= WORLD_MAX_XY;
+                const h = heights[x * ny + y];
+                const gy = Math.floor(wy / GRID), fy = (wy - gy * GRID) / GRID;
+                const rowBase = ((gx - g0x) * sy + (gy - g0y)) * sz - g0z;
+                let pi = (x * ny + y) * nz;
+                for (let z = 0; z < nz; z++, pi++) {
+                    const wz = z0 + z;
+                    let v;
+                    if (wz < WORLD_BOTTOM) {
+                        v = 1;
+                    } else if (outside || wz >= h) {
+                        v = 0;
+                    } else {
+                        const gz = Math.floor(wz / GRID), fz = (wz - gz * GRID) / GRID;
+                        const gi = rowBase + gz;
+                        const a = interpolate(ga, gi, fx, fy, fz);
+                        const b = needsB(a) ? interpolate(gb, gi, fx, fy, fz) : 1;
+                        const c = needsC(wz, h) ? interpolate(gc, gi, fx, fy, fz) : 0;
+                        v = isCave(wz, h, a, b, c) ? 0 : 1;
+                    }
+                    out[pi] = v;
+                }
+            }
+        }
+    }
+
     /** surface heights every step voxels, n x n samples from (x0, y0), x varying fastest; outside the world: very low */
     function heightGrid(x0, y0, n, step) {
         const grid = new Int16Array(n * n);
@@ -205,5 +283,5 @@ export function createGenerator(seed) {
         return grid;
     }
 
-    return { surfaceHeight, solidAt, columnHeights, fillChunk, heightGrid };
+    return { surfaceHeight, solidAt, columnHeights, fillChunk, heightGrid, regionHeights, fillRegion };
 }

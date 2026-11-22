@@ -41,6 +41,7 @@ FACES.forEach((face, f) => {
 // One growable list of packed vertices per face direction, reused between chunks.
 const buckets = FACES.map(() => ({ data: new Uint32Array(1 << 16), len: 0 }));
 const aoScratch = new Uint8Array(4);
+const skyScratch = new Uint8Array(4);
 const waterBucket = { data: new Uint32Array(1 << 14), len: 0 };
 const waterFlags = new Uint8Array(P * P * P);
 const waterQueue = new Int32Array(P * P * P);
@@ -78,13 +79,16 @@ function material(heights, x, y, wx, wy, wz) {
 /**
  * Build the mesh of a padded chunk. A vertex is a single uint32:
  * x, y, z in the chunk (7 bits each) | face direction (3 bits) | ambient occlusion (2 bits) | material (3 bits)
+ * | sky light (3 bits)
  * Each face is 4 vertices; the triangles come from an index buffer shared by all chunks.
  * Faces are grouped by direction so that the directions facing away from the camera can be skipped.
  * @param padded voxels of the chunk and of one voxel around, index ((x + 1) * P + (y + 1)) * P + (z + 1)
  * @param heights surface heights of the columns, index (x + 1) * P + (y + 1)
  * @param origin world position of the chunk
+ * @param light sky light (0 .. 15) of the padded voxels, or null (open sky everywhere: quick remesh after an explosion,
+ * until the workers send the lit mesh)
  */
-export function buildMesh(padded, heights, origin) {
+export function buildMesh(padded, heights, origin, light = null) {
     for (const b of buckets) b.len = 0;
     const [ox, oy, oz] = origin;
 
@@ -104,14 +108,26 @@ export function buildMesh(padded, heights, origin) {
                         base = x | (y << 7) | (z << 14) | (mat << 26);
                     }
 
-                    // ambient occlusion level per corner: 0 (dark) .. 3 (no occlusion)
-                    const ao = aoScratch;
+                    // ambient occlusion level per corner: 0 (dark) .. 3 (no occlusion);
+                    // smooth sky light per corner: mean light of the air voxels around it, 3 bits
+                    const ao = aoScratch, sky = skyScratch;
                     for (let k = 0; k < 4; k++) {
                         const i = f * 4 + k;
-                        const s1 = padded[pi + AO_SIDE1[i]] !== 0 ? 1 : 0;
-                        const s2 = padded[pi + AO_SIDE2[i]] !== 0 ? 1 : 0;
-                        const co = padded[pi + AO_CORNER[i]] !== 0 ? 1 : 0;
+                        const j1 = pi + AO_SIDE1[i], j2 = pi + AO_SIDE2[i], jc = pi + AO_CORNER[i];
+                        const s1 = padded[j1] !== 0 ? 1 : 0;
+                        const s2 = padded[j2] !== 0 ? 1 : 0;
+                        const co = padded[jc] !== 0 ? 1 : 0;
                         ao[k] = (s1 && s2) ? 0 : 3 - (s1 + s2 + co);
+                        if (light === null) {
+                            sky[k] = 7;
+                        } else {
+                            const jn = pi + FACE_NEIGHBOR[f];
+                            let sum = light[jn], n = 1;
+                            if (!s1) { sum += light[j1]; n++; }
+                            if (!s2) { sum += light[j2]; n++; }
+                            if (!co && !(s1 && s2)) { sum += light[jc]; n++; }
+                            sky[k] = Math.round(sum * 7 / (15 * n));
+                        }
                     }
 
                     // the shared index buffer splits each quad along its 0-2 diagonal;
@@ -121,7 +137,7 @@ export function buildMesh(padded, heights, origin) {
                     const bucket = buckets[f];
                     for (let j = 0; j < 4; j++) {
                         const k = (start + j) & 3;
-                        push(bucket, (base + CORNER_BITS[f * 4 + k]) | (f << 21) | (ao[k] << 24));
+                        push(bucket, (base + CORNER_BITS[f * 4 + k]) | (f << 21) | (ao[k] << 24) | (sky[k] << 29));
                     }
                 }
             }
