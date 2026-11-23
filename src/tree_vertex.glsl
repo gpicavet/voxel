@@ -4,12 +4,11 @@ precision highp float;
 // Trees: a voxel model (treeModels.js, same packed vertex as the terrain) placed by instance attributes.
 layout(location=0) in uint data;
 layout(location=1) in vec4 instancePosition; // base (world) and yaw
-layout(location=2) in vec4 instanceData;     // scale, tint, sky light (0..1), sway phase
+layout(location=2) in vec4 instanceData;     // scale, tint, sky light (0..1), unused
 
 uniform mat4 viewProj;
 uniform vec3 modelOrigin; // model voxels: center of the base
 uniform float voxelSize;
-uniform float windTime;   // seconds; 0 = no wind (shadow map)
 
 out vec3 vPosition;
 out vec3 vRestPosition; // without the wind: the shadow map of the trees has no wind
@@ -37,14 +36,9 @@ void main() {
 
     vec3 p = (local - modelOrigin) * voxelSize * scale;
     float c = cos(instancePosition.w), s = sin(instancePosition.w);
-    vRestPosition = instancePosition.xyz + vec3(c * p.x - s * p.y, s * p.x + c * p.y, p.z);
-    // leaves sway in the wind, more towards the top
-    bool leaf = material == 1 || material == 3 || material == 5 || material == 6;
-    if(leaf && windTime > 0.0) {
-        float phase = instanceData.w + p.z * 0.35;
-        p.xy += vec2(sin(windTime * 1.7 + phase), cos(windTime * 1.3 + phase * 1.3)) * 0.012 * p.z;
-    }
+    // the geometry stays still: the leaves move inside their texture (tree_surface.glsl)
     vPosition = instancePosition.xyz + vec3(c * p.x - s * p.y, s * p.x + c * p.y, p.z);
+    vRestPosition = vPosition;
     vec3 n = NORMALS[face];
     vNormal = vec3(c * n.x - s * n.y, s * n.x + c * n.y, n.z);
     vLocal = local;
