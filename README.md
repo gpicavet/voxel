@@ -9,6 +9,7 @@ Chunks are generated and meshed in web workers and loaded around the camera.
 
 Day and night cycle with a physical sky (Rayleigh and Mie scattering), sun and moon shadows, voxel clouds drifting with
 the wind and casting shadows, light shafts (god rays) and valley mist. Realistic textures (512 x 512, albedo and normal map) generated on the GPU at startup.
+On the surface, patches of blocks with grass or snow on all their faces and of bare earth.
 Sky light propagated like in Minecraft (caves and overhangs are dark), and ray-traced ambient occlusion within 10 voxels.
 Trees: 5 species (oak, spruce, birch, bush, dead tree) in 11 variants, made of voxels 4 times smaller than the terrain,
 grown at startup in a worker (crooked trunks with roots, recursive crooked limbs, flat pads of foliage with hanging

@@ -75,28 +75,22 @@ float material(vec2 uv, out vec3 albedo) {
         vec3 w = worley(uv, 28.0);
         float pebble = smoothstep(0.3, 0.15, w.x) * step(0.82, w.z); // a few small stones
         float height = lumps * 0.55 + grain * 0.25 + pebble * (0.4 - w.x);
-        albedo = mix(vec3(0.16, 0.10, 0.06), vec3(0.36, 0.25, 0.15), lumps * 0.7 + grain * 0.3);
-        albedo = mix(albedo, vec3(0.30, 0.26, 0.21) * (0.8 + 0.3 * w.z), pebble * 0.8);
-        albedo *= 0.7 + 0.45 * height;
+        // soft: a narrow range of browns
+        albedo = mix(vec3(0.20, 0.13, 0.08), vec3(0.31, 0.21, 0.13), lumps * 0.7 + grain * 0.3);
+        albedo = mix(albedo, vec3(0.29, 0.24, 0.19) * (0.9 + 0.15 * w.z), pebble * 0.5);
+        albedo *= 0.86 + 0.2 * height;
         return height;
     }
     if(layer == 1) {
-        // rock: horizontal strata, large fractured blocks with a few thin cracks, fine grain, lichen
+        // rock: horizontal strata, bumps, fine grain, lichen (no cracks)
         float strata = fbm(uv, vec2(2.0, 20.0), 5);
         float bumps = fbm(uv, vec2(10.0), 6);
-        vec3 w = worley(uv, 4.0);
-        // cracks only along some block edges (broken up by noise), and fainter hairline cracks
-        float crack = smoothstep(0.035, 0.0, w.y - w.x) * smoothstep(0.45, 0.6, fbm(uv, vec2(8.0), 3));
-        vec3 fine = worley(uv + 0.21, 16.0);
-        float hairline = smoothstep(0.02, 0.0, fine.y - fine.x) * smoothstep(0.55, 0.7, fbm(uv + 0.4, vec2(12.0), 3));
-        float height = bumps * 0.55 + strata * 0.35 + w.x * 0.1 - crack * 0.35 - hairline * 0.12;
+        float height = bumps * 0.6 + strata * 0.4;
         float tone = fbm(uv, vec2(24.0), 4) * 0.45 + strata * 0.55;
-        albedo = mix(vec3(0.21, 0.20, 0.20), vec3(0.50, 0.48, 0.45), tone);
-        albedo *= 0.9 + 0.2 * w.z; // each block a bit different
-        albedo *= 0.85 + 0.3 * vnoise(uv, vec2(128.0)); // grain
+        albedo = mix(vec3(0.13, 0.125, 0.12), vec3(0.32, 0.305, 0.29), tone);
+        albedo *= 0.88 + 0.24 * vnoise(uv, vec2(128.0)); // grain
         float lichen = smoothstep(0.64, 0.78, fbm(uv + 0.5, vec2(10.0), 5));
-        albedo = mix(albedo, vec3(0.36, 0.38, 0.22), lichen * 0.45);
-        albedo *= 1.0 - crack * 0.5 - hairline * 0.2;
+        albedo = mix(albedo, vec3(0.29, 0.31, 0.18), lichen * 0.4);
         return height;
     }
     if(layer == 2) {
@@ -105,11 +99,12 @@ float material(vec2 uv, out vec3 albedo) {
         float clumps = fbm(uv, vec2(16.0), 4);
         float patches = smoothstep(0.55, 0.8, fbm(uv, vec2(4.0), 4));
         float height = blades * 0.55 + clumps * 0.45;
-        albedo = mix(vec3(0.05, 0.13, 0.025), vec3(0.17, 0.36, 0.07), clumps * 0.5 + blades * 0.5);
-        albedo = mix(albedo, vec3(0.34, 0.36, 0.10), patches * 0.45);
+        // soft: a narrow range of greens, faint yellowed patches and bare earth
+        albedo = mix(vec3(0.08, 0.18, 0.04), vec3(0.14, 0.31, 0.06), clumps * 0.5 + blades * 0.5);
+        albedo = mix(albedo, vec3(0.30, 0.33, 0.10), patches * 0.3);
         float bare = smoothstep(0.82, 0.92, vnoise(uv, vec2(40.0)));
-        albedo = mix(albedo, vec3(0.25, 0.17, 0.10), bare * 0.6);
-        albedo *= 0.75 + 0.5 * blades;
+        albedo = mix(albedo, vec3(0.24, 0.17, 0.10), bare * 0.3);
+        albedo *= 0.88 + 0.24 * blades;
         return height;
     }
     if(layer == 4) {
@@ -178,7 +173,7 @@ void main() {
     // normal from the relief (finite differences, wrapping around with the noise)
     float hx = material(uv + vec2(1.0 / size, 0.0), unused);
     float hy = material(uv + vec2(0.0, 1.0 / size), unused);
-    float strength = layer == 3 || layer == 4 ? 2.0 : layer == 2 ? 5.0 : layer == 5 ? 3.0 : 8.0;
+    float strength = layer == 3 || layer == 4 ? 2.0 : layer == 2 ? 3.0 : layer == 0 ? 5.0 : layer == 5 ? 3.0 : 8.0;
     vec3 n = normalize(vec3((h - hx) * size * strength / 64.0, (h - hy) * size * strength / 64.0, 1.0));
     outAlbedo = vec4(albedo, 1.0);
     outNormal = vec4(n * 0.5 + 0.5, 1.0);

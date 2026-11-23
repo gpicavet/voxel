@@ -1,8 +1,9 @@
 import { BRICK_BYTES, BRICKS, CHUNK_SIZE, COARSE, COARSE_BYTES, COARSE_POW, SEA_LEVEL } from './constants';
 import { P } from './generator';
 
-// Materials, decoded in vertex.glsl
-export const EARTH = 0, ROCK = 1, GRASS = 2, SNOW = 3, SAND = 4;
+// Materials, decoded in fragment.glsl: grass is earth under grass, snow rock under snow; the full ones have the same
+// texture on all their faces
+export const EARTH = 0, ROCK = 1, GRASS = 2, SNOW = 3, SAND = 4, GRASS_FULL = 5, SNOW_FULL = 6;
 
 const SIZE = CHUNK_SIZE;
 const PP = P * P;
@@ -55,9 +56,27 @@ function push(bucket, v) {
     bucket.data[bucket.len++] = v;
 }
 
+function hash(x, y, k) {
+    let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(k, 2246822519)) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+/** patches (0 .. 1) of about cell voxels, with ragged edges: smooth value noise and a little per voxel noise */
+function patches(wx, wy, cell, k) {
+    const gx = Math.floor(wx / cell), gy = Math.floor(wy / cell);
+    let fx = wx / cell - gx, fy = wy / cell - gy;
+    fx = fx * fx * (3 - 2 * fx);
+    fy = fy * fy * (3 - 2 * fy);
+    const a = hash(gx, gy, k), b = hash(gx + 1, gy, k), c = hash(gx, gy + 1, k), d = hash(gx + 1, gy + 1, k);
+    const smooth = (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy;
+    return smooth * 0.8 + hash(wx, wy, k + 1) * 0.2;
+}
+
 /**
  * Material of a visible voxel, from its depth below the original surface:
- * grass on top (snow above the snow line), a few voxels of earth below, rock deeper and on steep slopes.
+ * grass on top (snow above the snow line), a few voxels of earth below, rock deeper and on steep slopes. On top, patches
+ * of blocks with grass or snow on all their faces, and of bare earth.
  * Depending on the original surface, a voxel keeps its material when the terrain around it is destroyed.
  */
 function material(heights, x, y, wx, wy, wz) {
@@ -69,8 +88,10 @@ function material(heights, x, y, wx, wy, wz) {
     const steep = slope >= 3;
     if (depth === 0) {
         const snowLine = SNOW_LINE + ((((wx * 73856093) ^ (wy * 19349663)) >>> 0) % 7) - 3; // ragged snow line
-        if (wz >= snowLine) return SNOW;
-        return steep ? ROCK : GRASS;
+        if (wz >= snowLine) return patches(wx, wy, 7, 11) > 0.5 ? SNOW_FULL : SNOW;
+        if (steep) return ROCK;
+        const p = patches(wx, wy, 9, 21);
+        return p < 0.24 ? EARTH : p > 0.55 ? GRASS_FULL : GRASS;
     }
     if (depth > 0 && depth <= 3 && !steep) return EARTH;
     return ROCK;

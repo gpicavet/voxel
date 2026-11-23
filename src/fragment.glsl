@@ -96,6 +96,9 @@ vec3 maskShadow(vec3 toLight, bool needShadow) {
 }
 
 const float TEXTURE_TILE = 4.0; // voxels covered by one texture: continuous across the blocks of a surface
+// texture layer of the faces of each material: 0 earth, 1 rock, 2 grass (earth), 3 snow (rock), 4 sand, 5 grass on all
+// faces, 6 snow on all faces
+const float BASE_LAYER[8] = float[8](0.0, 1.0, 0.0, 1.0, 4.0, 2.0, 3.0, 1.0);
 
 float noise1(float x) {
     float i = floor(x), f = fract(x);
@@ -119,11 +122,12 @@ void surface(out vec3 albedo, out vec3 normal) {
     vec3 bitangent = vFace < 4 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
     bool top = vFace == 4, bottom = vFace == 5;
 
-    // layer below and layer on top: grass voxels are earth under grass, snow voxels rock under snow
-    float base = vMaterial == 0 ? 0.0 : vMaterial == 1 ? 1.0 : vMaterial == 2 ? 0.0 : vMaterial == 3 ? 1.0 : 4.0;
-    float cover = vMaterial == 2 ? 2.0 : vMaterial == 3 ? 3.0 : base;
-    float coverage = vMaterial < 2 || vMaterial == 4 || bottom ? 0.0 : top ? 1.0
-        : fringe(uv.x * TEXTURE_TILE, vLocal.z, vMaterial == 2 ? 0.22 : 0.32);
+    // layer below and layer on top: grass voxels (2) are earth under grass, snow voxels (3) rock under snow; the others
+    // have one layer on all their faces (5 grass, 6 snow)
+    float base = BASE_LAYER[vMaterial];
+    bool covered = vMaterial == 2 || vMaterial == 3;
+    float cover = vMaterial == 2 ? 2.0 : 3.0;
+    float coverage = !covered || bottom ? 0.0 : top ? 1.0 : fringe(uv.x * TEXTURE_TILE, vLocal.z, vMaterial == 2 ? 0.22 : 0.32);
 
     vec4 a = texture(voxelAlbedo, vec3(uv, base)), n = texture(voxelNormals, vec3(uv, base));
     if(coverage > 0.0) {
