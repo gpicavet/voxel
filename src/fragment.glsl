@@ -169,7 +169,8 @@ void main() {
     // ambient occlusion: the 3 voxels of the corner (vertices, sharp contact) and the voxels within 10 (ray traced)
     // and the foliage of the trees above and around (canopy map)
     occlusion *= 1.0 - canopyOcclusion(vPosition, false);
-    vec3 light = ambientLight(normal) * vAO * occlusion * skyAccess + lightColor * max(dot(normal, toLight), 0.0) * shadow * (0.5 + 0.5 * vAO);
+    vec3 light = ambientLight(normal) * vAO * occlusion * skyAccess
+        + lightColor * max(dot(normal, toLight), 0.0) * shadow * (0.5 + 0.5 * vAO) * (1.0 - 0.45 * trunkContact(vPosition));
     vec3 color = albedo * light;
 
     color = applyAtmosphere(color, vPosition);

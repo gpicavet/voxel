@@ -33,7 +33,8 @@ out vec4 fragColor;
 @import ./atmosphere;
 
 const vec3 ABSORPTION = vec3(0.45, 0.16, 0.12);   // per meter (lake water): red absorbed first, it turns blue-green
-const vec3 SCATTERING = vec3(0.004, 0.020, 0.026); // light scattered back by the water body: deep water is dark blue-green
+const float TURBIDITY = 0.45;                      // per meter: suspended particles, the bed fades out within a few meters
+const vec3 SCATTERING = vec3(0.006, 0.024, 0.028); // light scattered back by the water body: deep water is dark blue-green
 
 float linearDepth(float z) {
     return depthRange.x * depthRange.y / (depthRange.y - z * (depthRange.y - depthRange.x));
@@ -83,7 +84,7 @@ void main() {
         float zw = linearDepth(gl_FragCoord.z);
         thickness = d >= 1.0 ? 200.0 : max(linearDepth(d) - zw, 0.0) * dist / max(zw, 1e-3);
     }
-    vec3 transmittance = exp(-ABSORPTION * thickness);
+    vec3 transmittance = exp(-(ABSORPTION + TURBIDITY) * thickness);
     float t = dot(transmittance, vec3(0.2, 0.5, 0.3));
     vec3 bodyLight = vAmbientUp + lightColor * max(toLight.z, 0.0);
     vec3 body = SCATTERING * bodyLight * (1.0 - transmittance) / max(1.0 - t, 1e-3); // color of the water itself

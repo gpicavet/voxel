@@ -26,7 +26,17 @@ float canopyOcclusion(vec3 p, bool onTree) {
         occlusion = max(occlusion, canopyAbove(near, p.z) * 0.8);
         // the ground right around a trunk, under its crown
         float bottom = near.b > 1e-3 ? near.r / near.b : 1e9;
-        if(p.z < bottom) occlusion = max(occlusion, near.a * 0.55);
+        if(p.z < bottom) occlusion = max(occlusion, near.a * 0.75);
     }
     return occlusion * fade;
+}
+
+// ground around a trunk, under its crown (0 .. 1): darkens the direct light a little too
+float trunkContact(vec3 p) {
+    if(!canopyOn) return 0.0;
+    vec2 uv = (p.xy - canopyOrigin) / canopySize;
+    if(any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 0.0;
+    vec4 near = textureLod(canopyTex, uv, 0.0);
+    float bottom = near.b > 1e-3 ? near.r / near.b : 1e9;
+    return p.z < bottom ? near.a : 0.0;
 }

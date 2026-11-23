@@ -10,7 +10,7 @@ const RECENTER = 64;        // the map follows the camera by steps of this many 
 const MIN_INTERVAL = 300;   // ms between two rebuilds when trees appear or disappear (streaming)
 const SPECIES_DENSITY = [0.85, 0.85, 0.6, 0.85, 0]; // oak, pine, birch, bush, dead tree (no foliage)
 const DENSITY = MODEL_SPECIES.map(species => SPECIES_DENSITY[species]);
-const CONTACT_RADIUS = 1.6; // darker ground around the trunks, within this distance
+const CONTACT_RADIUS = 2.6; // darker ground around the trunks, within this distance
 
 export class CanopyMap {
     constructor(gl, unit, crowns) {
@@ -85,7 +85,7 @@ export class CanopyMap {
                     for (let x = Math.max(0, Math.floor(tx - CONTACT_RADIUS)); x <= Math.min(SIZE - 1, Math.ceil(tx + CONTACT_RADIUS)); x++) {
                         const dist = Math.hypot(x + 0.5 - tx, y + 0.5 - ty);
                         const c = (y * SIZE + x) * 4 + 3;
-                        data[c] = Math.max(data[c], Math.max(0, 1 - dist / CONTACT_RADIUS) * Math.min(scale, 1));
+                        data[c] = Math.max(data[c], Math.max(0, 1 - dist / CONTACT_RADIUS) ** 1.5 * Math.min(scale, 1));
                     }
                 }
             }

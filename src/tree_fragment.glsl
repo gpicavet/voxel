@@ -25,6 +25,7 @@ flat in float vTint;
 flat in float vSkyLight;
 flat in float vYaw;
 in float vOpenness;
+in float vHeight;
 
 out vec4 fragColor;
 
@@ -139,9 +140,12 @@ void main() {
         shadow = s.x * s.y * treeShadow(vRestPosition, n);
     }
     float skyAccess = 0.02 + 0.98 * pow(0.8, (1.0 - vSkyLight) * 15.0);
-    // ambient occlusion: the tree itself (baked: inside and under the crown) and the forest around (canopy map)
-    float occlusion = mix(0.32, 1.0, sqrt(vOpenness)) * (1.0 - canopyOcclusion(vRestPosition, true));
-    vec3 light = ambientLight(n) * vAO * occlusion * skyAccess + lightColor * diffuse * shadow;
+    // ambient occlusion: the tree itself (baked: inside and under the crown, corners of the voxels), the ground at its
+    // foot, and the forest around (canopy map); half of it on the direct light too, so that it shows in the sun
+    float foot = mix(0.45, 1.0, smoothstep(0.0, 1.5, vHeight));
+    float self = mix(0.2, 1.0, vOpenness) * vAO * foot;
+    float occlusion = self * (1.0 - canopyOcclusion(vRestPosition, true));
+    vec3 light = ambientLight(n) * occlusion * skyAccess + lightColor * diffuse * shadow * mix(1.0, self, 0.5);
     vec3 color = albedo * light;
     fragColor = vec4(toneMap(applyAtmosphere(color, vPosition)), 1.0);
 }
