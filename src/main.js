@@ -44,7 +44,8 @@ const ATMOSPHERE_UNIFORMS = ["atmosphereScatter", "screenSize", "atmosphereOn"];
 // weather presets (cloud coverage), w cycles through them
 const WEATHERS = [["fair", 0.35], ["cloudy", 0.55], ["overcast", 0.85], ["clear", 0.0]]; // the first is the default
 // uniforms of tree_shadow.glsl
-const TREE_SHADOW_UNIFORMS = ["treeShadowMap", "treeShadowMatrix", "treeShadowMapB", "treeShadowMatrixB", "treeShadowBlend", "treeShadowOn"];
+const TREE_SHADOW_UNIFORMS = ["treeShadowMap", "treeShadowMatrix", "treeShadowMapB", "treeShadowMatrixB", "treeShadowBlend", "treeShadowOn",
+    "treeShadowFar", "treeShadowFarMatrix", "treeShadowFarOn"];
 const CANOPY_UNIFORMS = ["canopyTex", "canopyOrigin", "canopySize", "canopyOn"];
 const TREE_SHADOW_SIZE = 2048;
 const TREE_SHADOW_RADIUS = 128; // half side of the area of the tree shadow map, around the camera
@@ -54,6 +55,11 @@ const TREE_SHADOW_RADIUS = 128; // half side of the area of the tree shadow map,
 // of the step, B becomes A and the next B is rendered: still one rendering per step.
 const TREE_SHADOW_HOUR_STEP = 0.004; // radians of hour angle: about 1.3 s at the normal speed of the sun
 const TREE_SHADOW_MOVE_STEP = 16;     // both maps rendered again when the camera moved this much (or trees changed)
+// Far tree shadows: one more map, much larger, with the coarsest models, beyond the two maps above. No blend: so far away,
+// a step of the sun moves the shadows by a few centimeters. Rendered again when the light turned by a step, the camera
+// moved, or trees appeared or disappeared (streaming, at most once a second).
+const TREE_FAR_SHADOW_RADIUS = 512;
+const TREE_FAR_SHADOW_MOVE_STEP = 32;
 // uniforms of shadow.glsl
 const SHADOW_UNIFORMS = ["brickTex", "coarseTex", "windowMin", "windowSize", "brickOrigin", "coarseOrigin",
     "horizonTex", "horizonOrigin", "horizonStep", "horizonValid"];
@@ -368,8 +374,8 @@ function init() {
         world.treesVersion = (world.treesVersion || 0) + 1; // and render the tree shadow map again
     });
 
-    // shadow maps of the trees (units 18 and 22): depth seen from the light, compared in the shaders
-    function createTreeShadowMap(unit) {
+    // shadow maps of the trees (units 18 and 22, far one 23): depth seen from the light, compared in the shaders
+    function createTreeShadowMap(unit, radius) {
         gl.activeTexture(unit);
         const texture = gl.createTexture();
         gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -387,9 +393,11 @@ function init() {
         gl.drawBuffers([gl.NONE]);
         gl.readBuffer(gl.NONE);
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-        return { unit: unit - gl.TEXTURE0, texture, framebuffer, matrix: mat4.create(), dir: vec3.create() };
+        return { unit: unit - gl.TEXTURE0, texture, framebuffer, radius, matrix: mat4.create(), dir: vec3.create() };
     }
-    const treeShadowMaps = [createTreeShadowMap(gl.TEXTURE18), createTreeShadowMap(gl.TEXTURE22)];
+    const treeShadowMaps = [createTreeShadowMap(gl.TEXTURE18, TREE_SHADOW_RADIUS), createTreeShadowMap(gl.TEXTURE22, TREE_SHADOW_RADIUS)];
+    const treeFarShadowMap = createTreeShadowMap(gl.TEXTURE23, TREE_FAR_SHADOW_RADIUS);
+    const treeFarShadowState = { dir: null, center: null, version: -1, time: -Infinity };
     let treeShadowA = 0;        // index of map A
     let treeShadowBlend = 0;    // 0: map A .. 1: map B
     const treeLightView = mat4.create(), treeLightProj = mat4.create();
@@ -407,7 +415,7 @@ function init() {
 
     // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 2 horizon heights, 3 half depth, 4 half face, 5 and 6 shadow masks,
     // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 and 14 voxel textures (albedo, normals), 15 water reflection,
-    // 16 and 17 ambient occlusion masks, 18 and 22 tree shadow maps, 19 foliage (pixel art), 20 canopy map,
+    // 16 and 17 ambient occlusion masks, 18, 22 and 23 tree shadow maps (near A, near B, far), 19 foliage (pixel art), 20 canopy map,
     // 21 motion of the leaves
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
@@ -576,6 +584,9 @@ function init() {
         gl.uniformMatrix4fv(program.locations.treeShadowMatrixB, false, b.matrix);
         gl.uniform1f(program.locations.treeShadowBlend, treeShadowBlend);
         gl.uniform1i(program.locations.treeShadowOn, treeShadowOn ? 1 : 0);
+        gl.uniform1i(program.locations.treeShadowFar, treeFarShadowMap.unit);
+        gl.uniformMatrix4fv(program.locations.treeShadowFarMatrix, false, treeFarShadowMap.matrix);
+        gl.uniform1i(program.locations.treeShadowFarOn, treeFarShadowState.dir ? 1 : 0);
     }
     function setCanopy(program) {
         gl.uniform2fv(program.locations.canopyOrigin, canopy.origin);
@@ -591,16 +602,18 @@ function init() {
         return treePlanes;
     }
 
-    /** depth of the trees seen from the light dir into a map; light space snapped to its texels (no shimmer) */
-    function renderTreeShadowMap(map, dir) {
+    /**
+     * depth of the trees of a set seen from the light dir into a map; light space snapped to its texels (no shimmer),
+     * depth range from -c[2] - depth to -c[2] + depth (the shaders use the same)
+     */
+    function renderTreeShadowMap(map, dir, setName = "shadow") {
         vec3.copy(map.dir, dir);
         const up = Math.abs(dir[2]) > 0.99 ? [0, 1, 0] : [0, 0, 1];
         mat4.lookAt(treeLightView, [0, 0, 0], dir, up);
         const c = vec3.transformMat4(vec3.create(), camPosition, treeLightView);
-        const texel = 2 * TREE_SHADOW_RADIUS / TREE_SHADOW_SIZE;
+        const r = map.radius, texel = 2 * r / TREE_SHADOW_SIZE, depth = r * 1.5 + 200;
         const sx = Math.round(c[0] / texel) * texel, sy = Math.round(c[1] / texel) * texel;
-        mat4.ortho(treeLightProj, sx - TREE_SHADOW_RADIUS, sx + TREE_SHADOW_RADIUS, sy - TREE_SHADOW_RADIUS, sy + TREE_SHADOW_RADIUS,
-            -c[2] - 400, -c[2] + 400);
+        mat4.ortho(treeLightProj, sx - r, sx + r, sy - r, sy + r, -c[2] - depth, -c[2] + depth);
         mat4.multiply(map.matrix, treeLightProj, treeLightView);
 
         gl.bindFramebuffer(gl.FRAMEBUFFER, map.framebuffer);
@@ -612,11 +625,26 @@ function init() {
         gl.useProgram(treeDepth.program);
         gl.uniformMatrix4fv(treeDepth.locations.viewProj, false, map.matrix);
         gl.uniform1f(treeDepth.locations.windTime, 0);
-        trees.draw("shadow", treeDepth.locations);
+        trees.draw(setName, treeDepth.locations);
         gl.cullFace(gl.BACK);
         gl.disable(gl.POLYGON_OFFSET_FILL);
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    }
+
+    /** the far tree shadow map, for the current light (see TREE_FAR_SHADOW_RADIUS) */
+    function renderTreeFarShadow(fastTime) {
+        const far = treeFarShadowState, now = performance.now();
+        const turned = !far.dir || vec3.angle(far.dir, light.lightDir) > (fastTime ? 0.03 : TREE_SHADOW_HOUR_STEP);
+        const moved = !far.center || vec3.distance(far.center, camPosition) > TREE_FAR_SHADOW_MOVE_STEP;
+        const changed = far.version !== world.treesVersion && now - far.time > 1000;
+        if (!turned && !moved && !changed) return;
+        far.dir = vec3.clone(light.lightDir);
+        far.center = vec3.clone(camPosition);
+        far.version = world.treesVersion;
+        far.time = now;
+        trees.gather("far", camPosition, null, TREE_FAR_SHADOW_RADIUS * 1.5, 2); // coarsest models
+        renderTreeShadowMap(treeFarShadowMap, light.lightDir, "far");
     }
 
     /** direction of the main light at an hour angle */
@@ -630,8 +658,10 @@ function init() {
         const state = treeShadowState;
         if (!treeShadowOn) {
             state.hourA = null; // start again when the shadows come back
+            treeFarShadowState.dir = null;
             return;
         }
+        renderTreeFarShadow(fastTime);
         if (fastTime) {
             // time running fast: a single map, rendered every frame with the current light
             trees.gather("shadow", camPosition, null, TREE_SHADOW_RADIUS * 1.5, 1);

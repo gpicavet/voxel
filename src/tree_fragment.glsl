@@ -25,6 +25,7 @@ flat in float vTint;
 flat in float vSkyLight;
 flat in float vYaw;
 in float vOpenness;
+in float vHeight;
 
 out vec4 fragColor;
 
@@ -47,6 +48,27 @@ float hash(vec3 p) {
     return fract((p.x + p.y) * p.z);
 }
 
+float valueNoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(vec3(i, 0.0)), hash(vec3(i + vec2(1.0, 0.0), 0.0)), f.x),
+        mix(hash(vec3(i + vec2(0.0, 1.0), 0.0)), hash(vec3(i + vec2(1.0), 0.0)), f.x), f.y);
+}
+
+const vec3 MOSS_COLOR = vec3(0.075, 0.13, 0.03);
+
+// moss cover (0 .. 1) of a bark face at uv (meters): on the faces turned to the north (+y, the sun culminates towards -y),
+// in patches with ragged edges, thicker low on the trunk where it is damp
+float moss(vec2 uv) {
+    float c = cos(vYaw), s = sin(vYaw);
+    float north = smoothstep(0.2, 0.9, s * vLocalNormal.x + c * vLocalNormal.y); // y of the world normal
+    if(north <= 0.0) return 0.0;
+    float low = 1.0 - smoothstep(1.0, 7.0, vLocal.z * voxelSize); // meters above the base of the model
+    float patches = valueNoise(uv * 2.5) * 0.7 + valueNoise(uv * 9.0) * 0.3;
+    float edge = 0.62 - 0.3 * low;
+    return north * smoothstep(edge - 0.06, edge + 0.06, patches);
+}
+
 // color (linear) and normal (world) of the fragment, from the textures; per tree and per voxel variations
 void treeSurface(bool leaf, out vec3 albedo, out vec3 normal) {
     vec3 texel = treeTexel(vMaterial, vLocal, vLocalNormal, vTint * 7.0, vPosition).rgb;
@@ -60,6 +82,14 @@ void treeSurface(bool leaf, out vec3 albedo, out vec3 normal) {
         albedo *= 0.94 + 0.12 * hash(floor(vLocal - vLocalNormal * 0.5));
         vec2 uv = treeUV(vLocal, vLocalNormal, vTint * 7.0);
         tn = texture(voxelNormals, vec3(uv, float(BARK_LAYERS[vMaterial]))).xyz * 2.0 - 1.0;
+        // moss on the faces turned to the north, flattening the relief of the bark
+        float m = moss(uv);
+        if(m > 0.0) {
+            // tufts: a fine grain, faded out where it gets smaller than the pixels (it would shimmer)
+            float grain = (valueNoise(uv * 48.0) - 0.5) * (1.0 - smoothstep(0.3, 1.0, fwidth(uv.x * 48.0)));
+            albedo = mix(albedo, MOSS_COLOR * (0.75 + 0.5 * valueNoise(uv * 11.0) + 0.5 * grain), m);
+        }
+        tn = normalize(mix(tn, vec3(0.0, 0.0, 1.0), m * 0.7));
     }
     vec3 n = vLocalNormal;
     vec3 t = abs(n.x) > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
@@ -110,9 +140,12 @@ void main() {
         shadow = s.x * s.y * treeShadow(vRestPosition, n);
     }
     float skyAccess = 0.02 + 0.98 * pow(0.8, (1.0 - vSkyLight) * 15.0);
-    // ambient occlusion: the tree itself (baked: inside and under the crown) and the forest around (canopy map)
-    float occlusion = mix(0.32, 1.0, sqrt(vOpenness)) * (1.0 - canopyOcclusion(vRestPosition, true));
-    vec3 light = ambientLight(n) * vAO * occlusion * skyAccess + lightColor * diffuse * shadow;
+    // ambient occlusion: the tree itself (baked: inside and under the crown, corners of the voxels), the ground at its
+    // foot, and the forest around (canopy map); half of it on the direct light too, so that it shows in the sun
+    float foot = mix(0.45, 1.0, smoothstep(0.0, 1.5, vHeight));
+    float self = mix(0.2, 1.0, vOpenness) * vAO * foot;
+    float occlusion = self * (1.0 - canopyOcclusion(vRestPosition, true));
+    vec3 light = ambientLight(n) * occlusion * skyAccess + lightColor * diffuse * shadow * mix(1.0, self, 0.5);
     vec3 color = albedo * light;
     fragColor = vec4(toneMap(applyAtmosphere(color, vPosition)), 1.0);
 }

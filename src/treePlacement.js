@@ -65,17 +65,25 @@ export function placeTrees(cx, cy, region, light, heights, x0, y0, z0, nx, ny, n
             const h = height(ix, iy);
             const slope = Math.max(Math.abs(height(ix + 1, iy) - height(ix - 1, iy)), Math.abs(height(ix, iy + 1) - height(ix, iy - 1)));
             if (h <= SEA_LEVEL + 1 || h >= SNOW_LINE || slope >= 3) continue;
-            // the ground is there (not a cave opening, not a crater) and the trunk has room
-            if (!solid(ix, iy, h - 1) || solid(ix, iy, h) || solid(ix, iy, h + 1) || solid(ix, iy, h + 2)) continue;
+            // the ground near the height map (the relief moves it a little; not a cave opening, not a crater, not on an
+            // outcrop) and room for the trunk
+            let ground = -1;
+            for (let z = h + 1; z >= h - 2; z--) {
+                if (solid(ix, iy, z - 1) && !solid(ix, iy, z) && !solid(ix, iy, z + 1) && !solid(ix, iy, z + 2)) {
+                    ground = z;
+                    break;
+                }
+            }
+            if (ground < 0) continue;
 
             const kind = species(h, hash(gx, gy, 4));
             const scale = kind === 1 ? 0.9 + hash(gx, gy, 5) * 0.5 : 0.75 + hash(gx, gy, 5) * 0.55;
             data.push(
-                x, y, h - 0.15, // slightly in the ground, for slopes
+                x, y, ground - 0.15, // slightly in the ground, for slopes
                 hash(gx, gy, 6) * Math.PI * 2,
                 scale,
                 hash(gx, gy, 7),
-                light[((ix - x0) * ny + (iy - y0)) * nz + (h + 1 - z0)] / 15,
+                light[((ix - x0) * ny + (iy - y0)) * nz + (ground + 1 - z0)] / 15,
                 hash(gx, gy, 8) * Math.PI * 2,
                 MODEL_FIRST[kind] + Math.floor(hash(gx, gy, 9) * SPECIES_VARIANTS[kind]));
             ids.push(gx * 8192 + gy);
