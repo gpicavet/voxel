@@ -4,11 +4,12 @@ precision highp float;
 // Trees: a voxel model (treeModels.js, same packed vertex as the terrain) placed by instance attributes.
 layout(location=0) in uint data;
 layout(location=1) in vec4 instancePosition; // base (world) and yaw
-layout(location=2) in vec4 instanceData;     // scale, tint, sky light (0..1), unused
+layout(location=2) in vec4 instanceData;     // scale, tint, sky light (0..1), sway phase
 
 uniform mat4 viewProj;
 uniform vec3 modelOrigin; // model voxels: center of the base
 uniform float voxelSize;
+uniform float windTime;   // seconds; 0 = no wind (shadow map)
 
 out vec3 vPosition;
 out vec3 vRestPosition; // without the wind: the shadow map of the trees has no wind
@@ -27,6 +28,7 @@ const vec3 NORMALS[6] = vec3[6](
     vec3(0, 1, 0), vec3(0, -1, 0),
     vec3(0, 0, 1), vec3(0, 0, -1));
 const float AO[4] = float[4](0.35, 0.6, 0.8, 1.0);
+const vec2 WIND_DIRECTION = vec2(0.92, 0.38); // the wind of the clouds
 
 void main() {
     vec3 local = vec3(float(data & 127u), float((data >> 7) & 127u), float((data >> 14) & 127u));
@@ -36,9 +38,24 @@ void main() {
 
     vec3 p = (local - modelOrigin) * voxelSize * scale;
     float c = cos(instancePosition.w), s = sin(instancePosition.w);
-    // the geometry stays still: the leaves move inside their texture (tree_surface.glsl)
-    vPosition = instancePosition.xyz + vec3(c * p.x - s * p.y, s * p.x + c * p.y, p.z);
-    vRestPosition = vPosition;
+    vec3 rest = instancePosition.xyz + vec3(c * p.x - s * p.y, s * p.x + c * p.y, p.z);
+    vRestPosition = rest;
+    // Slight motion of the whole tree (the leaves also flutter inside their texture, tree_surface.glsl). The offset only
+    // depends on the rest position of the vertex: the corners shared by neighbouring blocks move together, nothing slides,
+    // and wood and leaves move alike, so the foliage stays on its branches.
+    vec3 offset = vec3(0.0);
+    if(windTime > 0.0) {
+        float gust = 0.7 + 0.3 * sin(windTime * 0.8 - dot(rest.xy, WIND_DIRECTION) * 0.07);
+        float phase = instanceData.w;
+        // the tree bends with the wind, more and more towards the top, rooted in the ground
+        float h = max(p.z, 0.0) / 10.0;
+        offset.xy = WIND_DIRECTION * (0.1 * h * h * (0.6 + 0.4 * sin(windTime * 0.7 + phase)) * gust);
+        // limbs and pads move in small loops, along waves wide enough for neighbouring blocks to move together
+        float reach = smoothstep(0.5, 6.0, length(p.xy)) * smoothstep(1.5, 5.0, p.z);
+        float a = windTime * 1.5 + phase + dot(rest, vec3(0.9, 0.7, 0.5));
+        offset += reach * 0.06 * gust * vec3(sin(a), cos(a * 1.3), 0.4 * sin(a * 0.7));
+    }
+    vPosition = rest + offset;
     vec3 n = NORMALS[face];
     vNormal = vec3(c * n.x - s * n.y, s * n.x + c * n.y, n.z);
     vLocal = local;
