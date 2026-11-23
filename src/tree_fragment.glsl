@@ -49,7 +49,7 @@ float hash(vec3 p) {
 
 // color (linear) and normal (world) of the fragment, from the textures; per tree and per voxel variations
 void treeSurface(bool leaf, out vec3 albedo, out vec3 normal) {
-    vec3 texel = treeTexel(vMaterial, vLocal, vLocalNormal, vTint * 7.0).rgb;
+    vec3 texel = treeTexel(vMaterial, vLocal, vLocalNormal, vTint * 7.0, vPosition).rgb;
     albedo = texel;
     vec3 tn = vec3(0.0, 0.0, 1.0); // the pixel art foliage is flat
     if(leaf) {

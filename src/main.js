@@ -44,14 +44,16 @@ const ATMOSPHERE_UNIFORMS = ["atmosphereScatter", "screenSize", "atmosphereOn"];
 // weather presets (cloud coverage), w cycles through them
 const WEATHERS = [["fair", 0.35], ["cloudy", 0.55], ["overcast", 0.85], ["clear", 0.0]]; // the first is the default
 // uniforms of tree_shadow.glsl
-const TREE_SHADOW_UNIFORMS = ["treeShadowMap", "treeShadowMatrix", "treeShadowOn"];
+const TREE_SHADOW_UNIFORMS = ["treeShadowMap", "treeShadowMatrix", "treeShadowMapB", "treeShadowMatrixB", "treeShadowBlend", "treeShadowOn"];
 const CANOPY_UNIFORMS = ["canopyTex", "canopyOrigin", "canopySize", "canopyOn"];
 const TREE_SHADOW_SIZE = 2048;
 const TREE_SHADOW_RADIUS = 128; // half side of the area of the tree shadow map, around the camera
-// the tree shadow map is rendered again only when the light turned by this much, the camera moved by this much, or
-// trees appeared or disappeared: in between nothing moves, so the shadows never shimmer
-const TREE_SHADOW_LIGHT_STEP = 0.004; // radians: about every second at the normal speed of the sun
-const TREE_SHADOW_MOVE_STEP = 16;
+// Two tree shadow maps: A for the light at the hour angle hA, B for the light at hA + TREE_SHADOW_HOUR_STEP (the course of
+// the sun is known in advance). The shaders blend them with the current hour angle: the shadows move continuously while
+// each map stays still (a map rendered every frame with the exact light shimmers). When the hour angle reaches the end
+// of the step, B becomes A and the next B is rendered: still one rendering per step.
+const TREE_SHADOW_HOUR_STEP = 0.004; // radians of hour angle: about 1.3 s at the normal speed of the sun
+const TREE_SHADOW_MOVE_STEP = 16;     // both maps rendered again when the camera moved this much (or trees changed)
 // uniforms of shadow.glsl
 const SHADOW_UNIFORMS = ["brickTex", "coarseTex", "windowMin", "windowSize", "brickOrigin", "coarseOrigin",
     "horizonTex", "horizonOrigin", "horizonStep", "horizonValid"];
@@ -344,7 +346,7 @@ function init() {
     const underwater = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, underwaterFshader),
         ["veil", ...SKY_UNIFORMS]);
     const treeVertexShader = compileShader(gl, gl.VERTEX_SHADER, treeVshader);
-    const TREE_UNIFORMS = ["viewProj", "modelOrigin", "voxelSize", "windTime", "cutout", "voxelAlbedo", "voxelNormals", "leafTextures"];
+    const TREE_UNIFORMS = ["viewProj", "modelOrigin", "voxelSize", "windTime", "cutout", "voxelAlbedo", "voxelNormals", "leafTextures", "leafMotion"];
     const treeColor = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeFshader),
         [...TREE_UNIFORMS, "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", "reflectionPass", "seaLevel",
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS, ...TREE_SHADOW_UNIFORMS, ...CANOPY_UNIFORMS]);
@@ -352,7 +354,7 @@ function init() {
     const treeDepth = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeDepthFshader), TREE_UNIFORMS);
     const textureGen = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, textureGenFshader), ["layer", "size"]);
     createVoxelTextures(gl, textureGen, gl.TEXTURE13, gl.TEXTURE14);
-    createLeafTextures(gl, gl.TEXTURE19);
+    createLeafTextures(gl, gl.TEXTURE19, gl.TEXTURE21);
     let cloudTime = 0;
 
 
@@ -366,27 +368,34 @@ function init() {
         world.treesVersion = (world.treesVersion || 0) + 1; // and render the tree shadow map again
     });
 
-    // shadow map of the trees (unit 18): depth seen from the light, compared in the shaders
-    gl.activeTexture(gl.TEXTURE18);
-    const treeShadowTexture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, treeShadowTexture);
-    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.DEPTH_COMPONENT24, TREE_SHADOW_SIZE, TREE_SHADOW_SIZE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
-    gl.activeTexture(gl.TEXTURE0);
-    const treeShadowFramebuffer = gl.createFramebuffer();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, treeShadowFramebuffer);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, treeShadowTexture, 0);
-    gl.drawBuffers([gl.NONE]);
-    gl.readBuffer(gl.NONE);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    const treeShadowMatrix = mat4.create(), treeLightView = mat4.create(), treeLightProj = mat4.create();
+    // shadow maps of the trees (units 18 and 22): depth seen from the light, compared in the shaders
+    function createTreeShadowMap(unit) {
+        gl.activeTexture(unit);
+        const texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texStorage2D(gl.TEXTURE_2D, 1, gl.DEPTH_COMPONENT24, TREE_SHADOW_SIZE, TREE_SHADOW_SIZE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+        gl.activeTexture(gl.TEXTURE0);
+        const framebuffer = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, texture, 0);
+        gl.drawBuffers([gl.NONE]);
+        gl.readBuffer(gl.NONE);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        return { unit: unit - gl.TEXTURE0, texture, framebuffer, matrix: mat4.create(), dir: vec3.create() };
+    }
+    const treeShadowMaps = [createTreeShadowMap(gl.TEXTURE18), createTreeShadowMap(gl.TEXTURE22)];
+    let treeShadowA = 0;        // index of map A
+    let treeShadowBlend = 0;    // 0: map A .. 1: map B
+    const treeLightView = mat4.create(), treeLightProj = mat4.create();
+    const futureLight = createDaylight();
     let treeShadowOn = false;
-    const treeShadowState = { light: null, center: null, version: -1 };
+    const treeShadowState = { hourA: null, center: null, version: -1 };
     // start above the ground at the center of the world
     vec3.set(camPosition, 0.5, 0.5, world.surfaceHeight(0, 0) + 25);
     const startPos = numbers("pos"), startLook = numbers("look");
@@ -398,7 +407,8 @@ function init() {
 
     // texture units: 0 voxel bricks, 1 coarse occupancy (shadow window), 2 horizon heights, 3 half depth, 4 half face, 5 and 6 shadow masks,
     // 7 sky, 8 cloud noise, 9 to 12 light shafts (current and previous frame), 13 and 14 voxel textures (albedo, normals), 15 water reflection,
-    // 16 and 17 ambient occlusion masks, 18 tree shadow map, 19 foliage (pixel art), 20 canopy map
+    // 16 and 17 ambient occlusion masks, 18 and 22 tree shadow maps, 19 foliage (pixel art), 20 canopy map,
+    // 21 motion of the leaves
     for (const program of [color, shadow]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.brickTex, 0);
@@ -418,7 +428,6 @@ function init() {
         gl.uniform1i(program.locations.cloudNoise, 8);
     }
     gl.useProgram(atmosphere.program);
-    gl.uniform1i(atmosphere.locations.treeShadowMap, 18);
     gl.uniform1i(atmosphere.locations.brickTex, 0);
     gl.uniform1i(atmosphere.locations.coarseTex, 1);
     gl.uniform1i(atmosphere.locations.halfDepth, 3);
@@ -426,16 +435,16 @@ function init() {
     gl.uniform1i(color.locations.halfDepth, 3);
     gl.uniform1i(color.locations.voxelAlbedo, 13);
     gl.uniform1i(color.locations.voxelNormals, 14);
-    gl.uniform1i(color.locations.treeShadowMap, 18);
     gl.uniform1i(color.locations.canopyTex, 20);
     gl.useProgram(treeColor.program);
-    for (const [name, unit] of [["brickTex", 0], ["coarseTex", 1], ["horizonTex", 2], ["skyLUT", 7], ["cloudNoise", 8], ["treeShadowMap", 18],
-        ["voxelAlbedo", 13], ["voxelNormals", 14], ["leafTextures", 19], ["canopyTex", 20]]) {
+    for (const [name, unit] of [["brickTex", 0], ["coarseTex", 1], ["horizonTex", 2], ["skyLUT", 7], ["cloudNoise", 8],
+        ["voxelAlbedo", 13], ["voxelNormals", 14], ["leafTextures", 19], ["canopyTex", 20], ["leafMotion", 21]]) {
         gl.uniform1i(treeColor.locations[name], unit);
     }
     gl.useProgram(treeGbuffer.program);
     gl.uniform1i(treeGbuffer.locations.voxelAlbedo, 13);
     gl.uniform1i(treeGbuffer.locations.leafTextures, 19);
+    gl.uniform1i(treeGbuffer.locations.leafMotion, 21);
     gl.uniform1f(treeColor.locations.seaLevel, SEA_LEVEL);
     gl.useProgram(color.program);
     gl.uniform1f(color.locations.seaLevel, SEA_LEVEL);
@@ -560,7 +569,12 @@ function init() {
     }
 
     function setTreeShadow(program) {
-        gl.uniformMatrix4fv(program.locations.treeShadowMatrix, false, treeShadowMatrix);
+        const a = treeShadowMaps[treeShadowA], b = treeShadowMaps[1 - treeShadowA];
+        gl.uniform1i(program.locations.treeShadowMap, a.unit);
+        gl.uniform1i(program.locations.treeShadowMapB, b.unit);
+        gl.uniformMatrix4fv(program.locations.treeShadowMatrix, false, a.matrix);
+        gl.uniformMatrix4fv(program.locations.treeShadowMatrixB, false, b.matrix);
+        gl.uniform1f(program.locations.treeShadowBlend, treeShadowBlend);
         gl.uniform1i(program.locations.treeShadowOn, treeShadowOn ? 1 : 0);
     }
     function setCanopy(program) {
@@ -577,43 +591,77 @@ function init() {
         return treePlanes;
     }
 
-    /** depth of the trees seen from the light, around the camera, when needed (see TREE_SHADOW_LIGHT_STEP) */
-    function renderTreeShadows(fastTime) {
-        treeShadowOn = -light.lightDir[2] > 0.03;
-        if (!treeShadowOn) return;
-        const state = treeShadowState;
-        const lightTurned = !state.light || fastTime || vec3.angle(state.light, light.lightDir) > TREE_SHADOW_LIGHT_STEP;
-        const cameraMoved = !state.center || vec3.distance(state.center, camPosition) > TREE_SHADOW_MOVE_STEP;
-        if (!lightTurned && !cameraMoved && state.version === world.treesVersion) return;
-        if (lightTurned) state.light = vec3.clone(light.lightDir);
-        state.center = vec3.clone(camPosition);
-        state.version = world.treesVersion;
-        // light space with a fixed orientation between light steps; the area is snapped to its texels, so moving the
-        // camera does not move the shadows
-        const up = Math.abs(state.light[2]) > 0.99 ? [0, 1, 0] : [0, 0, 1];
-        mat4.lookAt(treeLightView, [0, 0, 0], state.light, up);
+    /** depth of the trees seen from the light dir into a map; light space snapped to its texels (no shimmer) */
+    function renderTreeShadowMap(map, dir) {
+        vec3.copy(map.dir, dir);
+        const up = Math.abs(dir[2]) > 0.99 ? [0, 1, 0] : [0, 0, 1];
+        mat4.lookAt(treeLightView, [0, 0, 0], dir, up);
         const c = vec3.transformMat4(vec3.create(), camPosition, treeLightView);
         const texel = 2 * TREE_SHADOW_RADIUS / TREE_SHADOW_SIZE;
         const sx = Math.round(c[0] / texel) * texel, sy = Math.round(c[1] / texel) * texel;
         mat4.ortho(treeLightProj, sx - TREE_SHADOW_RADIUS, sx + TREE_SHADOW_RADIUS, sy - TREE_SHADOW_RADIUS, sy + TREE_SHADOW_RADIUS,
             -c[2] - 400, -c[2] + 400);
-        mat4.multiply(treeShadowMatrix, treeLightProj, treeLightView);
+        mat4.multiply(map.matrix, treeLightProj, treeLightView);
 
-        trees.gather("shadow", camPosition, null, TREE_SHADOW_RADIUS * 1.5, 1); // full foliage: cheaper, no gaps needed
-        gl.bindFramebuffer(gl.FRAMEBUFFER, treeShadowFramebuffer);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, map.framebuffer);
         gl.viewport(0, 0, TREE_SHADOW_SIZE, TREE_SHADOW_SIZE);
         gl.clear(gl.DEPTH_BUFFER_BIT);
         gl.enable(gl.POLYGON_OFFSET_FILL);
         gl.polygonOffset(2, 4);
         gl.cullFace(gl.FRONT); // back faces in the map: less self shadowing on the lit faces
         gl.useProgram(treeDepth.program);
-        gl.uniformMatrix4fv(treeDepth.locations.viewProj, false, treeShadowMatrix);
+        gl.uniformMatrix4fv(treeDepth.locations.viewProj, false, map.matrix);
         gl.uniform1f(treeDepth.locations.windTime, 0);
         trees.draw("shadow", treeDepth.locations);
         gl.cullFace(gl.BACK);
         gl.disable(gl.POLYGON_OFFSET_FILL);
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    }
+
+    /** direction of the main light at an hour angle */
+    function lightAt(hour) {
+        return daylight(futureLight, hour).lightDir;
+    }
+
+    /** keep the two tree shadow maps for the current hour angle (see TREE_SHADOW_HOUR_STEP), and their blend */
+    function renderTreeShadows(fastTime) {
+        treeShadowOn = -light.lightDir[2] > 0.03;
+        const state = treeShadowState;
+        if (!treeShadowOn) {
+            state.hourA = null; // start again when the shadows come back
+            return;
+        }
+        if (fastTime) {
+            // time running fast: a single map, rendered every frame with the current light
+            trees.gather("shadow", camPosition, null, TREE_SHADOW_RADIUS * 1.5, 1);
+            renderTreeShadowMap(treeShadowMaps[treeShadowA], light.lightDir);
+            treeShadowBlend = 0;
+            state.hourA = null;
+            return;
+        }
+        let renderA = false, renderB = false;
+        if (state.hourA === null || hourAngle < state.hourA || hourAngle >= state.hourA + 2 * TREE_SHADOW_HOUR_STEP) {
+            state.hourA = hourAngle;
+            renderA = renderB = true;
+        } else if (hourAngle >= state.hourA + TREE_SHADOW_HOUR_STEP) {
+            treeShadowA = 1 - treeShadowA; // B becomes A
+            state.hourA += TREE_SHADOW_HOUR_STEP;
+            renderB = true;
+        }
+        if (!state.center || vec3.distance(state.center, camPosition) > TREE_SHADOW_MOVE_STEP || state.version !== world.treesVersion) {
+            renderA = renderB = true;
+        }
+        if (renderA || renderB) {
+            state.center = vec3.clone(camPosition);
+            state.version = world.treesVersion;
+            trees.gather("shadow", camPosition, null, TREE_SHADOW_RADIUS * 1.5, 1); // full foliage: cheaper, no gaps needed
+            if (renderA) renderTreeShadowMap(treeShadowMaps[treeShadowA], lightAt(state.hourA));
+            if (renderB) renderTreeShadowMap(treeShadowMaps[1 - treeShadowA], lightAt(state.hourA + TREE_SHADOW_HOUR_STEP));
+        }
+        treeShadowBlend = Math.min(1, Math.max(0, (hourAngle - state.hourA) / TREE_SHADOW_HOUR_STEP));
+        // the moon takes over from the sun: no blend between unrelated shadows
+        if (vec3.angle(treeShadowMaps[0].dir, treeShadowMaps[1].dir) > 0.1) treeShadowBlend = treeShadowBlend < 0.5 ? 0 : 1;
     }
 
     function setShadowWindow(program) {
