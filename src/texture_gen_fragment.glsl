@@ -132,10 +132,11 @@ float material(vec2 uv, out vec3 albedo) {
         float breaks = smoothstep(0.82, 0.92, vnoise(uv, vec2(10.0, 7.0)));
         float grain = vnoise(uv, vec2(96.0, 24.0));
         float height = plates * (1.0 - breaks * 0.6) * 0.75 + grain * 0.25;
-        albedo = mix(vec3(0.08, 0.06, 0.045), vec3(0.30, 0.25, 0.20), height);
+        // dark: well below the earth (layer 0)
+        albedo = mix(vec3(0.045, 0.034, 0.026), vec3(0.17, 0.135, 0.105), height);
         albedo *= 0.85 + 0.3 * fbm(uv, vec2(5.0), 3);
         float moss = smoothstep(0.6, 0.75, fbm(uv + 0.3, vec2(4.0, 8.0), 4)) * (1.0 - plates);
-        albedo = mix(albedo, vec3(0.16, 0.22, 0.07), moss * 0.6);
+        albedo = mix(albedo, vec3(0.10, 0.14, 0.045), moss * 0.6);
         return height;
     }
     if(layer == 7) {
