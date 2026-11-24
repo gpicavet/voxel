@@ -372,6 +372,7 @@ export class World {
             ids = Int32Array.from(keep, i => ids[i]);
         }
         column.trees = { data, ids, bounds: treeBounds(data) };
+        column.treeOcclusion = null; // new trees: unknown (trees.js)
         this.treesVersion = (this.treesVersion || 0) + 1; // the shadow map of the trees is rendered again
     }
 
@@ -728,8 +729,9 @@ export class World {
                         chunk.occlusionEpoch++;
                     }
                     chunk.culledFrame = frame;
-                    chunk.occlusionTest = occlusion && aabbDistance(chunk, camPosition) > OCCLUSION_NEAR;
-                    if (chunk.occluded && (!chunk.occlusionTest || !this.seenByTest(chunk, camPosition))) {
+                    chunk.occlusionTest = occlusion && boxDistance(chunk.aabbMin, chunk.aabbMax, camPosition) > OCCLUSION_NEAR;
+                    if (chunk.occluded && (!chunk.occlusionTest
+                        || !this.seenByTest(chunk.aabbMin, chunk.aabbMax, chunk.occlusionPlanes, 0, camPosition))) {
                         chunk.occluded = false;
                     }
                     if (chunk.occluded) this.occluded++;
@@ -763,21 +765,21 @@ export class World {
     }
 
     /**
-     * Was all of the box of the chunk that is in the view now also in the view of the test that found it occluded? The
-     * box clipped by the frustum is convex: it is enough that its vertices were in the view of the test. Its vertices
-     * are the corners of the box inside the frustum, the crossings of the box edges with the frustum planes, and the
-     * crossings of the frustum side edges with the box faces (the near and far corners are never in a tested box).
+     * Was all of the box [min, max] that is in the view now also in the view of the test that found it occluded (its
+     * frustum planes: before, from offset)? The box clipped by the frustum is convex: it is enough that its vertices
+     * were in the view of the test. Its vertices are the corners of the box inside the frustum, the crossings of the box
+     * edges with the frustum planes, and the crossings of the frustum side edges with the box faces (the near and far
+     * corners are never in a tested box).
      */
-    seenByTest(chunk, eye) {
-        const before = chunk.occlusionPlanes, now = this.viewPlanes;
+    seenByTest(min, max, before, offset, eye) {
+        const now = this.viewPlanes;
         let same = true;
-        for (let k = 0; k < 24 && same; k++) same = before[k] === now[k];
+        for (let k = 0; k < 24 && same; k++) same = before[offset + k] === now[k];
         if (same) return true; // the camera did not move
-        const min = chunk.aabbMin, max = chunk.aabbMax;
-        if (insidePlanes(before, min, max)) return true; // the whole box was in the view of the test
+        if (insidePlanes(before, offset, min, max)) return true; // the whole box was in the view of the test
         // a vertex of the box clipped by the view, now in the view but not before
-        const newlySeen = (x, y, z) => pointInPlanes(now, x, y, z, 1e-3)
-            && !pointInPlanes(before, x, y, z, 1e-3 + OCCLUSION_SLIVER * Math.hypot(x - eye[0], y - eye[1], z - eye[2]));
+        const newlySeen = (x, y, z) => pointInPlanes(now, 0, x, y, z, 1e-3)
+            && !pointInPlanes(before, offset, x, y, z, 1e-3 + OCCLUSION_SLIVER * Math.hypot(x - eye[0], y - eye[1], z - eye[2]));
         const c = [0, 0, 0];
         for (let i = 0; i < 8; i++) {
             if (newlySeen((i & 1) ? max[0] : min[0], (i & 2) ? max[1] : min[1], (i & 4) ? max[2] : min[2])) return false;
@@ -823,12 +825,20 @@ export class World {
                 pending[n++] = test;
                 continue;
             }
-            const chunk = test.chunk;
-            if (chunk.occlusionEpoch === test.epoch) {
-                chunk.occluded = !gl.getQueryParameter(test.query, gl.QUERY_RESULT);
-                [chunk.occlusionPlanes, chunk.queryPlanes] = [chunk.queryPlanes, chunk.occlusionPlanes];
+            const chunk = test.chunk, trees = test.trees, i = test.index;
+            if (chunk) {
+                if (chunk.occlusionEpoch === test.epoch) {
+                    chunk.occluded = !gl.getQueryParameter(test.query, gl.QUERY_RESULT);
+                    [chunk.occlusionPlanes, chunk.queryPlanes] = [chunk.queryPlanes, chunk.occlusionPlanes];
+                }
+                chunk.occlusionQuery = null;
+            } else {
+                if (trees.epoch[i] === test.epoch) {
+                    trees.occluded[i] = gl.getQueryParameter(test.query, gl.QUERY_RESULT) ? 0 : 1;
+                    trees.planes.set(trees.queryPlanes.subarray(i * 24, i * 24 + 24), i * 24);
+                }
+                trees.pending[i] = 0;
             }
-            chunk.occlusionQuery = null;
             this.occlusionQueries.push(test.query);
         }
         pending.length = n;
@@ -851,7 +861,53 @@ export class World {
         gl.depthMask(true);
         chunk.occlusionQuery = query;
         chunk.queryPlanes.set(this.viewPlanes);
-        this.pendingOcclusion.push({ query, chunk, epoch: chunk.occlusionEpoch });
+        this.pendingOcclusion.push({ query, chunk, trees: null, index: 0, epoch: chunk.occlusionEpoch });
+    }
+
+    /**
+     * Occlusion state of a tree in the view this frame (trees.js), with the rules of the chunks (cull): state from
+     * createTreeOcclusion, tree i, box [min, max]. @returns true when the tree must be tested this frame (testTrees)
+     */
+    updateTreeOcclusion(state, i, min, max, eye) {
+        if (state.culledFrame[i] !== this.cullFrame - 1) {
+            state.occluded[i] = 0;
+            state.epoch[i]++;
+        }
+        state.culledFrame[i] = this.cullFrame;
+        const testable = boxDistance(min, max, eye) > OCCLUSION_NEAR;
+        if (state.occluded[i] && (!testable || !this.seenByTest(min, max, state.planes, i * 24, eye))) state.occluded[i] = 0;
+        return testable && !state.pending[i];
+    }
+
+    /**
+     * Occlusion queries on the boxes of the trees gathered for a test (trees.js), against the depth drawn so far: the
+     * terrain of the pre-pass, before the trees. program: viewProj, boxMin, boxSize (box_vertex.glsl).
+     */
+    testTrees(tests, program, viewProj, eye, pixelAngle) {
+        if (tests.count === 0) return;
+        const gl = this.gl, locations = program.locations, b = tests.boxes;
+        gl.useProgram(program.program);
+        gl.uniformMatrix4fv(locations.viewProj, false, viewProj);
+        gl.colorMask(false, false, false, false);
+        gl.depthMask(false);
+        gl.bindVertexArray(this.boxArray);
+        for (let k = 0; k < tests.count; k++) {
+            const o = k * 6, state = tests.states[k], i = tests.indices[k];
+            const distance = Math.hypot((b[o] + b[o + 3]) / 2 - eye[0], (b[o + 1] + b[o + 4]) / 2 - eye[1], (b[o + 2] + b[o + 5]) / 2 - eye[2]);
+            const margin = OCCLUSION_MARGIN + distance * pixelAngle * OCCLUSION_PIXELS;
+            gl.uniform3f(locations.boxMin, b[o] - margin, b[o + 1] - margin, b[o + 2] - margin);
+            gl.uniform3f(locations.boxSize, b[o + 3] - b[o] + 2 * margin, b[o + 4] - b[o + 1] + 2 * margin, b[o + 5] - b[o + 2] + 2 * margin);
+            const query = this.occlusionQueries.pop() || gl.createQuery();
+            gl.beginQuery(gl.ANY_SAMPLES_PASSED_CONSERVATIVE, query);
+            gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_BYTE, 0);
+            gl.endQuery(gl.ANY_SAMPLES_PASSED_CONSERVATIVE);
+            state.pending[i] = 1;
+            state.queryPlanes.set(this.viewPlanes, i * 24);
+            this.pendingOcclusion.push({ query, chunk: null, trees: state, index: i, epoch: state.epoch[i] });
+        }
+        gl.bindVertexArray(null);
+        gl.colorMask(true, true, true, true);
+        gl.depthMask(true);
     }
 
     /**
@@ -893,17 +949,17 @@ export class World {
 }
 
 
-/** is the point inside the planes (unit normals), give or take slack? */
-function pointInPlanes(planes, x, y, z, slack) {
-    for (let p = 0; p < 24; p += 4) {
+/** is the point inside the planes (unit normals, from offset), give or take slack? */
+function pointInPlanes(planes, offset, x, y, z, slack) {
+    for (let p = offset; p < offset + 24; p += 4) {
         if (planes[p] * x + planes[p + 1] * y + planes[p + 2] * z + planes[p + 3] < -slack) return false;
     }
     return true;
 }
 
-/** is the whole box [min, max] inside the planes? */
-function insidePlanes(planes, min, max) {
-    for (let p = 0; p < 24; p += 4) {
+/** is the whole box [min, max] inside the planes (from offset)? */
+function insidePlanes(planes, offset, min, max) {
+    for (let p = offset; p < offset + 24; p += 4) {
         const a = planes[p], b = planes[p + 1], c = planes[p + 2];
         // corner of the box the least along the plane normal
         if (a * (a > 0 ? min[0] : max[0]) + b * (b > 0 ? min[1] : max[1]) + c * (c > 0 ? min[2] : max[2]) + planes[p + 3] < 0) {
@@ -913,11 +969,11 @@ function insidePlanes(planes, min, max) {
     return true;
 }
 
-/** distance from the point to the box of the chunk (0 inside) */
-function aabbDistance(chunk, p) {
+/** distance from the point to the box [min, max] (0 inside) */
+function boxDistance(min, max, p) {
     let d2 = 0;
     for (let i = 0; i < 3; i++) {
-        const d = Math.max(chunk.aabbMin[i] - p[i], 0, p[i] - chunk.aabbMax[i]);
+        const d = Math.max(min[i] - p[i], 0, p[i] - max[i]);
         d2 += d * d;
     }
     return Math.sqrt(d2);
