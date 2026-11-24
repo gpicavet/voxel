@@ -5,6 +5,7 @@ precision highp float;
 layout(location=0) in uint data;
 layout(location=1) in vec4 instancePosition; // base (world) and yaw
 layout(location=2) in vec4 instanceData;     // scale, tint, sky light (0..1), sway phase
+layout(location=3) in uint extra;            // variant of the foliage, fringe and its corner (treeModels.js meshGrid)
 
 uniform mat4 viewProj;
 uniform vec3 modelOrigin; // model voxels: center of the base
@@ -18,6 +19,8 @@ out vec3 vLocal;             // model voxels, for the texture of the voxel
 flat out vec3 vLocalNormal;
 out float vAO;
 flat out int vMaterial;
+flat out int vVariant;
+out vec3 vFringe; // fringe of the foliage: 1, then the position on the voxel face (0..1 on it); 0 for the voxel faces
 flat out float vTint;
 flat out float vSkyLight;
 flat out float vYaw;
@@ -31,9 +34,24 @@ const vec3 NORMALS[6] = vec3[6](
 const float AO[4] = float[4](0.35, 0.6, 0.8, 1.0);
 const vec2 WIND_DIRECTION = vec2(0.92, 0.38); // the wind of the clouds
 
+// fringe of the foliage (drawn for the nearest trees, trees.js): pushed out of the face and grown towards the edges of
+// the foliage (model voxels)
+const float FRINGE_OUT = 0.3;
+const float FRINGE_GROW = 0.45;
+
 void main() {
     vec3 local = vec3(float(data & 127u), float((data >> 7) & 127u), float((data >> 14) & 127u));
     int face = int((data >> 21) & 7u);
+    vFringe = vec3(0.0);
+    if((extra & 4u) != 0u) {
+        int axis = face >> 1, u = axis == 0 ? 1 : 0, v = axis == 2 ? 1 : 2;
+        vec2 corner = vec2(float((extra >> 3) & 1u), float((extra >> 4) & 1u));
+        vec2 grow = vec2(float((extra >> 5) & 1u), float((extra >> 6) & 1u)) * (corner * 2.0 - 1.0) * FRINGE_GROW;
+        local += NORMALS[face] * FRINGE_OUT;
+        local[u] += grow.x;
+        local[v] += grow.y;
+        vFringe = vec3(1.0, corner + grow);
+    }
     int material = int((data >> 26) & 7u);
     float scale = instanceData.x;
 
@@ -63,6 +81,7 @@ void main() {
     vLocalNormal = n;
     vAO = AO[(data >> 24) & 3u];
     vMaterial = material;
+    vVariant = int(extra & 3u);
     vTint = instanceData.y;
     vSkyLight = instanceData.z;
     vYaw = instancePosition.w;
