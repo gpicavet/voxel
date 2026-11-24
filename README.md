@@ -20,7 +20,7 @@ Minecraft-like pixel art foliage (one texture per leaf voxel face, holes cut out
 sway of the whole tree, shadow maps for their shadows (and a larger one with the coarsest models for the far trees),
 ambient occlusion (baked in the models, darker inside the crowns and at the foot of the trunks even in the sun, and a canopy map darkening the ground under the trees and the forest around),
 and reflections in the water; explosions destroy them.
-Lakes in the valleys (sea level 28) with planar reflections, waves, Fresnel, sun glint, depth-based transparency (turbid: the bed fades out within a few meters) and an
+Lakes in the valleys (sea level 28) with planar reflections (rendered only where the water is seen, with the shadows of the camera where it sees the same surface), waves, Fresnel, sun glint, depth-based transparency (turbid: the bed fades out within a few meters) and an
 underwater view; craters dug next to the water fill up.
 
 Controls: arrows to move and turn, `z` / `s` to look up and down, `space` to blow up the terrain,

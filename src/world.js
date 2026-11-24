@@ -35,6 +35,8 @@ const RESULT_BUDGET_MS = 6;  // per frame, for uploading generated columns
 // mesh (voxels twice as large, a few times fewer faces); back to the real voxels a little closer (no flickering at the
 // limit).
 const FAR_DISTANCE = 384, FAR_HYSTERESIS = 16;
+// in the reflection of the water (half resolution, blurred by the waves), much closer
+const REFLECTION_FAR_DISTANCE = 192;
 // Occlusion culling: in the depth pre-pass, right before each chunk is drawn (nearest first), its box is tested against the
 // depth of the chunks drawn so far (hardware query, nothing written). A chunk whose box shows no sample is skipped by the
 // following frames, until a new test finds it visible. WebGL gives the answers a frame or more later: a chunk uncovered by
@@ -914,9 +916,10 @@ export class World {
      * @param locations of the program: chunkOrigin, chunkScale (1, or 2 for the coarse meshes of the far chunks)
      * @param pixelAngle the depth pre-pass, when not 0 (angle of its pixels, in radians): the occluded chunks are skipped,
      * and the chunks to test are tested right before being drawn
+     * @param reflection the reflection of the water: coarse meshes from REFLECTION_FAR_DISTANCE
      * @returns the number of faces drawn
      */
-    draw(chunks, camPosition, locations, pixelAngle = 0) {
+    draw(chunks, camPosition, locations, pixelAngle = 0, reflection = false) {
         const gl = this.gl;
         let faces = 0;
         for (const chunk of chunks) {
@@ -928,11 +931,19 @@ export class World {
             const dx = Math.max(chunk.aabbMin[0] - camPosition[0], 0, camPosition[0] - chunk.aabbMax[0]);
             const dy = Math.max(chunk.aabbMin[1] - camPosition[1], 0, camPosition[1] - chunk.aabbMax[1]);
             const d = Math.hypot(dx, dy);
-            if (d > FAR_DISTANCE + FAR_HYSTERESIS) chunk.far = true;
-            else if (d < FAR_DISTANCE - FAR_HYSTERESIS) chunk.far = false;
+            let coarse;
+            if (reflection) {
+                if (d > REFLECTION_FAR_DISTANCE + FAR_HYSTERESIS) chunk.reflectionFar = true;
+                else if (d < REFLECTION_FAR_DISTANCE - FAR_HYSTERESIS) chunk.reflectionFar = false;
+                coarse = chunk.reflectionFar && chunk.hasCoarse;
+            } else {
+                if (d > FAR_DISTANCE + FAR_HYSTERESIS) chunk.far = true;
+                else if (d < FAR_DISTANCE - FAR_HYSTERESIS) chunk.far = false;
+                coarse = chunk.far && chunk.hasCoarse;
+            }
             gl.uniform3fv(locations.chunkOrigin, chunk.pos);
-            gl.uniform1f(locations.chunkScale, chunk.far && chunk.hasCoarse ? 2 : 1);
-            faces += chunk.draw(gl, camPosition, this.multiDraw);
+            gl.uniform1f(locations.chunkScale, coarse ? 2 : 1);
+            faces += chunk.draw(gl, camPosition, this.multiDraw, coarse);
         }
         gl.bindVertexArray(null);
         return faces;
