@@ -1,4 +1,4 @@
-import { vec3 } from "gl-matrix";
+import { mat4, vec3 } from "gl-matrix";
 import { Chunk } from "./chunk";
 import { runColumnTask, runHeightGridTask } from "./columnTask";
 import { buildTreeModels } from "./treeModels";
@@ -35,6 +35,16 @@ const RESULT_BUDGET_MS = 6;  // per frame, for uploading generated columns
 // mesh (voxels twice as large, a few times fewer faces); back to the real voxels a little closer (no flickering at the
 // limit).
 const FAR_DISTANCE = 384, FAR_HYSTERESIS = 16;
+// Occlusion culling: in the depth pre-pass, right before each chunk is drawn (nearest first), its box is tested against the
+// depth of the chunks drawn so far (hardware query, nothing written). A chunk whose box shows no sample is skipped by the
+// following frames, until a new test finds it visible. WebGL gives the answers a frame or more later: a chunk uncovered by
+// the movement shows up that much late. The boxes are grown by OCCLUSION_MARGIN voxels plus OCCLUSION_PIXELS pixels of the
+// pre-pass (half resolution: a gap thinner than its pixels must not hide what is behind).
+const OCCLUSION_MARGIN = 1, OCCLUSION_PIXELS = 1.5;
+const OCCLUSION_NEAR = 4;    // eye closer than this to the box: drawn without test (the near plane would cut the box)
+// A test only saw the part of the box that was in the view: after the camera turned or moved, a chunk stays hidden only
+// if all of its box now in the view was in the view of the test, give or take a sliver this thin (radians).
+const OCCLUSION_SLIVER = 0.0004;
 
 /** Generation and meshing in web workers; on the main thread, one column per frame, if workers are not available. */
 class WorkerPool {
@@ -140,6 +150,15 @@ export class World {
         this.visitedFrame = new Map(); // chunk key -> last frame the visibility traversal reached it
         this.visibilityQueue = [];
         this.caveCulling = true;
+        this.occlusionCulling = true;
+        this.occlusionQueries = [];    // free query objects
+        this.pendingOcclusion = [];    // tests waiting for their answer: { query, chunk, epoch }
+        this.cullFrame = 0;
+        this.viewPlanes = new Float32Array(24); // frustum planes, unit normals (distances in voxels)
+        this.viewEdges = new Float32Array(24);  // the 4 side edges of the frustum: near corner, then near to far corner
+        this.invViewProj = mat4.create();
+        this.occluded = 0;             // chunks of the view skipped this frame
+        this.boxArray = createBoxArray(gl);
         this.padded = new Uint8Array(P * P * P);
 
         this.multiDraw = gl.getExtension("WEBGL_multi_draw");
@@ -683,18 +702,37 @@ export class World {
         return visible.sort((c1, c2) => c1.reflectionDist2 - c2.reflectionDist2);
     }
 
-    /** meshed chunks inside the camera frustum (and reached by the cave culling), from the nearest to the farthest */
-    cull(viewProj, camPosition) {
-        frustumPlanes(this.planes, viewProj);
+    /**
+     * Meshed chunks inside the camera frustum (and reached by the cave culling), from the nearest to the farthest.
+     * @param occlusion the depth pre-pass tests the chunks this frame (see draw); chunk.occluded: skipped by the passes
+     */
+    cull(viewProj, camPosition, occlusion) {
+        const planes = frustumPlanes(this.planes, viewProj);
+        this.updateViewVolume(viewProj);
         if (this.caveCulling) this.traverseVisibility(camPosition);
+        occlusion = occlusion && this.occlusionCulling;
+        this.pollOcclusion();
+        const frame = ++this.cullFrame;
         const visible = this.visible;
         visible.length = 0;
+        this.occluded = 0;
         for (const column of this.columns.values()) {
             if (!column.hasMesh || !column.chunks) continue;
             for (const chunk of column.chunks) {
                 if (this.caveCulling && chunk.visibleFrame !== this.frame) continue;
-                if (chunk.nFaces > 0 && aabbInFrustum(this.planes, chunk.aabbMin, chunk.aabbMax)) {
+                if (chunk.nFaces > 0 && aabbInFrustum(planes, chunk.aabbMin, chunk.aabbMax)) {
                     chunk.camDist2 = vec3.sqrDist(chunk.centerPos, camPosition);
+                    // back in the view, or no test: unknown, so drawn (the answers of older tests are ignored)
+                    if (!occlusion || chunk.culledFrame !== frame - 1) {
+                        chunk.occluded = false;
+                        chunk.occlusionEpoch++;
+                    }
+                    chunk.culledFrame = frame;
+                    chunk.occlusionTest = occlusion && aabbDistance(chunk, camPosition) > OCCLUSION_NEAR;
+                    if (chunk.occluded && (!chunk.occlusionTest || !this.seenByTest(chunk, camPosition))) {
+                        chunk.occluded = false;
+                    }
+                    if (chunk.occluded) this.occluded++;
                     visible.push(chunk);
                 }
             }
@@ -703,14 +741,133 @@ export class World {
         return visible;
     }
 
-    /** @returns the number of faces drawn */
+    /** unit frustum planes and side edges of the view (seenByTest) */
+    updateViewVolume(viewProj) {
+        const planes = this.viewPlanes;
+        planes.set(this.planes);
+        for (let p = 0; p < 24; p += 4) {
+            const length = Math.hypot(planes[p], planes[p + 1], planes[p + 2]);
+            for (let k = 0; k < 4; k++) planes[p + k] /= length;
+        }
+        const m = mat4.invert(this.invViewProj, viewProj), edges = this.viewEdges;
+        const unproject = (out, o, x, y, z) => {
+            const w = m[3] * x + m[7] * y + m[11] * z + m[15];
+            for (let k = 0; k < 3; k++) out[o + k] = (m[k] * x + m[4 + k] * y + m[8 + k] * z + m[12 + k]) / w;
+        };
+        for (let e = 0; e < 4; e++) {
+            const x = (e & 1) ? 1 : -1, y = (e & 2) ? 1 : -1, o = e * 6;
+            unproject(edges, o, x, y, -1);
+            unproject(edges, o + 3, x, y, 1);
+            for (let k = 0; k < 3; k++) edges[o + 3 + k] -= edges[o + k];
+        }
+    }
+
+    /**
+     * Was all of the box of the chunk that is in the view now also in the view of the test that found it occluded? The
+     * box clipped by the frustum is convex: it is enough that its vertices were in the view of the test. Its vertices
+     * are the corners of the box inside the frustum, the crossings of the box edges with the frustum planes, and the
+     * crossings of the frustum side edges with the box faces (the near and far corners are never in a tested box).
+     */
+    seenByTest(chunk, eye) {
+        const before = chunk.occlusionPlanes, now = this.viewPlanes;
+        let same = true;
+        for (let k = 0; k < 24 && same; k++) same = before[k] === now[k];
+        if (same) return true; // the camera did not move
+        const min = chunk.aabbMin, max = chunk.aabbMax;
+        if (insidePlanes(before, min, max)) return true; // the whole box was in the view of the test
+        // a vertex of the box clipped by the view, now in the view but not before
+        const newlySeen = (x, y, z) => pointInPlanes(now, x, y, z, 1e-3)
+            && !pointInPlanes(before, x, y, z, 1e-3 + OCCLUSION_SLIVER * Math.hypot(x - eye[0], y - eye[1], z - eye[2]));
+        const c = [0, 0, 0];
+        for (let i = 0; i < 8; i++) {
+            if (newlySeen((i & 1) ? max[0] : min[0], (i & 2) ? max[1] : min[1], (i & 4) ? max[2] : min[2])) return false;
+        }
+        for (let a = 0; a < 3; a++) {
+            const b = (a + 1) % 3, d = (a + 2) % 3;
+            for (let i = 0; i < 4; i++) {
+                c[b] = (i & 1) ? max[b] : min[b];
+                c[d] = (i & 2) ? max[d] : min[d];
+                for (let p = 0; p < 24; p += 4) {
+                    if (Math.abs(now[p + a]) < 1e-9) continue;
+                    c[a] = -(now[p + b] * c[b] + now[p + d] * c[d] + now[p + 3]) / now[p + a];
+                    if (c[a] >= min[a] && c[a] <= max[a] && newlySeen(c[0], c[1], c[2])) return false;
+                }
+            }
+        }
+        const edges = this.viewEdges;
+        for (let o = 0; o < 24; o += 6) {
+            for (let a = 0; a < 3; a++) {
+                const v = edges[o + 3 + a];
+                if (Math.abs(v) < 1e-9) continue;
+                for (const face of [min[a], max[a]]) {
+                    const t = (face - edges[o + a]) / v;
+                    if (t < 0 || t > 1) continue;
+                    let inside = true;
+                    for (let k = 0; k < 3; k++) {
+                        c[k] = k === a ? face : edges[o + k] + t * edges[o + 3 + k];
+                        if (k !== a && (c[k] < min[k] - 1e-3 || c[k] > max[k] + 1e-3)) inside = false;
+                    }
+                    if (inside && newlySeen(c[0], c[1], c[2])) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /** answers of the occlusion tests that have arrived */
+    pollOcclusion() {
+        const gl = this.gl, pending = this.pendingOcclusion;
+        let n = 0;
+        for (const test of pending) {
+            if (!gl.getQueryParameter(test.query, gl.QUERY_RESULT_AVAILABLE)) {
+                pending[n++] = test;
+                continue;
+            }
+            const chunk = test.chunk;
+            if (chunk.occlusionEpoch === test.epoch) {
+                chunk.occluded = !gl.getQueryParameter(test.query, gl.QUERY_RESULT);
+                [chunk.occlusionPlanes, chunk.queryPlanes] = [chunk.queryPlanes, chunk.occlusionPlanes];
+            }
+            chunk.occlusionQuery = null;
+            this.occlusionQueries.push(test.query);
+        }
+        pending.length = n;
+    }
+
+    /** occlusion query on the (grown) box of the chunk, against the depth of the chunks drawn so far; nothing written */
+    testOcclusion(chunk, locations, pixelAngle) {
+        const gl = this.gl;
+        const query = this.occlusionQueries.pop() || gl.createQuery();
+        const margin = OCCLUSION_MARGIN + Math.sqrt(chunk.camDist2) * pixelAngle * OCCLUSION_PIXELS;
+        gl.colorMask(false, false, false, false);
+        gl.depthMask(false);
+        gl.uniform3f(locations.chunkOrigin, chunk.pos[0] - margin, chunk.pos[1] - margin, chunk.pos[2] - margin);
+        gl.uniform1f(locations.chunkScale, CHUNK_SIZE + 2 * margin);
+        gl.bindVertexArray(this.boxArray);
+        gl.beginQuery(gl.ANY_SAMPLES_PASSED_CONSERVATIVE, query);
+        gl.drawElements(gl.TRIANGLES, 36, gl.UNSIGNED_BYTE, 0);
+        gl.endQuery(gl.ANY_SAMPLES_PASSED_CONSERVATIVE);
+        gl.colorMask(true, true, true, true);
+        gl.depthMask(true);
+        chunk.occlusionQuery = query;
+        chunk.queryPlanes.set(this.viewPlanes);
+        this.pendingOcclusion.push({ query, chunk, epoch: chunk.occlusionEpoch });
+    }
+
     /**
      * @param locations of the program: chunkOrigin, chunkScale (1, or 2 for the coarse meshes of the far chunks)
+     * @param pixelAngle the depth pre-pass, when not 0 (angle of its pixels, in radians): the occluded chunks are skipped,
+     * and the chunks to test are tested right before being drawn
+     * @returns the number of faces drawn
      */
-    draw(chunks, camPosition, locations) {
+    draw(chunks, camPosition, locations, pixelAngle = 0) {
         const gl = this.gl;
         let faces = 0;
         for (const chunk of chunks) {
+            if (pixelAngle > 0) {
+                if (chunk.occlusionTest && chunk.occlusionQuery === null) this.testOcclusion(chunk, locations, pixelAngle);
+                if (chunk.occluded) continue;
+            }
             // horizontal distance to the chunk (the mirrored eye of the reflection gives the same)
             const dx = Math.max(chunk.aabbMin[0] - camPosition[0], 0, camPosition[0] - chunk.aabbMax[0]);
             const dy = Math.max(chunk.aabbMin[1] - camPosition[1], 0, camPosition[1] - chunk.aabbMax[1]);
@@ -735,6 +892,66 @@ export class World {
     }
 }
 
+
+/** is the point inside the planes (unit normals), give or take slack? */
+function pointInPlanes(planes, x, y, z, slack) {
+    for (let p = 0; p < 24; p += 4) {
+        if (planes[p] * x + planes[p + 1] * y + planes[p + 2] * z + planes[p + 3] < -slack) return false;
+    }
+    return true;
+}
+
+/** is the whole box [min, max] inside the planes? */
+function insidePlanes(planes, min, max) {
+    for (let p = 0; p < 24; p += 4) {
+        const a = planes[p], b = planes[p + 1], c = planes[p + 2];
+        // corner of the box the least along the plane normal
+        if (a * (a > 0 ? min[0] : max[0]) + b * (b > 0 ? min[1] : max[1]) + c * (c > 0 ? min[2] : max[2]) + planes[p + 3] < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** distance from the point to the box of the chunk (0 inside) */
+function aabbDistance(chunk, p) {
+    let d2 = 0;
+    for (let i = 0; i < 3; i++) {
+        const d = Math.max(chunk.aabbMin[i] - p[i], 0, p[i] - chunk.aabbMax[i]);
+        d2 += d * d;
+    }
+    return Math.sqrt(d2);
+}
+
+/**
+ * Unit cube in the packed vertex format of the chunk meshes (corners at 0 or 1, scaled by chunkScale), its triangles
+ * counter-clockwise seen from outside: the boxes of the occlusion tests.
+ */
+function createBoxArray(gl) {
+    const vertices = new Uint32Array(8);
+    for (let i = 0; i < 8; i++) vertices[i] = (i & 1) | ((i >> 1) & 1) << 7 | ((i >> 2) & 1) << 14;
+    const indices = [];
+    for (let axis = 0; axis < 3; axis++) {
+        const u = (axis + 1) % 3, v = (axis + 2) % 3; // u x v = axis
+        for (const side of [0, 1]) {
+            const corner = (a, b) => (side << axis) | (a << u) | (b << v);
+            const quad = side
+                ? [corner(0, 0), corner(1, 0), corner(1, 1), corner(0, 1)]
+                : [corner(0, 0), corner(0, 1), corner(1, 1), corner(1, 0)];
+            indices.push(quad[0], quad[1], quad[2], quad[0], quad[2], quad[3]);
+        }
+    }
+    const vertexArray = gl.createVertexArray();
+    gl.bindVertexArray(vertexArray);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+    gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 4, 0);
+    gl.enableVertexAttribArray(0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint8Array(indices), gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+    return vertexArray;
+}
 
 function chunkKey(cx, cy, cz) {
     return columnKey(cx, cy) * CHUNKS_PER_COLUMN + (cz - CZ_MIN);

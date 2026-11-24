@@ -47,6 +47,14 @@ export class Chunk {
         this.coarseFirst = new Int32Array(6);
         this.coarseCount = new Int32Array(6);
         this.far = false; // drawn coarse (hysteresis: world.js)
+        // occlusion culling (world.js)
+        this.occluded = false;        // hidden at the last test: skipped
+        this.occlusionTest = false;   // tested this frame
+        this.occlusionQuery = null;   // test waiting for its answer
+        this.occlusionEpoch = 0;      // answers of tests made before a change of this number are ignored
+        this.culledFrame = -1;        // last frame the chunk was in the view
+        this.queryPlanes = new Float32Array(24);     // frustum planes of the pending test
+        this.occlusionPlanes = new Float32Array(24); // frustum planes of the test that gave this.occluded
         this.waterVertexArray = null;
         this.waterBuffer = null;
         this.nWaterFaces = 0;
