@@ -82,6 +82,7 @@ let keysDown = {};
 let halfResShadows = true;
 let viewRadiusChange = 0;
 let caveCullingToggle = false;
+let occlusionCullingToggle = false;
 let maskHistoryStale = false;
 let aoHistoryStale = false; // the occlusion does not depend on the sun: only reset when the mask stops being updated
 let writeViewToUrl = false;
@@ -106,6 +107,9 @@ function onkeydown(event) {
     }
     if (event.key === "c") {
         caveCullingToggle = true;
+    }
+    if (event.key === "o") {
+        occlusionCullingToggle = true;
     }
     if (event.key === "+" || event.key === "=") {
         viewRadiusChange = 1;
@@ -480,11 +484,12 @@ function init() {
         return (world.viewRadius - 0.5) * CHUNK_SIZE;
     }
     const NEAR = 0.1;
+    const FOV = Math.PI / 4; // vertical
     function farPlane() {
         return viewDistance() * 1.5;
     }
     function updateProjection() {
-        mat4.perspective(projMatrix, Math.PI / 4, gl.drawingBufferWidth / gl.drawingBufferHeight, NEAR, farPlane());
+        mat4.perspective(projMatrix, FOV, gl.drawingBufferWidth / gl.drawingBufferHeight, NEAR, farPlane());
     }
 
     // planar reflection of the water, rendered mirrored at half the CSS resolution (unit 15), linear HDR
@@ -814,10 +819,17 @@ function init() {
             world.caveCulling = !world.caveCulling;
             caveCullingToggle = false;
         }
+        if (occlusionCullingToggle) {
+            world.occlusionCulling = !world.occlusionCulling;
+            occlusionCullingToggle = false;
+        }
         world.update(camPosition);
 
         underWater = world.isWater(Math.floor(camPosition[0]), Math.floor(camPosition[1]), Math.floor(camPosition[2] + 0.12));
-        const visible = world.cull(viewProjMatrix, camPosition);
+        // chunks in the view; the ones found hidden by the occlusion tests of the depth pre-pass are not drawn
+        const prepass = halfResShadows || atmosphereEnabled;
+        const visible = world.cull(viewProjMatrix, camPosition, prepass);
+        const drawnChunks = world.occluded > 0 ? visible.filter(chunk => !chunk.occluded) : visible;
         visibleChunks = visible.length;
         renderTreeShadows(timeScale > 1);
         canopy.update(world, camPosition);
@@ -837,14 +849,14 @@ function init() {
             aoHistoryStale = false;
         }
         const atmosphereOn = atmosphereEnabled;
-        if (halfResShadows || atmosphereOn) {
+        if (prepass) {
             // 1. half resolution: depth and face direction of the nearest surface (cheap fragment shader)
             gl.bindFramebuffer(gl.FRAMEBUFFER, shadowTargets.geometryFramebuffer);
             gl.viewport(0, 0, shadowTargets.width, shadowTargets.height);
             gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
             gl.useProgram(gbuffer.program);
             gl.uniformMatrix4fv(gbuffer.locations.viewProj, false, viewProjMatrix);
-            world.draw(visible, camPosition, gbuffer.locations);
+            world.draw(visible, camPosition, gbuffer.locations, 2 * Math.tan(FOV / 2) / shadowTargets.height); // + tests
             gl.useProgram(treeGbuffer.program);
             gl.uniformMatrix4fv(treeGbuffer.locations.viewProj, false, viewProjMatrix);
             gl.uniform1f(treeGbuffer.locations.windTime, waterTime);
@@ -991,7 +1003,7 @@ function init() {
             gl.depthFunc(gl.LESS);
         }
 
-        const waterChunks = visible.filter(chunk => chunk.nWaterFaces > 0);
+        const waterChunks = drawnChunks.filter(chunk => chunk.nWaterFaces > 0);
         waterFaces = waterChunks.reduce((sum, chunk) => sum + chunk.nWaterFaces, 0);
 
         // planar reflection: the scene mirrored about the water plane, seen from the camera (only above the water). Only
@@ -1025,7 +1037,7 @@ function init() {
 
         // 3. full resolution color, shadows read from the mask (or traced per pixel)
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-        facesDrawn = drawTerrainColor(visible, viewProjMatrix, camPosition, false);
+        facesDrawn = drawTerrainColor(drawnChunks, viewProjMatrix, camPosition, false);
         drawTrees(viewProjMatrix, camPosition, false);
 
         // 4. sky
@@ -1094,10 +1106,11 @@ function init() {
             statsElement.textContent =
                 `${(frames * 1000 / (now - statsTime)).toFixed(0)} fps` +
                 (gpuMs !== null ? ` | GPU ${gpuMs.toFixed(2)} ms` : "") +
-                ` | chunks ${visibleChunks} visible` +
+                ` | chunks ${visibleChunks - world.occluded} drawn / ${visibleChunks} in view` +
                 ` | columns ${stats.meshed} meshed / ${stats.loaded} loaded, ${stats.pending} pending` +
                 ` | view ${world.viewRadius} (+/-)` +
                 ` | cave culling ${world.caveCulling ? "on" : "off"} (c)` +
+                ` | occlusion culling ${world.occlusionCulling ? "on" : "off"} (o)` +
                 ` | ${(facesDrawn * 2 / 1e6).toFixed(2)} M triangles` +
                 ` | trees ${trees.sets.camera.trees} (${(trees.sets.camera.faces * 2 / 1e6).toFixed(2)} M triangles)` +
                 (waterFaces > 0 ? ` | water ${(waterFaces / 1e3).toFixed(0)} k faces` : "") +
