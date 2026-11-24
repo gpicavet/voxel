@@ -147,6 +147,9 @@ export class Chunk {
         gl.bindBuffer(gl.ARRAY_BUFFER, this.waterBuffer);
         gl.bufferData(gl.ARRAY_BUFFER, mesh.vertices, gl.STATIC_DRAW);
         this.nWaterFaces = mesh.nFaces;
+        // bounds of the water faces, in world coordinates (the part of the screen the reflection must cover)
+        this.waterMin = vec3.fromValues(this.pos[0] + mesh.min[0], this.pos[1] + mesh.min[1], this.pos[2] + mesh.min[2]);
+        this.waterMax = vec3.fromValues(this.pos[0] + mesh.max[0], this.pos[1] + mesh.max[1], this.pos[2] + mesh.max[2]);
     }
 
     drawWater(gl) {

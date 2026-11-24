@@ -1,4 +1,4 @@
-import { mat4, vec3 } from "gl-matrix";
+import { mat4, vec3, vec4 } from "gl-matrix";
 import { moveWithCollisions } from "./collision";
 import { CHUNK_SIZE, SEA_LEVEL } from "./constants";
 import { createCloudNoiseTexture } from "./cloudNoise";
@@ -546,6 +546,7 @@ function init() {
     var mirrorMatrix = mat4.fromValues(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, 0, 0, 0, 2 * SEA_LEVEL, 1);
     var reflViewProjMatrix = mat4.create();
     var reflInvViewProjMatrix = mat4.create();
+    var reflCullMatrix = mat4.create(); // the mirrored view narrowed to the water on the screen (culling)
     var mirroredCamPosition = vec3.create();
     var waterTime = 0;
     var underWater = false;
@@ -594,12 +595,39 @@ function init() {
         gl.uniform1i(program.locations.canopyOn, canopy.valid ? 1 : 0);
     }
 
-    // frustum planes without the bottom and top ones (trees above or below the screen show in the reflections)
-    const treePlanes = new Float32Array(24);
-    function sidePlanes(matrix) {
-        frustumPlanes(treePlanes, matrix);
-        for (let i = 8; i < 16; i++) treePlanes[i] = (i % 4 === 3) ? 1 : 0;
-        return treePlanes;
+    const treePlanes = new Float32Array(24), reflectionPlanes = new Float32Array(24);
+
+    // Part of the screen covered by the water of these chunks: [x0, y0, x1, y1] in normalized device coordinates, with a
+    // margin for the waves (the water reads the reflection a little to the side, water_fragment.glsl), or null when it
+    // is off the screen. The whole screen when a corner is behind the camera.
+    const REFLECTION_MARGIN = 0.1;
+    const corner = vec4.create();
+    function waterScreenRect(chunks, matrix) {
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (const chunk of chunks) {
+            const a = chunk.waterMin, b = chunk.waterMax;
+            for (let k = 0; k < 8; k++) {
+                vec4.set(corner, k & 1 ? b[0] : a[0], k & 2 ? b[1] : a[1], k & 4 ? b[2] : a[2], 1);
+                vec4.transformMat4(corner, corner, matrix);
+                if (corner[3] < NEAR) return [-1, -1, 1, 1];
+                const x = corner[0] / corner[3], y = corner[1] / corner[3];
+                x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+            }
+        }
+        x0 = Math.max(-1, x0 - REFLECTION_MARGIN); y0 = Math.max(-1, y0 - REFLECTION_MARGIN);
+        x1 = Math.min(1, x1 + REFLECTION_MARGIN); y1 = Math.min(1, y1 + REFLECTION_MARGIN);
+        return x0 < x1 && y0 < y1 ? [x0, y0, x1, y1] : null;
+    }
+
+    // a view projection narrowed to a rectangle of the screen: the frustum of that part only (for the culling)
+    const cropMatrix = mat4.create();
+    function cropped(out, matrix, [x0, y0, x1, y1]) {
+        mat4.identity(cropMatrix);
+        cropMatrix[0] = 2 / (x1 - x0);
+        cropMatrix[5] = 2 / (y1 - y0);
+        cropMatrix[12] = -(x1 + x0) / (x1 - x0);
+        cropMatrix[13] = -(y1 + y0) / (y1 - y0);
+        return mat4.multiply(out, cropMatrix, matrix);
     }
 
     /**
@@ -793,7 +821,8 @@ function init() {
         visibleChunks = visible.length;
         renderTreeShadows(timeScale > 1);
         canopy.update(world, camPosition);
-        trees.gather("camera", camPosition, sidePlanes(viewProjMatrix), viewDistance());
+        frustumPlanes(treePlanes, viewProjMatrix);
+        trees.gather("camera", camPosition, treePlanes, viewDistance());
 
         gl.enable(gl.DEPTH_TEST);
         gl.depthFunc(gl.LESS);
@@ -919,7 +948,7 @@ function init() {
         }
 
         // trees, shaded like the terrain; mirrored = in the reflection of the water
-        function drawTrees(matrix, eye, mirrored) {
+        function drawTrees(matrix, eye, mirrored, setName = "camera") {
             gl.useProgram(treeColor.program);
             gl.uniformMatrix4fv(treeColor.locations.viewProj, false, matrix);
             gl.uniform1f(treeColor.locations.windTime, waterTime);
@@ -938,7 +967,7 @@ function init() {
                 shadowTargets.width / gl.drawingBufferWidth, shadowTargets.height / gl.drawingBufferHeight);
             gl.uniform1f(treeColor.locations.fogDensity, 1.2 / viewDistance());
             setShadowWindow(treeColor);
-            trees.draw("camera", treeColor.locations);
+            trees.draw(setName, treeColor.locations);
         }
 
         // sky on the far plane: only the pixels the terrain left empty are shaded
@@ -965,20 +994,31 @@ function init() {
         const waterChunks = visible.filter(chunk => chunk.nWaterFaces > 0);
         waterFaces = waterChunks.reduce((sum, chunk) => sum + chunk.nWaterFaces, 0);
 
-        // planar reflection: the scene mirrored about the water plane, seen from the camera (only above the water)
-        const reflectionOn = reflection !== null && waterChunks.length > 0 && camPosition[2] > SEA_LEVEL;
+        // planar reflection: the scene mirrored about the water plane, seen from the camera (only above the water). Only
+        // the part of the screen where there is water: the pixels around are not drawn (scissor), and the chunks and
+        // trees whose reflection falls outside are not drawn at all (frustum narrowed to that part)
+        const waterRect = waterChunks.length > 0 ? waterScreenRect(waterChunks, viewProjMatrix) : null;
+        const reflectionOn = reflection !== null && waterRect !== null && camPosition[2] > SEA_LEVEL;
         if (reflectionOn) {
             mat4.multiply(reflViewProjMatrix, viewProjMatrix, mirrorMatrix);
             mat4.invert(reflInvViewProjMatrix, reflViewProjMatrix);
             vec3.set(mirroredCamPosition, camPosition[0], camPosition[1], 2 * SEA_LEVEL - camPosition[2]);
+            const narrowed = cropped(reflCullMatrix, reflViewProjMatrix, waterRect);
+            frustumPlanes(reflectionPlanes, narrowed);
+            trees.gather("reflection", camPosition, reflectionPlanes, viewDistance());
             gl.bindFramebuffer(gl.FRAMEBUFFER, reflection.framebuffer);
             gl.viewport(0, 0, reflection.width, reflection.height);
+            const [x0, y0, x1, y1] = waterRect, w = reflection.width, h = reflection.height;
+            const px = Math.floor((x0 + 1) * 0.5 * w), py = Math.floor((y0 + 1) * 0.5 * h);
+            gl.enable(gl.SCISSOR_TEST);
+            gl.scissor(px, py, Math.ceil((x1 + 1) * 0.5 * w) - px, Math.ceil((y1 + 1) * 0.5 * h) - py);
             gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
             gl.cullFace(gl.FRONT); // the mirror flips the winding
-            drawTerrainColor(world.cullReflection(reflViewProjMatrix, mirroredCamPosition), reflViewProjMatrix, mirroredCamPosition, true);
-            drawTrees(reflViewProjMatrix, mirroredCamPosition, true);
+            drawTerrainColor(world.cullReflection(narrowed, mirroredCamPosition), reflViewProjMatrix, mirroredCamPosition, true);
+            drawTrees(reflViewProjMatrix, mirroredCamPosition, true, "reflection");
             gl.cullFace(gl.BACK);
             drawSky(reflInvViewProjMatrix, mirroredCamPosition, true);
+            gl.disable(gl.SCISSOR_TEST);
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
             gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
         }
