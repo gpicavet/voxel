@@ -9,8 +9,8 @@ import { CHUNK_SIZE, SEA_LEVEL, SEED } from './constants';
 const CELL = 7;
 export const TREE_FLOATS = 9; // x, y, z (base), yaw, scale, tint, sky light, sway phase, model
 
-// species: 0 oak, 1 pine, 2 birch, 3 bush, 4 dead tree; each with a few variants (models of treeModels.js)
-export const SPECIES_VARIANTS = [3, 2, 2, 2, 2];
+// species: 0 oak, 1 pine, 2 birch, 3 bush, 4 dead tree, 5 blossom; each with a few variants (models of treeModels.js)
+export const SPECIES_VARIANTS = [3, 2, 2, 2, 2, 2];
 export const MODEL_SPECIES = SPECIES_VARIANTS.flatMap((n, species) => new Array(n).fill(species));
 export const MODEL_COUNT = MODEL_SPECIES.length;
 const MODEL_FIRST = SPECIES_VARIANTS.map((n, species) => SPECIES_VARIANTS.slice(0, species).reduce((a, b) => a + b, 0));
@@ -29,9 +29,13 @@ function smoothstep(a, b, x) {
     return t * t * (3 - 2 * t);
 }
 
-/** species from the altitude and a random number (oak 0, pine 1, birch 2, bush 3, dead 4) */
-function species(h, r) {
+/**
+ * species from the altitude and a random number (oak 0, pine 1, birch 2, bush 3, dead 4, blossom 5); grove: inside a
+ * grove of blossom trees (in the valleys)
+ */
+function species(h, r, grove) {
     if (r < 0.03) return 4;
+    if (grove && h < 65 && r < 0.65) return 5;
     if (h < 50) return r < 0.55 ? 0 : r < 0.8 ? 2 : 3;
     if (h < 75) return r < 0.3 ? 0 : r < 0.85 ? 1 : 3;
     return r < 0.88 ? 1 : 4;
@@ -76,7 +80,8 @@ export function placeTrees(cx, cy, region, light, heights, x0, y0, z0, nx, ny, n
             }
             if (ground < 0) continue;
 
-            const kind = species(h, hash(gx, gy, 4));
+            const grove = forestNoise(x / 260 + 31.7, y / 260 - 12.9) > 0.45;
+            const kind = species(h, hash(gx, gy, 4), grove);
             const scale = kind === 1 ? 0.9 + hash(gx, gy, 5) * 0.5 : 0.75 + hash(gx, gy, 5) * 0.55;
             data.push(
                 x, y, ground - 0.15, // slightly in the ground, for slopes

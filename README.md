@@ -13,10 +13,10 @@ Day and night cycle with a physical sky (Rayleigh and Mie scattering), sun and m
 the wind and casting shadows, light shafts (god rays) and valley mist. Realistic textures (512 x 512, albedo and normal map) generated on the GPU at startup.
 On the surface, patches of blocks with grass or snow on all their faces and of bare earth.
 Sky light propagated like in Minecraft (caves and overhangs are dark), and ray-traced ambient occlusion within 10 voxels.
-Trees: 5 species (oak, spruce, birch, bush, dead tree) in 11 variants, made of voxels 4 times smaller than the terrain,
+Trees: 6 species (oak, spruce, birch, bush, dead tree, blossom tree in groves in the valleys) in 13 variants, made of voxels 4 times smaller than the terrain,
 grown at startup in a worker (crooked trunks with roots, recursive crooked limbs, flat pads of foliage with hanging
 fringes, spruces with whorls of drooping branches and a bare spire) and drawn as instances (free position, rotation, size, tint), with 3 levels of detail, high resolution bark textures (moss on the faces turned to the north, thicker low on the trunk) and
-Minecraft-like pixel art foliage (one texture per leaf voxel face, holes cut out up close), leaves fluttering in the wind inside their texture (each clump moving and turning with its own phase, gusts) and a slight
+Minecraft-like pixel art foliage (leaves of a few texels, one texture per meter of foliage, holes cut out up close; several tones per tree, one per pad of leaves; up close, a fringe of leaves breaking the outline of the voxels), leaves fluttering in the wind inside their texture (each leaf moving and turning with its own phase, gusts) and a slight
 sway of the whole tree, shadow maps for their shadows (and a larger one with the coarsest models for the far trees),
 ambient occlusion (baked in the models, darker inside the crowns and at the foot of the trunks even in the sun, and a canopy map darkening the ground under the trees and the forest around),
 and reflections in the water; explosions destroy them.

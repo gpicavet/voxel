@@ -25,6 +25,8 @@ in vec3 vLocal;
 flat in vec3 vLocalNormal;
 in float vAO;
 flat in int vMaterial;
+flat in int vVariant;
+in vec3 vFringe;
 flat in float vTint;
 flat in float vSkyLight;
 flat in float vYaw;
@@ -76,12 +78,13 @@ float moss(vec2 uv) {
 
 // color (linear) and normal (world) of the fragment, from the textures; per tree and per voxel variations
 void treeSurface(bool leaf, out vec3 albedo, out vec3 normal) {
-    vec3 texel = treeTexel(vMaterial, vLocal, vLocalNormal, vTint * 7.0, vPosition).rgb;
+    vec3 texel = treeTexel(vMaterial, vVariant, vLocal, vLocalNormal, vTint * 7.0, vPosition, vFringe).rgb;
     albedo = texel;
     vec3 tn = vec3(0.0, 0.0, 1.0); // the pixel art foliage is flat
     if(leaf) {
-        // every tree a bit different: from fresh green to yellowish, lighter or darker
-        albedo = mix(albedo, albedo * vec3(1.25, 1.08, 0.7), vTint * 0.4) * (0.88 + 0.24 * vTint);
+        // every tree a bit different: from fresh green to yellowish (not the blossoms), lighter or darker
+        if(vMaterial != 7) albedo = mix(albedo, albedo * vec3(1.25, 1.08, 0.7), vTint * 0.4);
+        albedo *= 0.88 + 0.24 * vTint;
     } else {
         // bark: a little per voxel, so the voxels still read, and the relief of the texture
         albedo *= 0.94 + 0.12 * hash(floor(vLocal - vLocalNormal * 0.5));

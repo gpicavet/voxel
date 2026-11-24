@@ -8,6 +8,10 @@ import { aabbInFrustum } from './utils';
 const INSTANCE_FLOATS = 8; // position + yaw, scale + tint + sky light + sway phase
 const LOD_DISTANCES = [90, 280]; // beyond the last one: coarsest model
 const BUCKETS = MODEL_COUNT * TREE_LODS;
+// the leafy fringe of the finest models (treeModels.js), drawn for the trees within this distance (meters, further its
+// leaves would be smaller than a few pixels): one more bucket per model
+const FRINGE_DISTANCE = 48;
+const FRINGE_MARGIN = 0.25; // meters: how far the fringe reaches out of the voxels
 
 export class TreeRenderer {
     /** @param world gives the shared index buffer (ensureIndexCapacity, indexBuffer) and the columns */
@@ -30,7 +34,7 @@ export class TreeRenderer {
     setModels(models) {
         const gl = this.gl, world = this.world;
         this.models = models.map(lods => lods.map(model => {
-            world.ensureIndexCapacity(model.nFaces);
+            world.ensureIndexCapacity(model.nFaces + model.nFringe);
             const buffer = gl.createBuffer();
             gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
             gl.bufferData(gl.ARRAY_BUFFER, model.vertices, gl.STATIC_DRAW);
@@ -41,7 +45,7 @@ export class TreeRenderer {
             const bound = { radius: 0, bottom: Infinity, top: -Infinity };
             for (const model of lods) {
                 const v = model.vertices, o = model.origin, size = model.voxelSize;
-                for (let k = 0; k < v.length; k++) {
+                for (let k = 0; k < v.length; k += 2) {
                     const x = ((v[k] & 127) - o[0]) * size, y = (((v[k] >> 7) & 127) - o[1]) * size, z = (((v[k] >> 14) & 127) - o[2]) * size;
                     bound.radius = Math.max(bound.radius, Math.hypot(x, y));
                     bound.bottom = Math.min(bound.bottom, z);
@@ -56,14 +60,18 @@ export class TreeRenderer {
     createSet() {
         const gl = this.gl;
         const buckets = [];
-        for (let b = 0; b < BUCKETS; b++) {
-            const model = this.models[Math.floor(b / TREE_LODS)][b % TREE_LODS];
+        for (let b = 0; b < BUCKETS + MODEL_COUNT; b++) {
+            const fringe = b >= BUCKETS; // fringe of the finest level of model b - BUCKETS
+            const model = fringe ? this.models[b - BUCKETS][0] : this.models[Math.floor(b / TREE_LODS)][b % TREE_LODS];
             const vao = gl.createVertexArray();
             const instances = gl.createBuffer();
             gl.bindVertexArray(vao);
+            // two words per vertex (treeModels.js meshGrid): the packed vertex, the variant of the foliage
             gl.bindBuffer(gl.ARRAY_BUFFER, model.buffer);
-            gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 4, 0);
+            gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 8, 0);
             gl.enableVertexAttribArray(0);
+            gl.vertexAttribIPointer(3, 1, gl.UNSIGNED_INT, 8, 4);
+            gl.enableVertexAttribArray(3);
             gl.bindBuffer(gl.ARRAY_BUFFER, instances);
             gl.vertexAttribPointer(1, 4, gl.FLOAT, false, INSTANCE_FLOATS * 4, 0);
             gl.vertexAttribPointer(2, 4, gl.FLOAT, false, INSTANCE_FLOATS * 4, 16);
@@ -73,7 +81,7 @@ export class TreeRenderer {
             gl.vertexAttribDivisor(2, 1);
             gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.world.indexBuffer);
             gl.bindVertexArray(null);
-            buckets.push({ vao, instances, data: new Float32Array(1024 * INSTANCE_FLOATS), count: 0, model, lod: b % TREE_LODS });
+            buckets.push({ vao, instances, data: new Float32Array(1024 * INSTANCE_FLOATS), count: 0, model, lod: fringe ? 0 : b % TREE_LODS, fringe });
         }
         return { buckets, trees: 0, faces: 0, occluded: 0 };
     }
@@ -116,9 +124,9 @@ export class TreeRenderer {
                 if (planes || occlusion) {
                     // box of the tree, with the sway of the wind (tree_vertex.glsl: up to 0.1 (h / 10)^2 + 0.06)
                     const bound = this.bounds[d[o + 8]], scale = d[o + 4], top = bound.top * scale;
-                    const r = bound.radius * scale + 0.1 * (top / 10) ** 2 + 0.1;
-                    min[0] = d[o] - r; min[1] = d[o + 1] - r; min[2] = d[o + 2] + bound.bottom * scale - 0.1;
-                    max[0] = d[o] + r; max[1] = d[o + 1] + r; max[2] = d[o + 2] + top + 0.1;
+                    const r = bound.radius * scale + 0.1 * (top / 10) ** 2 + 0.1 + FRINGE_MARGIN;
+                    min[0] = d[o] - r; min[1] = d[o + 1] - r; min[2] = d[o + 2] + bound.bottom * scale - 0.1 - FRINGE_MARGIN;
+                    max[0] = d[o] + r; max[1] = d[o + 1] + r; max[2] = d[o + 2] + top + 0.1 + FRINGE_MARGIN;
                     if (planes && !aabbInFrustum(planes, min, max)) continue;
                     if (occlusion) {
                         if (this.world.updateTreeOcclusion(state, i, min, max, eye)) {
@@ -142,15 +150,14 @@ export class TreeRenderer {
                 let lod = distance2 < LOD_DISTANCES[0] ** 2 ? 0 : distance2 < LOD_DISTANCES[1] ** 2 ? 1 : 2;
                 lod = Math.max(lod, minLod);
                 const bucket = set.buckets[d[o + 8] * TREE_LODS + lod];
-                if ((bucket.count + 1) * INSTANCE_FLOATS > bucket.data.length) {
-                    const bigger = new Float32Array(bucket.data.length * 2);
-                    bigger.set(bucket.data);
-                    bucket.data = bigger;
-                }
-                bucket.data.set(d.subarray(o, o + INSTANCE_FLOATS), bucket.count * INSTANCE_FLOATS);
-                bucket.count++;
+                addInstance(bucket, d, o);
                 set.trees++;
                 set.faces += bucket.model.nFaces;
+                if (lod === 0 && distance2 < FRINGE_DISTANCE * FRINGE_DISTANCE && bucket.model.nFringe > 0) {
+                    const fringe = set.buckets[BUCKETS + d[o + 8]];
+                    addInstance(fringe, d, o);
+                    set.faces += fringe.model.nFringe;
+                }
             }
         }
         for (const bucket of set.buckets) {
@@ -170,10 +177,26 @@ export class TreeRenderer {
             // transparent gaps in the leaves of the finest level only (further, the foliage is full)
             if (locations.cutout) gl.uniform1i(locations.cutout, bucket.lod === 0 ? 1 : 0);
             gl.bindVertexArray(bucket.vao);
-            gl.drawElementsInstanced(gl.TRIANGLES, bucket.model.nFaces * 6, gl.UNSIGNED_INT, 0, bucket.count);
+            if (bucket.fringe) {
+                // the fringe faces, after the others in the vertex buffer (and so in the shared index buffer)
+                gl.drawElementsInstanced(gl.TRIANGLES, bucket.model.nFringe * 6, gl.UNSIGNED_INT, bucket.model.nFaces * 6 * 4, bucket.count);
+            } else {
+                gl.drawElementsInstanced(gl.TRIANGLES, bucket.model.nFaces * 6, gl.UNSIGNED_INT, 0, bucket.count);
+            }
         }
         gl.bindVertexArray(null);
     }
+}
+
+/** append the instance attributes of the tree at offset o of the column data */
+function addInstance(bucket, d, o) {
+    if ((bucket.count + 1) * INSTANCE_FLOATS > bucket.data.length) {
+        const bigger = new Float32Array(bucket.data.length * 2);
+        bigger.set(bucket.data);
+        bucket.data = bigger;
+    }
+    bucket.data.set(d.subarray(o, o + INSTANCE_FLOATS), bucket.count * INSTANCE_FLOATS);
+    bucket.count++;
 }
 
 /**

@@ -652,7 +652,12 @@ function init() {
      * depth of the trees of a set seen from the light dir into a map; light space snapped to its texels (no shimmer),
      * depth range from -c[2] - depth to -c[2] + depth (the shaders use the same)
      */
-    function renderTreeShadowMap(map, dir, setName = "shadow") {
+    // Trees of a tree shadow map: all those in its volume seen from the light, not only those around the camera: with a
+    // low light, the map covers a long strip of ground along it, shaded by trees far from the camera (missing from the
+    // map, their shadow would vanish where the map takes over from the far map). Gathered into setName, never finer
+    // than minLod.
+    const treeShadowPlanes = new Float32Array(24);
+    function renderTreeShadowMap(map, dir, setName, minLod) {
         vec3.copy(map.dir, dir);
         const up = Math.abs(dir[2]) > 0.99 ? [0, 1, 0] : [0, 0, 1];
         mat4.lookAt(treeLightView, [0, 0, 0], dir, up);
@@ -661,6 +666,8 @@ function init() {
         const sx = Math.round(c[0] / texel) * texel, sy = Math.round(c[1] / texel) * texel;
         mat4.ortho(treeLightProj, sx - r, sx + r, sy - r, sy + r, -c[2] - depth, -c[2] + depth);
         mat4.multiply(map.matrix, treeLightProj, treeLightView);
+        frustumPlanes(treeShadowPlanes, map.matrix);
+        trees.gather(setName, camPosition, treeShadowPlanes, Infinity, minLod);
 
         gl.bindFramebuffer(gl.FRAMEBUFFER, map.framebuffer);
         gl.viewport(0, 0, TREE_SHADOW_SIZE, TREE_SHADOW_SIZE);
@@ -689,8 +696,7 @@ function init() {
         far.center = vec3.clone(camPosition);
         far.version = world.treesVersion;
         far.time = now;
-        trees.gather("far", camPosition, null, TREE_FAR_SHADOW_RADIUS * 1.5, 2); // coarsest models
-        renderTreeShadowMap(treeFarShadowMap, light.lightDir, "far");
+        renderTreeShadowMap(treeFarShadowMap, light.lightDir, "far", 2); // coarsest models
     }
 
     /** direction of the main light at an hour angle */
@@ -710,8 +716,7 @@ function init() {
         renderTreeFarShadow(fastTime);
         if (fastTime) {
             // time running fast: a single map, rendered every frame with the current light
-            trees.gather("shadow", camPosition, null, TREE_SHADOW_RADIUS * 1.5, 1);
-            renderTreeShadowMap(treeShadowMaps[treeShadowA], light.lightDir);
+            renderTreeShadowMap(treeShadowMaps[treeShadowA], light.lightDir, "shadow", 1);
             treeShadowBlend = 0;
             state.hourA = null;
             return;
@@ -731,9 +736,9 @@ function init() {
         if (renderA || renderB) {
             state.center = vec3.clone(camPosition);
             state.version = world.treesVersion;
-            trees.gather("shadow", camPosition, null, TREE_SHADOW_RADIUS * 1.5, 1); // full foliage: cheaper, no gaps needed
-            if (renderA) renderTreeShadowMap(treeShadowMaps[treeShadowA], lightAt(state.hourA));
-            if (renderB) renderTreeShadowMap(treeShadowMaps[1 - treeShadowA], lightAt(state.hourA + TREE_SHADOW_HOUR_STEP));
+            // full foliage (level 1 at least): cheaper, no gaps needed
+            if (renderA) renderTreeShadowMap(treeShadowMaps[treeShadowA], lightAt(state.hourA), "shadow", 1);
+            if (renderB) renderTreeShadowMap(treeShadowMaps[1 - treeShadowA], lightAt(state.hourA + TREE_SHADOW_HOUR_STEP), "shadow", 1);
         }
         treeShadowBlend = Math.min(1, Math.max(0, (hourAngle - state.hourA) / TREE_SHADOW_HOUR_STEP));
         // the moon takes over from the sun: no blend between unrelated shadows
