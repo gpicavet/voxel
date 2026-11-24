@@ -27,6 +27,10 @@ const ZERO_COARSE = new Uint8Array(COARSE_BYTES);
 const FULL_COARSE = new Uint8Array(COARSE_BYTES).fill(1);
 
 const RESULT_BUDGET_MS = 6;  // per frame, for uploading generated columns
+// Chunks farther than this (horizontally, from the eye to the nearest point of the chunk) are drawn with their coarse
+// mesh (voxels twice as large, a few times fewer faces); back to the real voxels a little closer (no flickering at the
+// limit).
+const FAR_DISTANCE = 256, FAR_HYSTERESIS = 16;
 
 /** Generation and meshing in web workers; on the main thread, one column per frame, if workers are not available. */
 class WorkerPool {
@@ -311,8 +315,9 @@ export class World {
             result.chunks.forEach((data, i) => {
                 const chunk = column.chunks[i];
                 if (data.mesh) {
-                    this.ensureIndexCapacity(data.mesh.nFaces);
+                    this.ensureIndexCapacity(Math.max(data.mesh.nFaces, data.coarseMesh.nFaces));
                     chunk.upload(gl, data.mesh, this.indexBuffer);
+                    chunk.uploadCoarse(gl, data.coarseMesh, this.indexBuffer);
                 } else {
                     chunk.freeMesh(gl);
                 }
@@ -425,6 +430,7 @@ export class World {
         chunk.connectivity = faceConnectivity(padded); // the voxels changed: so may the openings
         this.ensureIndexCapacity(mesh.nFaces);
         chunk.upload(this.gl, mesh, this.indexBuffer);
+        chunk.uploadCoarse(this.gl, null); // drawn with its real voxels until the workers send the new coarse mesh
         const water = buildWaterMesh(padded, column.heights, chunk.pos);
         if (water) this.ensureIndexCapacity(water.nFaces);
         chunk.uploadWater(this.gl, water, this.indexBuffer);
@@ -688,11 +694,21 @@ export class World {
     }
 
     /** @returns the number of faces drawn */
-    draw(chunks, camPosition, chunkOriginLocation) {
+    /**
+     * @param locations of the program: chunkOrigin, chunkScale (1, or 2 for the coarse meshes of the far chunks)
+     */
+    draw(chunks, camPosition, locations) {
         const gl = this.gl;
         let faces = 0;
         for (const chunk of chunks) {
-            gl.uniform3fv(chunkOriginLocation, chunk.pos);
+            // horizontal distance to the chunk (the mirrored eye of the reflection gives the same)
+            const dx = Math.max(chunk.aabbMin[0] - camPosition[0], 0, camPosition[0] - chunk.aabbMax[0]);
+            const dy = Math.max(chunk.aabbMin[1] - camPosition[1], 0, camPosition[1] - chunk.aabbMax[1]);
+            const d = Math.hypot(dx, dy);
+            if (d > FAR_DISTANCE + FAR_HYSTERESIS) chunk.far = true;
+            else if (d < FAR_DISTANCE - FAR_HYSTERESIS) chunk.far = false;
+            gl.uniform3fv(locations.chunkOrigin, chunk.pos);
+            gl.uniform1f(locations.chunkScale, chunk.far && chunk.hasCoarse ? 2 : 1);
             faces += chunk.draw(gl, camPosition, this.multiDraw);
         }
         gl.bindVertexArray(null);
