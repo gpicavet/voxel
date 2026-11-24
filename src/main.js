@@ -458,11 +458,11 @@ function init() {
         ["voxelAlbedo", 13], ["voxelNormals", 14], ["leafTextures", 19], ["canopyTex", 20], ["leafMotion", 21]]) {
         gl.uniform1i(treeColor.locations[name], unit);
     }
+    gl.uniform1f(treeColor.locations.seaLevel, SEA_LEVEL);
     gl.useProgram(treeGbuffer.program);
     gl.uniform1i(treeGbuffer.locations.voxelAlbedo, 13);
     gl.uniform1i(treeGbuffer.locations.leafTextures, 19);
     gl.uniform1i(treeGbuffer.locations.leafMotion, 21);
-    gl.uniform1f(treeColor.locations.seaLevel, SEA_LEVEL);
     gl.useProgram(color.program);
     gl.uniform1f(color.locations.seaLevel, SEA_LEVEL);
     gl.useProgram(water.program);
