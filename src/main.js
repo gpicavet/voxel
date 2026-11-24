@@ -13,6 +13,9 @@ var vshader = require('./vertex.glsl');
 var fshader = require('./fragment.glsl');
 var gbufferFshader = require('./gbuffer_fragment.glsl');
 var shadowFshader = require('./shadow_fragment.glsl');
+var softShadowFshader = require('./soft_shadow_fragment.glsl');
+var cloudShadowFshader = require('./cloud_shadow_fragment.glsl');
+var blurFshader = require('./blur_fragment.glsl');
 var skyVshader = require('./sky_vertex.glsl');
 var skyFshader = require('./sky_fragment.glsl');
 var skyLutFshader = require('./sky_lut_fragment.glsl');
@@ -43,7 +46,12 @@ const MAX_PIXEL_RATIO = 2;
 // uniforms of common.glsl
 const SKY_UNIFORMS = ["skyLUT", "sunDir", "lightDir", "lightColor", "exposure", "rawOutput", "underwaterDensity"];
 // uniforms of clouds.glsl and atmosphere.glsl
-const CLOUD_UNIFORMS = ["cloudNoise", "cloudTime", "cloudCoverage"];
+const CLOUD_UNIFORMS = ["cloudNoise", "cloudTime", "cloudCoverage", "cloudShadowTex", "cloudShadowArea"];
+// Shadows of the clouds: a texture of the light they let through (cloud_shadow_fragment.glsl), CLOUD_SHADOW_TEXELS per
+// side over CLOUD_SHADOW_SIZE meters at the bottom of the clouds, around where the light from the camera surroundings
+// enters them; blurred over the penumbra of the sun (SUN_RADIUS of shadow.glsl). Units 24 (read) and 25 (blur).
+const CLOUD_SHADOW_TEXELS = 512, CLOUD_SHADOW_SIZE = 2048;
+const CLOUD_BOTTOM = 210, SUN_RADIUS = 0.014; // as in clouds.glsl and shadow.glsl
 const ATMOSPHERE_UNIFORMS = ["atmosphereScatter", "screenSize", "atmosphereOn"];
 // weather presets (cloud coverage), w cycles through them
 const WEATHERS = [["fair", 0.35], ["cloudy", 0.55], ["overcast", 0.85], ["clear", 0.0]]; // the first is the default
@@ -202,8 +210,12 @@ function createShadowTargets(gl, screenWidth, screenHeight) {
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         return framebuffer;
     });
+    // soft shadow mask (soft_shadow_fragment.glsl, unit 26): the raw mask blurred over the penumbras, read by the color pass
+    const softMask = createTexture2D(gl, gl.TEXTURE26, gl.RGBA8, width, height);
+    gl.activeTexture(gl.TEXTURE0);
     return {
-        width, height, depth, face, masks, aoMasks,
+        width, height, depth, face, masks, aoMasks, softMask,
+        softFramebuffer: createFramebuffer(gl, softMask, null),
         current: 0, // index of the mask written this frame
         historyValid: false,
         aoHistoryValid: false,
@@ -261,6 +273,8 @@ function deleteShadowTargets(gl, targets) {
     gl.deleteTexture(targets.face);
     targets.masks.forEach(mask => gl.deleteTexture(mask));
     targets.aoMasks.forEach(mask => gl.deleteTexture(mask));
+    gl.deleteFramebuffer(targets.softFramebuffer);
+    gl.deleteTexture(targets.softMask);
 }
 
 /** GPU time of a frame, when EXT_disjoint_timer_query_webgl2 is available (not on Firefox and Safari) */
@@ -334,6 +348,11 @@ function init() {
         ["invViewProj", "camPosition", "moonDir", "sunDiskColor", "moonDiskColor", "starVisibility", ...SKY_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const skyLut = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, skyLutFshader),
         ["sunDir", "moonDir", "moonSky", "lutSize"]);
+    const softShadow = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, softShadowFshader),
+        ["rawMask", "halfDepth", "invViewProj", "depthRange", "lightDir", "pixelAngle", ...CLOUD_UNIFORMS]);
+    const cloudShadowPass = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, cloudShadowFshader),
+        ["toLight", "texels", ...CLOUD_UNIFORMS]);
+    const blur = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, blurFshader), ["source", "step"]);
     const atmosphere = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, atmosphereFshader),
         ["halfDepth", "historyScatter", "historyDepth", "invViewProj", "prevViewProj", "camPosition", "frameIndex", "historyValid", "lightShafts", "shaftDistance",
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...TREE_SHADOW_UNIFORMS]);
@@ -445,10 +464,24 @@ function init() {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.skyLUT, 7);
     }
-    for (const program of [color, atmosphere, shadow, sky]) {
+    for (const program of [color, atmosphere, shadow, sky, softShadow, cloudShadowPass]) {
         gl.useProgram(program.program);
         gl.uniform1i(program.locations.cloudNoise, 8);
     }
+    gl.useProgram(softShadow.program);
+    gl.uniform1i(softShadow.locations.halfDepth, 3);
+    gl.useProgram(cloudShadowPass.program);
+    gl.uniform1f(cloudShadowPass.locations.texels, CLOUD_SHADOW_TEXELS);
+    // the textures of the cloud shadows (read, blur), linear: the shadows are interpolated between the texels
+    const cloudShadowTextures = [gl.TEXTURE24, gl.TEXTURE25].map(unit => {
+        const texture = createTexture2D(gl, unit, gl.R8, CLOUD_SHADOW_TEXELS, CLOUD_SHADOW_TEXELS);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        return { texture, framebuffer: createFramebuffer(gl, texture, null) };
+    });
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const cloudShadowArea = new Float32Array([0, 0, CLOUD_SHADOW_SIZE]);
     gl.useProgram(atmosphere.program);
     gl.uniform1i(atmosphere.locations.brickTex, 0);
     gl.uniform1i(atmosphere.locations.coarseTex, 1);
@@ -579,6 +612,47 @@ function init() {
     function setClouds(program) {
         gl.uniform1f(program.locations.cloudTime, cloudTime);
         gl.uniform1f(program.locations.cloudCoverage, WEATHERS[weather][1]);
+        gl.uniform1i(program.locations.cloudShadowTex, 24);
+        gl.uniform3fv(program.locations.cloudShadowArea, cloudShadowArea);
+    }
+
+    /**
+     * Texture of the light let through by the clouds (cloud_shadow_fragment.glsl), every frame (the clouds move): around
+     * where the light from the ground near the camera enters the clouds, aligned on its texels (no shimmering), then
+     * blurred in two directions over the penumbra of the sun at that distance.
+     */
+    function renderCloudShadow() {
+        const toLight = vec3.negate(vec3.create(), light.lightDir);
+        if (WEATHERS[weather][1] <= 0 || toLight[2] <= 0.02) return;
+        const ground = Math.min(camPosition[2], CLOUD_BOTTOM - 20), along = (CLOUD_BOTTOM - ground) / toLight[2];
+        const texel = CLOUD_SHADOW_SIZE / CLOUD_SHADOW_TEXELS;
+        for (let k = 0; k < 2; k++) {
+            const u = camPosition[k] + toLight[k] * along - CLOUD_SHADOW_SIZE / 2;
+            cloudShadowArea[k] = Math.round(u / texel) * texel;
+        }
+        gl.disable(gl.DEPTH_TEST);
+        gl.viewport(0, 0, CLOUD_SHADOW_TEXELS, CLOUD_SHADOW_TEXELS);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, cloudShadowTextures[0].framebuffer);
+        gl.useProgram(cloudShadowPass.program);
+        gl.uniform3fv(cloudShadowPass.locations.toLight, toLight);
+        gl.uniform1f(cloudShadowPass.locations.cloudTime, cloudTime);
+        gl.uniform1f(cloudShadowPass.locations.cloudCoverage, WEATHERS[weather][1]);
+        gl.uniform3fv(cloudShadowPass.locations.cloudShadowArea, cloudShadowArea);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        // penumbra (diameter) at the distance of the clouds along the light: the 9 taps cover a gaussian of about 1.75 taps
+        const sigma = Math.max(0.5, along * SUN_RADIUS / texel), step = sigma / 1.75 / CLOUD_SHADOW_TEXELS;
+        gl.useProgram(blur.program);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, cloudShadowTextures[1].framebuffer);
+        gl.uniform1i(blur.locations.source, 24);
+        gl.uniform2f(blur.locations.step, step, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, cloudShadowTextures[0].framebuffer);
+        gl.uniform1i(blur.locations.source, 25);
+        gl.uniform2f(blur.locations.step, 0, step);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+        gl.enable(gl.DEPTH_TEST);
     }
     function setAtmosphere(program) {
         const on = atmosphereEnabled;
@@ -868,6 +942,7 @@ function init() {
             aoHistoryStale = false;
         }
         const atmosphereOn = atmosphereEnabled;
+        renderCloudShadow();
         if (prepass) {
             // 1. half resolution: depth and face direction of the nearest surface (cheap fragment shader)
             gl.bindFramebuffer(gl.FRAMEBUFFER, shadowTargets.geometryFramebuffer);
@@ -902,6 +977,17 @@ function init() {
             gl.uniform3fv(shadow.locations.camPosition, camPosition);
             setClouds(shadow);
             setShadowWindow(shadow);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+            // 3. soft shadows: the mask blurred over the penumbras, with the cloud shadows, for the color pass
+            gl.bindFramebuffer(gl.FRAMEBUFFER, shadowTargets.softFramebuffer);
+            gl.useProgram(softShadow.program);
+            gl.uniform1i(softShadow.locations.rawMask, 5 + current);
+            gl.uniformMatrix4fv(softShadow.locations.invViewProj, false, invViewProjMatrix);
+            gl.uniform2f(softShadow.locations.depthRange, NEAR, farPlane());
+            gl.uniform3fv(softShadow.locations.lightDir, light.lightDir);
+            gl.uniform1f(softShadow.locations.pixelAngle, 2 * Math.tan(FOV / 2) / shadowTargets.height);
+            setClouds(softShadow);
             gl.drawArrays(gl.TRIANGLES, 0, 3);
             gl.enable(gl.DEPTH_TEST);
             shadowTargets.historyValid = true;
@@ -972,7 +1058,7 @@ function init() {
             gl.uniformMatrix4fv(color.locations.mainViewProj, false, viewProjMatrix);
             gl.uniform1i(color.locations.rawOutput, mirrored ? 1 : 0);
             if (mirrored) gl.uniform1i(color.locations.atmosphereOn, 0);
-            gl.uniform1i(color.locations.shadowMask, 5 + shadowTargets.current);
+            gl.uniform1i(color.locations.shadowMask, 26); // the soft mask
             gl.uniform1i(color.locations.aoMask, 16 + shadowTargets.current);
             gl.uniform2f(color.locations.depthRange, NEAR, farPlane());
             gl.uniform2f(color.locations.maskScale,
@@ -1002,7 +1088,7 @@ function init() {
             gl.uniform2f(treeColor.locations.depthRange, NEAR, farPlane());
             gl.uniform1i(treeColor.locations.rawOutput, mirrored ? 1 : 0);
             if (mirrored) gl.uniform1i(treeColor.locations.atmosphereOn, 0);
-            gl.uniform1i(treeColor.locations.shadowMask, 5 + shadowTargets.current);
+            gl.uniform1i(treeColor.locations.shadowMask, 26);
             gl.uniform2f(treeColor.locations.maskScale,
                 shadowTargets.width / gl.drawingBufferWidth, shadowTargets.height / gl.drawingBufferHeight);
             gl.uniform1f(treeColor.locations.fogDensity, 1.2 / viewDistance());

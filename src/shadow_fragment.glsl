@@ -5,9 +5,9 @@ precision lowp usampler3D;
 precision highp sampler2D;
 precision highp sampler3D;
 
-// One shadow ray per half resolution pixel, written to the shadow mask read by the color pass:
-// r = lit (1) or in the shadow (0), g = face direction + 1 (0 = sky), b = face plane coordinate modulo 256,
-// a = light let through by the clouds (computed every frame: the clouds move).
+// One shadow ray per half resolution pixel, written to the raw shadow mask (softened by soft_shadow_fragment.glsl for
+// the color pass): r = lit (1) or in the shadow (0), g = face direction + 1 (0 = sky), b = face plane coordinate modulo
+// 256, a = distance to the occluder (encodeOccluder), for the size of the penumbra.
 // Second output: ambient occlusion of the surface by the voxels within AO_RADIUS (ray traced, accumulated over frames).
 uniform sampler2D halfDepth;
 uniform sampler2D halfFace;
@@ -42,8 +42,14 @@ const float AO_DISTANCE = 200.0;
 const int REFRESH_PERIOD = 8;
 const int TREE_FACE = 7; // face id of the tree pixels (tree_gbuffer_fragment.glsl)
 
-float reusedShadow(vec3 pos, int face, float plane, out bool found) {
+// distance to the occluder in 8 bits: finer close up (contact shadows), up to 2048 voxels
+float encodeOccluder(float d) {
+    return sqrt(clamp(d / 2048.0, 0.0, 1.0));
+}
+
+float reusedShadow(vec3 pos, int face, float plane, out bool found, out float occluder) {
     found = false;
+    occluder = 0.0;
     vec4 prev = prevViewProj * vec4(pos, 1.0);
     if(prev.w <= 0.0) return 0.0;
     vec2 uv = prev.xy / prev.w * 0.5 + 0.5;
@@ -52,13 +58,14 @@ float reusedShadow(vec3 pos, int face, float plane, out bool found) {
     vec2 h = uv * vec2(size) - 0.5;
     vec2 f = fract(h);
     ivec2 base = ivec2(floor(h));
-    float sum = 0.0, weightSum = 0.0, lo = 1.0, hi = 0.0;
+    float sum = 0.0, weightSum = 0.0, lo = 1.0, hi = 0.0, occluderSum = 0.0;
     for(int j = 0; j <= 1; j++) {
         for(int i = 0; i <= 1; i++) {
             vec4 m = texelFetch(historyMask, clamp(base + ivec2(i, j), ivec2(0), size - 1), 0);
             if(int(m.g * 255.0 + 0.5) - 1 == face && floor(m.b * 255.0 + 0.5) == plane) {
                 float w = max(mix(1.0 - f.x, f.x, float(i)) * mix(1.0 - f.y, f.y, float(j)), 1e-3);
                 sum += m.r * w;
+                occluderSum += m.a * w;
                 weightSum += w;
                 lo = min(lo, m.r);
                 hi = max(hi, m.r);
@@ -66,6 +73,7 @@ float reusedShadow(vec3 pos, int face, float plane, out bool found) {
         }
     }
     found = weightSum > 0.0 && hi - lo < 0.5;
+    occluder = found ? occluderSum / weightSum : 0.0; // already encoded
     return found ? sum / weightSum : 0.0;
 }
 
@@ -132,15 +140,18 @@ void main() {
         // a tree (not in the voxel textures): its terrain shadow from its surface, no normal, no occlusion here
         vec4 treePoint = invViewProj * vec4((vec2(p) + 0.5) / vec2(textureSize(halfDepth, 0)) * 2.0 - 1.0, texelFetch(halfDepth, p, 0).r * 2.0 - 1.0, 1.0);
         vec3 treePos = treePoint.xyz / treePoint.w;
-        float treeLit = 0.0, treeCloud = 1.0;
+        float treeLit = 0.0, treeOccluder = 0.0;
         if(sunDir.z > 0.0) {
-            treeCloud = cloudShadow(treePos, sunDir);
             bool found = false;
             bool refresh = refreshAll || ((p.x >> 3) + (p.y >> 3) * 3 + frameIndex) % REFRESH_PERIOD == 0;
-            if(!refresh) treeLit = reusedShadow(treePos, TREE_FACE, 0.0, found);
-            if(!found) treeLit = castShadowRay(treePos + sunDir * 0.3, sunDir);
+            if(!refresh) treeLit = reusedShadow(treePos, TREE_FACE, 0.0, found, treeOccluder);
+            if(!found) {
+                float d;
+                treeLit = traceShadow(treePos + sunDir * 0.3, sunDir, d);
+                treeOccluder = encodeOccluder(d);
+            }
         }
-        fragMask = vec4(treeLit, float(TREE_FACE + 1) / 255.0, 0.0, treeCloud);
+        fragMask = vec4(treeLit, float(TREE_FACE + 1) / 255.0, 0.0, treeOccluder);
         fragAO = vec4(1.0);
         return;
     }
@@ -158,19 +169,20 @@ void main() {
 
     float plane = mod(pos[axis], 256.0);
 
-    float lit = 0.0, cloud = 1.0;
+    float lit = 0.0, occluder = 0.0; // faces turned away from the light: sharp terminator
     if(dot(normal, sunDir) > 0.0) {
-        cloud = cloudShadow(pos, sunDir);
         bool found = false;
         bool refresh = refreshAll || ((p.x >> 3) + (p.y >> 3) * 3 + frameIndex) % REFRESH_PERIOD == 0;
         if(!refresh) {
-            lit = reusedShadow(pos, face, plane, found);
+            lit = reusedShadow(pos, face, plane, found, occluder);
         }
         if(!found) {
-            lit = castShadowRay(pos + normal * 0.01, sunDir);
+            float d;
+            lit = traceShadow(pos + normal * 0.01, sunDir, d);
+            occluder = encodeOccluder(d);
         }
     }
-    fragMask = vec4(lit, float(face + 1) / 255.0, plane / 255.0, cloud);
+    fragMask = vec4(lit, float(face + 1) / 255.0, plane / 255.0, occluder);
 
     float fade = smoothstep(AO_DISTANCE, AO_DISTANCE * 0.75, distance(pos, camPosition));
     if(fade <= 0.0) {

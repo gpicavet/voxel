@@ -18,34 +18,49 @@ const int COARSE_POW = 3; // must match constants.js
 const int MAX_STEPS = 256;
 const float MAX_TERRAIN = 121.0; // highest generated surface + 1 (MAX_HEIGHT of constants.js)
 const int HORIZON_STEPS = 320;   // 8 voxels each: 2560 voxels
+// Soft shadows: penumbra of a sun disk of this angular radius (radians), 3 times the real one so that the shadows of far
+// occluders read soft (the height map below; the voxels: soft_shadow_fragment.glsl, from the occluder distance)
+const float SUN_RADIUS = 0.014;
 
-// The ray left the loaded window sideways, at world position p, below the highest terrain: go on against the height map
-// of the generated terrain (bilinear, ignores caves and overhangs), until it rises above all the terrain or leaves the map.
-float horizonVisibility(vec3 p, vec3 rd) {
+// The ray left the loaded window sideways, at world position p (traveled: distance along the ray from its start), below
+// the highest terrain: go on against the height map of the generated terrain (bilinear, ignores caves and overhangs),
+// until it rises above all the terrain or leaves the map. Returns the part of the sun disk seen above the terrain: from
+// the lowest angle of the ray above it, seen from the start; occluder: distance of that lowest point.
+float horizonVisibility(vec3 p, vec3 rd, float traveled, out float occluder) {
+    occluder = 0.0;
     float horizontal = length(rd.xy);
     if(!horizonValid || horizontal < 1e-4) return 1.0;
     float dt = 8.0 / horizontal;
     vec2 last = vec2(textureSize(horizonTex, 0) - 2);
+    float margin = 1.0;
     for(int i = 1; i <= HORIZON_STEPS; i++) {
-        vec3 q = p + rd * (float(i) * dt);
-        if(q.z >= MAX_TERRAIN) return 1.0;
+        float s = float(i) * dt;
+        vec3 q = p + rd * s;
+        if(q.z >= MAX_TERRAIN) break;
         vec2 g = (q.xy - horizonOrigin) / horizonStep;
-        if(any(lessThan(g, vec2(0.0))) || any(greaterThan(g, last))) return 1.0;
+        if(any(lessThan(g, vec2(0.0))) || any(greaterThan(g, last))) break;
         ivec2 c = ivec2(g);
         vec2 f = g - vec2(c);
         float h = mix(mix(float(texelFetch(horizonTex, c, 0).r), float(texelFetch(horizonTex, c + ivec2(1, 0), 0).r), f.x),
             mix(float(texelFetch(horizonTex, c + ivec2(0, 1), 0).r), float(texelFetch(horizonTex, c + ivec2(1, 1), 0).r), f.x), f.y);
-        if(q.z < h) return 0.0;
+        float m = (q.z - h) * horizontal / (traveled + s); // angle of the ray above the terrain here
+        if(m < margin) {
+            margin = m;
+            occluder = traveled + s;
+        }
+        if(margin < -SUN_RADIUS) break; // the whole disk hidden
     }
-    return 1.0;
+    return smoothstep(-SUN_RADIUS, SUN_RADIUS, margin);
 }
 
 // Voxel traversal towards the light: every voxel crossed by the ray is tested (no fixed step that could
 // miss a corner), empty 8^3 then 2^3 blocks are crossed in one step. A ray that leaves the loaded window sideways, or
 // runs too long along the slopes (low sun), goes on against the coarse height map of the terrain: the distant mountains
 // cast their shadows at sunset, and neighbouring rays never alternate between lit and dark (bright streaks).
-// Returns 1 when lit, 0 in the shadow.
-float castShadowRay(vec3 startPos, vec3 rd) {
+// Returns 1 when lit, 0 in the shadow (between the two in the penumbra of the far terrain); occluder: distance to what
+// casts the shadow.
+float traceShadow(vec3 startPos, vec3 rd, out float occluder) {
+    occluder = 0.0;
     // light at or below the horizon: blocked by the terrain all around (the rays would run flat across the world)
     if(rd.z <= 0.0) return 0.0;
     rd = mix(rd, vec3(1e-6), lessThan(abs(rd), vec3(1e-6)));
@@ -59,6 +74,7 @@ float castShadowRay(vec3 startPos, vec3 rd) {
     for(int i = 0; i < MAX_STEPS; i++) {
         vec3 pos = ro + rd * t;
         if(pos.z < 0.0) {
+            occluder = t;
             return 0.0; // below the world: rock
         }
         if(pos.z >= windowSize.z) {
@@ -66,7 +82,7 @@ float castShadowRay(vec3 startPos, vec3 rd) {
         }
         if(any(lessThan(pos.xy, vec2(0.0))) || any(greaterThanEqual(pos.xy, windowSize.xy))) {
             // out of the loaded window: the terrain further away decides
-            return horizonVisibility(pos + windowMin, rd);
+            return horizonVisibility(pos + windowMin, rd, t, occluder);
         }
         ivec3 cell = ivec3(pos);
 
@@ -79,7 +95,8 @@ float castShadowRay(vec3 startPos, vec3 rd) {
             if(brick == 0u) {
                 boxPow = 1;
             } else if(((brick >> uint((cell.x & 1) | ((cell.y & 1) << 1) | ((cell.z & 1) << 2))) & 1u) != 0u) {
-                return 0.0; // Ombre
+                occluder = t;
+                return 0.0; // in the shadow
             } else {
                 boxPow = 0;
             }
@@ -93,7 +110,12 @@ float castShadowRay(vec3 startPos, vec3 rd) {
 
     // still close to the terrain after MAX_STEPS: a grazing ray (low sun) running along the slopes; the coarse height
     // map decides from there, like for the rays that leave the window
-    return horizonVisibility(ro + rd * t + windowMin, rd);
+    return horizonVisibility(ro + rd * t + windowMin, rd, t, occluder);
+}
+
+float castShadowRay(vec3 startPos, vec3 rd) {
+    float occluder;
+    return traceShadow(startPos, rd, occluder);
 }
 
 // Cheaper visibility of the light from a point in the air, for the light shafts: only the 8^3 coarse occupancy
