@@ -24,6 +24,8 @@ var underwaterFshader = require('./underwater_fragment.glsl');
 var treeVshader = require('./tree_vertex.glsl');
 var treeFshader = require('./tree_fragment.glsl');
 var treeGbufferFshader = require('./tree_gbuffer_fragment.glsl');
+var boxVshader = require('./box_vertex.glsl');
+var boxFshader = require('./box_fragment.glsl');
 var treeDepthFshader = require('./tree_depth_fragment.glsl');
 
 // per second, so the speed no longer depends on the frame rate (same feel as before at 60 fps)
@@ -361,6 +363,9 @@ function init() {
         [...TREE_UNIFORMS, "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", "reflectionPass", "seaLevel",
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS, ...TREE_SHADOW_UNIFORMS, ...CANOPY_UNIFORMS]);
     const treeGbuffer = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeGbufferFshader), TREE_UNIFORMS);
+    // boxes of the occlusion tests of the trees
+    const occlusionBox = createProgram(gl, compileShader(gl, gl.VERTEX_SHADER, boxVshader),
+        compileShader(gl, gl.FRAGMENT_SHADER, boxFshader), ["viewProj", "boxMin", "boxSize"]);
     const treeDepth = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeDepthFshader), TREE_UNIFORMS);
     const textureGen = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, textureGenFshader), ["layer", "size"]);
     createVoxelTextures(gl, textureGen, gl.TEXTURE13, gl.TEXTURE14);
@@ -834,7 +839,8 @@ function init() {
         renderTreeShadows(timeScale > 1);
         canopy.update(world, camPosition);
         frustumPlanes(treePlanes, viewProjMatrix);
-        trees.gather("camera", camPosition, treePlanes, viewDistance());
+        const occlusion = prepass && world.occlusionCulling;
+        trees.gather("camera", camPosition, treePlanes, viewDistance(), 0, occlusion);
 
         gl.enable(gl.DEPTH_TEST);
         gl.depthFunc(gl.LESS);
@@ -856,7 +862,10 @@ function init() {
             gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
             gl.useProgram(gbuffer.program);
             gl.uniformMatrix4fv(gbuffer.locations.viewProj, false, viewProjMatrix);
-            world.draw(visible, camPosition, gbuffer.locations, 2 * Math.tan(FOV / 2) / shadowTargets.height); // + tests
+            // chunks, each tested before being drawn, then the trees tested against the terrain before they are drawn
+            const pixelAngle = 2 * Math.tan(FOV / 2) / shadowTargets.height;
+            world.draw(visible, camPosition, gbuffer.locations, pixelAngle);
+            if (occlusion) world.testTrees(trees.tests, occlusionBox, viewProjMatrix, camPosition, pixelAngle);
             gl.useProgram(treeGbuffer.program);
             gl.uniformMatrix4fv(treeGbuffer.locations.viewProj, false, viewProjMatrix);
             gl.uniform1f(treeGbuffer.locations.windTime, waterTime);
@@ -1112,7 +1121,7 @@ function init() {
                 ` | cave culling ${world.caveCulling ? "on" : "off"} (c)` +
                 ` | occlusion culling ${world.occlusionCulling ? "on" : "off"} (o)` +
                 ` | ${(facesDrawn * 2 / 1e6).toFixed(2)} M triangles` +
-                ` | trees ${trees.sets.camera.trees} (${(trees.sets.camera.faces * 2 / 1e6).toFixed(2)} M triangles)` +
+                ` | trees ${trees.sets.camera.trees} (${(trees.sets.camera.faces * 2 / 1e6).toFixed(2)} M triangles), ${trees.sets.camera.occluded} occluded` +
                 (waterFaces > 0 ? ` | water ${(waterFaces / 1e3).toFixed(0)} k faces` : "") +
                 ` | ${canvas.width}x${canvas.height}` +
                 ` | pos ${Array.from(camPosition, v => v.toFixed(1)).join(" ")}` +
