@@ -185,7 +185,7 @@ export function buildMesh(padded, heights, origin, light = null) {
  * SEA_LEVEL), so that a crater dug in the bed or the shore fills up, and a closed cave stays dry. The fill reaches one
  * voxel into the neighbour chunks (the padding), so a crater across a chunk border fills on both sides.
  * Same vertex format as buildMesh, all 4 corners per face.
- * @returns null when the chunk has no water face
+ * @returns null when the chunk has no water face; min and max: bounds of the faces in the chunk (for the reflection)
  */
 export function buildWaterMesh(padded, heights, origin) {
     const [ox, oy, oz] = origin;
@@ -221,6 +221,7 @@ export function buildWaterMesh(padded, heights, origin) {
     }
 
     waterBucket.len = 0;
+    const min = [SIZE, SIZE, SIZE], max = [0, 0, 0];
     const zEnd = Math.min(surface, SIZE); // local z range of the water in the chunk: 0 .. zEnd - 1
     for (let x = 0; x < SIZE; x++) {
         for (let y = 0; y < SIZE; y++) {
@@ -233,12 +234,14 @@ export function buildWaterMesh(padded, heights, origin) {
                     // no face against the ground or between two water voxels
                     if (padded[j] !== 0 || water[j] !== 0) continue;
                     for (let k = 0; k < 4; k++) push(waterBucket, (base + CORNER_BITS[f * 4 + k]) | (f << 21) | (3 << 24));
+                    min[0] = Math.min(min[0], x); min[1] = Math.min(min[1], y); min[2] = Math.min(min[2], z);
+                    max[0] = Math.max(max[0], x + 1); max[1] = Math.max(max[1], y + 1); max[2] = Math.max(max[2], z + 1);
                 }
             }
         }
     }
     if (waterBucket.len === 0) return null;
-    return { vertices: waterBucket.data.slice(0, waterBucket.len), nFaces: waterBucket.len >> 2 };
+    return { vertices: waterBucket.data.slice(0, waterBucket.len), nFaces: waterBucket.len >> 2, min, max };
 }
 
 /**

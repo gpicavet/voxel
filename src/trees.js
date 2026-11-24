@@ -16,8 +16,9 @@ export class TreeRenderer {
         this.world = world;
         this.models = null; // built in a worker: setModels
         this.crowns = null;
-        // camera, tree shadow maps near the camera, far tree shadow map
-        this.sets = { camera: { buckets: [], trees: 0, faces: 0 }, shadow: { buckets: [], trees: 0, faces: 0 }, far: { buckets: [], trees: 0, faces: 0 } };
+        // camera, reflection in the water, tree shadow maps near the camera, far tree shadow map
+        const empty = () => ({ buckets: [], trees: 0, faces: 0 });
+        this.sets = { camera: empty(), reflection: empty(), shadow: empty(), far: empty() };
         this.min = new Float32Array(3);
         this.max = new Float32Array(3);
     }
@@ -33,7 +34,7 @@ export class TreeRenderer {
             return { ...model, buffer };
         }));
         this.crowns = this.models.map(lods => lods[0].crown);
-        this.sets = { camera: this.createSet(), shadow: this.createSet(), far: this.createSet() };
+        this.sets = { camera: this.createSet(), reflection: this.createSet(), shadow: this.createSet(), far: this.createSet() };
     }
 
     createSet() {
