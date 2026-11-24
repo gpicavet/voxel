@@ -47,6 +47,7 @@ export class Chunk {
         this.coarseFirst = new Int32Array(6);
         this.coarseCount = new Int32Array(6);
         this.far = false; // drawn coarse (hysteresis: world.js)
+        this.reflectionFar = false; // drawn coarse in the reflection of the water
         // occlusion culling (world.js)
         this.occluded = false;        // hidden at the last test: skipped
         this.occlusionTest = false;   // tested this frame
@@ -204,11 +205,10 @@ export class Chunk {
 
     /**
      * Draw the face directions that can be seen from the camera, in one call with WEBGL_multi_draw; the coarse mesh when
-     * this.far (and it is ready).
+     * coarse (it must be ready: hasCoarse).
      * @returns the number of faces drawn
      */
-    draw(gl, camPosition, multiDraw) {
-        const coarse = this.far && this.hasCoarse;
+    draw(gl, camPosition, multiDraw, coarse) {
         if ((coarse ? this.nCoarseFaces : this.nFaces) === 0) return 0;
         gl.bindVertexArray(coarse ? this.coarseArray : this.vertexArray);
         const faceCount = coarse ? this.coarseCount : this.faceCount, faceFirst = coarse ? this.coarseFirst : this.faceFirst;

@@ -26,6 +26,8 @@ var treeFshader = require('./tree_fragment.glsl');
 var treeGbufferFshader = require('./tree_gbuffer_fragment.glsl');
 var boxVshader = require('./box_vertex.glsl');
 var boxFshader = require('./box_fragment.glsl');
+var waterMaskVshader = require('./water_mask_vertex.glsl');
+var waterMaskFshader = require('./water_mask_fragment.glsl');
 var treeDepthFshader = require('./tree_depth_fragment.glsl');
 
 // per second, so the speed no longer depends on the frame rate (same feel as before at 60 fps)
@@ -321,7 +323,7 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "chunkScale", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals", "reflectionPass", "seaLevel", "aoMask", ...TREE_SHADOW_UNIFORMS, ...CANOPY_UNIFORMS,
+        ["mainViewProj", "reflectionMask", "viewProj", "chunkOrigin", "chunkScale", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals", "reflectionPass", "seaLevel", "aoMask", ...TREE_SHADOW_UNIFORMS, ...CANOPY_UNIFORMS,
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
         ["viewProj", "chunkOrigin", "chunkScale"]);
@@ -360,9 +362,12 @@ function init() {
     const treeVertexShader = compileShader(gl, gl.VERTEX_SHADER, treeVshader);
     const TREE_UNIFORMS = ["viewProj", "modelOrigin", "voxelSize", "windTime", "cutout", "voxelAlbedo", "voxelNormals", "leafTextures", "leafMotion"];
     const treeColor = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeFshader),
-        [...TREE_UNIFORMS, "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", "reflectionPass", "seaLevel",
+        [...TREE_UNIFORMS, "mainViewProj", "reflectionMask", "halfDepth", "depthRange", "camPosition", "halfResShadows", "shadowMask", "maskScale", "fogDensity", "reflectionPass", "seaLevel",
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS, ...TREE_SHADOW_UNIFORMS, ...CANOPY_UNIFORMS]);
     const treeGbuffer = createProgram(gl, treeVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, treeGbufferFshader), TREE_UNIFORMS);
+    // water seen from the camera, marked in the stencil of the reflection
+    const waterMask = createProgram(gl, compileShader(gl, gl.VERTEX_SHADER, waterMaskVshader),
+        compileShader(gl, gl.FRAGMENT_SHADER, waterMaskFshader), ["viewProj", "chunkOrigin", "seaLevel", "halfDepth", "targetSize"]);
     // boxes of the occlusion tests of the trees
     const occlusionBox = createProgram(gl, compileShader(gl, gl.VERTEX_SHADER, boxVshader),
         compileShader(gl, gl.FRAGMENT_SHADER, boxFshader), ["viewProj", "boxMin", "boxSize"]);
@@ -455,7 +460,7 @@ function init() {
     gl.uniform1i(color.locations.canopyTex, 20);
     gl.useProgram(treeColor.program);
     for (const [name, unit] of [["brickTex", 0], ["coarseTex", 1], ["horizonTex", 2], ["skyLUT", 7], ["cloudNoise", 8],
-        ["voxelAlbedo", 13], ["voxelNormals", 14], ["leafTextures", 19], ["canopyTex", 20], ["leafMotion", 21]]) {
+        ["halfDepth", 3], ["voxelAlbedo", 13], ["voxelNormals", 14], ["leafTextures", 19], ["canopyTex", 20], ["leafMotion", 21]]) {
         gl.uniform1i(treeColor.locations[name], unit);
     }
     gl.uniform1f(treeColor.locations.seaLevel, SEA_LEVEL);
@@ -465,6 +470,9 @@ function init() {
     gl.uniform1i(treeGbuffer.locations.leafMotion, 21);
     gl.useProgram(color.program);
     gl.uniform1f(color.locations.seaLevel, SEA_LEVEL);
+    gl.useProgram(waterMask.program);
+    gl.uniform1i(waterMask.locations.halfDepth, 3);
+    gl.uniform1f(waterMask.locations.seaLevel, SEA_LEVEL);
     gl.useProgram(water.program);
     gl.uniform1i(water.locations.skyLUT, 7);
     gl.uniform1i(water.locations.cloudNoise, 8);
@@ -507,10 +515,10 @@ function init() {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
         const depth = gl.createRenderbuffer();
         gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
-        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, width, height);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH24_STENCIL8, width, height); // stencil: where the water is seen
         const framebuffer = createFramebuffer(gl, texture, null);
         gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.RENDERBUFFER, depth);
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         gl.activeTexture(gl.TEXTURE0);
         return { width, height, texture, depth, framebuffer };
@@ -954,6 +962,9 @@ function init() {
             gl.uniform3fv(color.locations.camPosition, eye);
             gl.uniform1i(color.locations.halfResShadows, halfResShadows && !mirrored ? 1 : 0);
             gl.uniform1i(color.locations.reflectionPass, mirrored ? 1 : 0);
+            // the reflection takes the shadows of the camera's mask where the camera sees the same surface
+            gl.uniform1i(color.locations.reflectionMask, mirrored && halfResShadows ? 1 : 0);
+            gl.uniformMatrix4fv(color.locations.mainViewProj, false, viewProjMatrix);
             gl.uniform1i(color.locations.rawOutput, mirrored ? 1 : 0);
             if (mirrored) gl.uniform1i(color.locations.atmosphereOn, 0);
             gl.uniform1i(color.locations.shadowMask, 5 + shadowTargets.current);
@@ -965,7 +976,7 @@ function init() {
             setShadowWindow(color);
             setTreeShadow(color);
             setCanopy(color);
-            return world.draw(chunks, eye, color.locations);
+            return world.draw(chunks, eye, color.locations, 0, mirrored);
         }
 
         // trees, shaded like the terrain; mirrored = in the reflection of the water
@@ -981,6 +992,9 @@ function init() {
             gl.uniform3fv(treeColor.locations.camPosition, eye);
             gl.uniform1i(treeColor.locations.halfResShadows, halfResShadows && !mirrored ? 1 : 0);
             gl.uniform1i(treeColor.locations.reflectionPass, mirrored ? 1 : 0);
+            gl.uniform1i(treeColor.locations.reflectionMask, mirrored && halfResShadows ? 1 : 0);
+            gl.uniformMatrix4fv(treeColor.locations.mainViewProj, false, viewProjMatrix);
+            gl.uniform2f(treeColor.locations.depthRange, NEAR, farPlane());
             gl.uniform1i(treeColor.locations.rawOutput, mirrored ? 1 : 0);
             if (mirrored) gl.uniform1i(treeColor.locations.atmosphereOn, 0);
             gl.uniform1i(treeColor.locations.shadowMask, 5 + shadowTargets.current);
@@ -989,6 +1003,29 @@ function init() {
             gl.uniform1f(treeColor.locations.fogDensity, 1.2 / viewDistance());
             setShadowWindow(treeColor);
             trees.draw(setName, treeColor.locations);
+        }
+
+        // stencil of the reflection target: 1 on the water faces seen from the camera (water_mask_fragment.glsl)
+        function markWater(chunks) {
+            gl.useProgram(waterMask.program);
+            gl.uniformMatrix4fv(waterMask.locations.viewProj, false, viewProjMatrix);
+            gl.uniform2f(waterMask.locations.targetSize, reflection.width, reflection.height);
+            gl.enable(gl.STENCIL_TEST);
+            gl.stencilFunc(gl.ALWAYS, 1, 0xff);
+            gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE);
+            gl.colorMask(false, false, false, false);
+            gl.depthMask(false);
+            gl.disable(gl.DEPTH_TEST);
+            gl.disable(gl.CULL_FACE);
+            for (const chunk of chunks) {
+                gl.uniform3fv(waterMask.locations.chunkOrigin, chunk.pos);
+                chunk.drawWater(gl);
+            }
+            gl.bindVertexArray(null);
+            gl.enable(gl.CULL_FACE);
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthMask(true);
+            gl.colorMask(true, true, true, true);
         }
 
         // sky on the far plane: only the pixels the terrain left empty are shaded
@@ -1033,12 +1070,22 @@ function init() {
             const px = Math.floor((x0 + 1) * 0.5 * w), py = Math.floor((y0 + 1) * 0.5 * h);
             gl.enable(gl.SCISSOR_TEST);
             gl.scissor(px, py, Math.ceil((x1 + 1) * 0.5 * w) - px, Math.ceil((y1 + 1) * 0.5 * h) - py);
-            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+            // only where the water is seen (in front of the terrain and the trees of the pre-pass, or close to it): the
+            // rest of the rectangle keeps the cleared alpha 0, and the water reads the texel right here instead
+            const masked = prepass;
+            if (masked) {
+                markWater(waterChunks);
+                gl.enable(gl.STENCIL_TEST);
+                gl.stencilFunc(gl.EQUAL, 1, 0xff);
+                gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+            }
             gl.cullFace(gl.FRONT); // the mirror flips the winding
             drawTerrainColor(world.cullReflection(narrowed, mirroredCamPosition), reflViewProjMatrix, mirroredCamPosition, true);
             drawTrees(reflViewProjMatrix, mirroredCamPosition, true, "reflection");
             gl.cullFace(gl.BACK);
             drawSky(reflInvViewProjMatrix, mirroredCamPosition, true);
+            gl.disable(gl.STENCIL_TEST);
             gl.disable(gl.SCISSOR_TEST);
             gl.bindFramebuffer(gl.FRAMEBUFFER, null);
             gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);

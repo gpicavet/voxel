@@ -12,6 +12,10 @@ uniform sampler2D shadowMask; // half resolution mask: tree texels have the face
 uniform vec2 maskScale;
 uniform float fogDensity;
 uniform bool reflectionPass;
+uniform bool reflectionMask;  // in the reflection, the shadows of the camera's mask where it sees the same tree
+uniform mat4 mainViewProj;    // the camera (not mirrored)
+uniform sampler2D halfDepth;  // depth of the half resolution pass
+uniform vec2 depthRange;      // near and far planes
 uniform float seaLevel;
 
 in vec3 vPosition;
@@ -38,6 +42,7 @@ out vec4 fragColor;
 @import ./tree_shadow;
 @import ./tree_surface;
 @import ./canopy;
+@import ./reflection_mask;
 
 const int TREE_FACE = 7;
 const float NEAR_FALLBACK = 40.0;
@@ -135,8 +140,14 @@ void main() {
 
     float shadow = 0.0;
     if(diffuse > 0.0 && toLight.z > 0.0) {
-        vec2 s = halfResShadows ? maskShadow(toLight)
-            : vec2(castShadowRay(vPosition + toLight * 0.3, toLight), cloudShadow(vPosition, toLight));
+        vec2 s;
+        if(halfResShadows) {
+            s = maskShadow(toLight);
+        } else {
+            // in the reflection, from the camera's mask where it sees this tree too; a ray elsewhere
+            s = reflectionMask ? cameraMaskShadow(vPosition, TREE_FACE, -1.0) : vec2(-1.0);
+            if(s.x < 0.0) s = vec2(castShadowRay(vPosition + toLight * 0.3, toLight), cloudShadow(vPosition, toLight));
+        }
         shadow = s.x * s.y * treeShadow(vRestPosition, n);
     }
     float skyAccess = 0.02 + 0.98 * pow(0.8, (1.0 - vSkyLight) * 15.0);

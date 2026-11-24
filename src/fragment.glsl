@@ -16,6 +16,8 @@ uniform vec2 depthRange;      // near and far planes
 uniform float fogDensity;     // set from the view distance, so that chunks appear in the fog
 uniform sampler2DArray voxelAlbedo;  // textures.js: 0 earth, 1 rock, 2 grass, 3 snow, 4 sand
 uniform bool reflectionPass;  // rendering the mirrored scene for the water: nothing below the water, no mist
+uniform bool reflectionMask;  // in the reflection, the shadows of the camera's mask where it sees the same surface
+uniform mat4 mainViewProj;    // the camera (not mirrored)
 uniform float seaLevel;
 uniform sampler2DArray voxelNormals; // tangent space normal maps of the same layers
 
@@ -37,6 +39,7 @@ out vec4 fragColor;
 @import ./surface_atmosphere;
 @import ./tree_shadow;
 @import ./canopy;
+@import ./reflection_mask;
 
 // start of the shadow ray: on the face plane (an integer coordinate: removes the interpolation error, which grows
 // far from the origin), just in front of the face
@@ -155,7 +158,9 @@ void main() {
         shadow = ndotl > 0.0 ? s.x * s.y : 0.0; // terrain x clouds
         occlusion = s.z;
     } else if(ndotl > 0.0) {
-        shadow = castShadowRay(rayStart(), toLight) * cloudShadow(vPosition, toLight);
+        // in the reflection, from the camera's mask where it sees this same surface; a ray elsewhere
+        vec2 m = reflectionMask ? cameraMaskShadow(vPosition, vFace, mod(floor(vPosition[vFace >> 1] + 0.5), 256.0)) : vec2(-1.0);
+        shadow = m.x >= 0.0 ? m.x * m.y : castShadowRay(rayStart(), toLight) * cloudShadow(vPosition, toLight);
     }
 
     // shadows of the trees (shadow map)

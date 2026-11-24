@@ -105,8 +105,15 @@ void main() {
 
         vec3 reflection;
         if(reflectionOn && vFace == 4) {
-            vec2 uv = gl_FragCoord.xy / screenSize + n.xy * 0.045;
-            reflection = texture(reflectionTex, clamp(uv, vec2(0.001), vec2(0.999))).rgb;
+            // the reflection is only rendered where the water is seen (and a little around): a texel outside it (alpha
+            // 0, the waves read the reflection a little aside) is replaced by the one right here
+            vec2 here = gl_FragCoord.xy / screenSize;
+            vec4 aside = texture(reflectionTex, clamp(here + n.xy * 0.045, vec2(0.001), vec2(0.999)));
+            if(aside.a < 0.999) {
+                vec4 h = texture(reflectionTex, here);
+                aside.rgb += (1.0 - aside.a) * (h.a > 0.01 ? h.rgb / h.a : skyRadiance(r));
+            }
+            reflection = aside.rgb;
         } else {
             reflection = skyRadiance(r);
         }
