@@ -20,6 +20,10 @@ import workerSource from "../build/worker.js?raw";
 export const WINDOW = 16; // columns: 1024 voxels
 const HALF_WINDOW = WINDOW / 2;
 const WINDOW_HEIGHT = CHUNKS_PER_COLUMN * CHUNK_SIZE;
+// View distance, in columns (+/- keys): columns are meshed within this radius, also beyond the shadow window (their
+// shadow rays go on against the horizon height map at once, no ray traced ambient occlusion: far in the fog).
+const VIEW_RADIUS = 9;      // fog at 544 voxels (main.js)
+const MAX_VIEW_RADIUS = 12;
 
 const ZERO_BRICKS = new Uint8Array(BRICK_BYTES);
 const FULL_BRICKS = new Uint8Array(BRICK_BYTES).fill(0xff);
@@ -27,6 +31,10 @@ const ZERO_COARSE = new Uint8Array(COARSE_BYTES);
 const FULL_COARSE = new Uint8Array(COARSE_BYTES).fill(1);
 
 const RESULT_BUDGET_MS = 6;  // per frame, for uploading generated columns
+// Chunks farther than this (horizontally, from the eye to the nearest point of the chunk) are drawn with their coarse
+// mesh (voxels twice as large, a few times fewer faces); back to the real voxels a little closer (no flickering at the
+// limit).
+const FAR_DISTANCE = 384, FAR_HYSTERESIS = 16;
 
 /** Generation and meshing in web workers; on the main thread, one column per frame, if workers are not available. */
 class WorkerPool {
@@ -121,7 +129,7 @@ export class World {
         this.columns = new Map();
         this.edits = new Map();        // column key -> modified chunks of an unloaded column
         this.treeRemovals = new Map(); // column key -> ids of the trees destroyed by explosions (kept when unloaded)
-        this.viewRadius = HALF_WINDOW; // in columns: 8 = 512 voxels
+        this.viewRadius = VIEW_RADIUS;
         this.camColumn = null;
         this.queue = [];               // column requests, nearest last
         this.results = [];
@@ -161,7 +169,7 @@ export class World {
     }
 
     setViewRadius(radius) {
-        this.viewRadius = Math.max(2, Math.min(HALF_WINDOW, radius));
+        this.viewRadius = Math.max(2, Math.min(MAX_VIEW_RADIUS, radius));
         this.camColumn = null; // plan again
     }
 
@@ -251,22 +259,28 @@ export class World {
         const [ccx, ccy] = this.camColumn;
         const radius = this.viewRadius;
 
+        // kept: the shadow window and the meshed columns, with a margin (no reload when the camera goes back and forth)
         for (const column of this.columns.values()) {
             const inWindow = Math.abs(column.cx - ccx + 0.5) <= HALF_WINDOW + 1 && Math.abs(column.cy - ccy + 0.5) <= HALF_WINDOW + 1;
-            if (!inWindow) {
+            const meshed = Math.hypot(column.cx - ccx, column.cy - ccy) <= radius + 1.5;
+            if (!inWindow && !meshed) {
                 this.unloadColumn(column);
-            } else if (column.hasMesh && Math.hypot(column.cx - ccx, column.cy - ccy) > radius + 1.5) {
+            } else if (column.hasMesh && !meshed) {
                 for (const chunk of column.chunks) chunk.freeMesh(gl);
                 column.hasMesh = false;
             }
         }
 
+        // loaded: the voxels of the shadow window (shadows only, beyond the view distance), and the meshed columns
         this.queue = [];
-        for (let cx = ccx - HALF_WINDOW; cx < ccx + HALF_WINDOW; cx++) {
-            for (let cy = ccy - HALF_WINDOW; cy < ccy + HALF_WINDOW; cy++) {
+        const reach = Math.max(HALF_WINDOW, Math.ceil(radius));
+        for (let cx = ccx - reach; cx <= ccx + reach; cx++) {
+            for (let cy = ccy - reach; cy <= ccy + reach; cy++) {
                 if (!insideWorld(cx, cy)) continue;
                 const distance = Math.hypot(cx - ccx, cy - ccy);
                 const mesh = distance <= radius;
+                const inWindow = cx >= ccx - HALF_WINDOW && cx < ccx + HALF_WINDOW && cy >= ccy - HALF_WINDOW && cy < ccy + HALF_WINDOW;
+                if (!mesh && !inWindow) continue;
                 const column = this.columns.get(columnKey(cx, cy));
                 if (!column) {
                     this.queue.push({ cx, cy, distance, mesh });
@@ -311,8 +325,9 @@ export class World {
             result.chunks.forEach((data, i) => {
                 const chunk = column.chunks[i];
                 if (data.mesh) {
-                    this.ensureIndexCapacity(data.mesh.nFaces);
+                    this.ensureIndexCapacity(Math.max(data.mesh.nFaces, data.coarseMesh.nFaces));
                     chunk.upload(gl, data.mesh, this.indexBuffer);
+                    chunk.uploadCoarse(gl, data.coarseMesh, this.indexBuffer);
                 } else {
                     chunk.freeMesh(gl);
                 }
@@ -425,6 +440,7 @@ export class World {
         chunk.connectivity = faceConnectivity(padded); // the voxels changed: so may the openings
         this.ensureIndexCapacity(mesh.nFaces);
         chunk.upload(this.gl, mesh, this.indexBuffer);
+        chunk.uploadCoarse(this.gl, null); // drawn with its real voxels until the workers send the new coarse mesh
         const water = buildWaterMesh(padded, column.heights, chunk.pos);
         if (water) this.ensureIndexCapacity(water.nFaces);
         chunk.uploadWater(this.gl, water, this.indexBuffer);
@@ -688,11 +704,21 @@ export class World {
     }
 
     /** @returns the number of faces drawn */
-    draw(chunks, camPosition, chunkOriginLocation) {
+    /**
+     * @param locations of the program: chunkOrigin, chunkScale (1, or 2 for the coarse meshes of the far chunks)
+     */
+    draw(chunks, camPosition, locations) {
         const gl = this.gl;
         let faces = 0;
         for (const chunk of chunks) {
-            gl.uniform3fv(chunkOriginLocation, chunk.pos);
+            // horizontal distance to the chunk (the mirrored eye of the reflection gives the same)
+            const dx = Math.max(chunk.aabbMin[0] - camPosition[0], 0, camPosition[0] - chunk.aabbMax[0]);
+            const dy = Math.max(chunk.aabbMin[1] - camPosition[1], 0, camPosition[1] - chunk.aabbMax[1]);
+            const d = Math.hypot(dx, dy);
+            if (d > FAR_DISTANCE + FAR_HYSTERESIS) chunk.far = true;
+            else if (d < FAR_DISTANCE - FAR_HYSTERESIS) chunk.far = false;
+            gl.uniform3fv(locations.chunkOrigin, chunk.pos);
+            gl.uniform1f(locations.chunkScale, chunk.far && chunk.hasCoarse ? 2 : 1);
             faces += chunk.draw(gl, camPosition, this.multiDraw);
         }
         gl.bindVertexArray(null);

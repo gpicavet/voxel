@@ -5,7 +5,8 @@ Using Ray-traced shadows.
 The world is 28 800 x 28 800 voxels (450 x 450 chunks of 64^3) and 256 high: mountains up to 120 above the ground,
 128 of underground with tunnels and caverns. The height map is shaped in 3D near the surface: ledges, recesses and
 overhangs on the slopes, rock outcrops on the ground, cave mouths opening on the hillsides.
-Chunks are generated and meshed in web workers and loaded around the camera.
+Chunks are generated and meshed in web workers and loaded around the camera; beyond 384 m they are drawn with a
+coarse mesh (voxels twice as large, about 7 times fewer faces).
 
 Day and night cycle with a physical sky (Rayleigh and Mie scattering), sun and moon shadows, voxel clouds drifting with
 the wind and casting shadows, light shafts (god rays) and valley mist. Realistic textures (512 x 512, albedo and normal map) generated on the GPU at startup.

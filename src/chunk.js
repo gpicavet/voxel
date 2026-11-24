@@ -39,6 +39,14 @@ export class Chunk {
         this.nFaces = 0;
         this.faceFirst = new Int32Array(6);
         this.faceCount = new Int32Array(6);
+        // the same chunk with voxels twice as large (columnTask.js), drawn far away (world.js)
+        this.coarseArray = null;
+        this.coarseBuffer = null;
+        this.hasCoarse = false;
+        this.nCoarseFaces = 0;
+        this.coarseFirst = new Int32Array(6);
+        this.coarseCount = new Int32Array(6);
+        this.far = false; // drawn coarse (hysteresis: world.js)
         this.waterVertexArray = null;
         this.waterBuffer = null;
         this.nWaterFaces = 0;
@@ -111,21 +119,24 @@ export class Chunk {
     }
 
     upload(gl, mesh, indexBuffer) {
-        if (this.vertexArray == null) {
-            this.vertexArray = gl.createVertexArray();
-            this.vertexBuffer = gl.createBuffer();
-            gl.bindVertexArray(this.vertexArray);
-            gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
-            gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 4, 0);
-            gl.enableVertexAttribArray(0);
-            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
-            gl.bindVertexArray(null);
-        }
+        if (this.vertexArray == null) [this.vertexArray, this.vertexBuffer] = createVertexArray(gl, indexBuffer);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
         gl.bufferData(gl.ARRAY_BUFFER, mesh.vertices, gl.STATIC_DRAW);
         this.faceFirst.set(mesh.faceFirst);
         this.faceCount.set(mesh.faceCount);
         this.nFaces = mesh.nFaces;
+    }
+
+    /** coarse mesh, or null: the voxels changed and the coarse mesh is not made yet (drawn with the real voxels) */
+    uploadCoarse(gl, mesh, indexBuffer) {
+        this.hasCoarse = mesh !== null;
+        if (!mesh) return;
+        if (this.coarseArray == null) [this.coarseArray, this.coarseBuffer] = createVertexArray(gl, indexBuffer);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.coarseBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, mesh.vertices, gl.STATIC_DRAW);
+        this.coarseFirst.set(mesh.faceFirst);
+        this.coarseCount.set(mesh.faceCount);
+        this.nCoarseFaces = mesh.nFaces;
     }
 
     /** water mesh (or null), drawn in its own transparent pass */
@@ -173,18 +184,29 @@ export class Chunk {
             this.vertexBuffer = null;
         }
         this.nFaces = 0;
+        if (this.coarseArray !== null) {
+            gl.deleteVertexArray(this.coarseArray);
+            gl.deleteBuffer(this.coarseBuffer);
+            this.coarseArray = null;
+            this.coarseBuffer = null;
+        }
+        this.hasCoarse = false;
+        this.nCoarseFaces = 0;
     }
 
     /**
-     * Draw the face directions that can be seen from the camera, in one call with WEBGL_multi_draw.
+     * Draw the face directions that can be seen from the camera, in one call with WEBGL_multi_draw; the coarse mesh when
+     * this.far (and it is ready).
      * @returns the number of faces drawn
      */
     draw(gl, camPosition, multiDraw) {
-        if (this.nFaces === 0) return 0;
-        gl.bindVertexArray(this.vertexArray);
+        const coarse = this.far && this.hasCoarse;
+        if ((coarse ? this.nCoarseFaces : this.nFaces) === 0) return 0;
+        gl.bindVertexArray(coarse ? this.coarseArray : this.vertexArray);
+        const faceCount = coarse ? this.coarseCount : this.faceCount, faceFirst = coarse ? this.coarseFirst : this.faceFirst;
         let drawn = 0, n = 0;
         for (let f = 0; f < 6; f++) {
-            const count = this.faceCount[f];
+            const count = faceCount[f];
             if (count === 0) continue;
             // +x faces lie on planes x in ]min, max], they can only be seen from x > min, and so on
             const axis = f >> 1;
@@ -193,7 +215,7 @@ export class Chunk {
                 : camPosition[axis] < this.aabbMax[axis];
             if (!visible) continue;
             drawCounts[n] = count * 6;
-            drawOffsets[n] = this.faceFirst[f] * 6 * 4;
+            drawOffsets[n] = faceFirst[f] * 6 * 4;
             n++;
             drawn += count;
         }
@@ -208,3 +230,15 @@ export class Chunk {
 
 const drawCounts = new Int32Array(6);
 const drawOffsets = new Int32Array(6);
+
+/** vertex array of a chunk mesh: one packed uint32 per vertex, the shared index buffer */
+function createVertexArray(gl, indexBuffer) {
+    const vertexArray = gl.createVertexArray(), buffer = gl.createBuffer();
+    gl.bindVertexArray(vertexArray);
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.vertexAttribIPointer(0, 1, gl.UNSIGNED_INT, 4, 0);
+    gl.enableVertexAttribArray(0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+    gl.bindVertexArray(null);
+    return [vertexArray, buffer];
+}

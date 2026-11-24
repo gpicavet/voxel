@@ -7,7 +7,6 @@ export const EARTH = 0, ROCK = 1, GRASS = 2, SNOW = 3, SAND = 4, GRASS_FULL = 5,
 
 const SIZE = CHUNK_SIZE;
 const PP = P * P;
-const STRIDES = [PP, P, 1];
 const SNOW_LINE = 90;
 
 // Face order: +x, -x, +y, -y, +z, -z. Corners are counter-clockwise seen from outside.
@@ -20,24 +19,32 @@ export const FACES = [
     { n: [0, 0, -1], c: [[1, 1, 0], [1, 0, 0], [0, 0, 0], [0, 1, 0]] },
 ];
 
-// Precomputed per face: offset of the neighbour in the padded array, and for each corner
-// the packed corner position and the offsets of the 3 voxels used for ambient occlusion.
-const FACE_NEIGHBOR = new Int32Array(6);
+// Precomputed per face, for a padded grid of size + 2 per side: offset of the neighbour, and for each corner the offsets
+// of the 3 voxels used for ambient occlusion. And the packed corner positions (the same for every size).
 const CORNER_BITS = new Uint32Array(24);
-const AO_SIDE1 = new Int32Array(24), AO_SIDE2 = new Int32Array(24), AO_CORNER = new Int32Array(24);
-FACES.forEach((face, f) => {
-    const axis = face.n.findIndex(v => v !== 0);
-    const [u, v] = [0, 1, 2].filter(a => a !== axis);
-    const nOff = face.n[0] * STRIDES[0] + face.n[1] * STRIDES[1] + face.n[2] * STRIDES[2];
-    FACE_NEIGHBOR[f] = nOff;
-    face.c.forEach((c, k) => {
-        const du = c[u] ? 1 : -1, dv = c[v] ? 1 : -1;
-        CORNER_BITS[f * 4 + k] = c[0] | (c[1] << 7) | (c[2] << 14);
-        AO_SIDE1[f * 4 + k] = nOff + du * STRIDES[u];
-        AO_SIDE2[f * 4 + k] = nOff + dv * STRIDES[v];
-        AO_CORNER[f * 4 + k] = nOff + du * STRIDES[u] + dv * STRIDES[v];
+function faceTables(size) {
+    const p = size + 2, strides = [p * p, p, 1];
+    const t = { size, p, pp: p * p, neighbor: new Int32Array(6), side1: new Int32Array(24), side2: new Int32Array(24), corner: new Int32Array(24) };
+    FACES.forEach((face, f) => {
+        const axis = face.n.findIndex(v => v !== 0);
+        const [u, v] = [0, 1, 2].filter(a => a !== axis);
+        const nOff = face.n[0] * strides[0] + face.n[1] * strides[1] + face.n[2] * strides[2];
+        t.neighbor[f] = nOff;
+        face.c.forEach((c, k) => {
+            const du = c[u] ? 1 : -1, dv = c[v] ? 1 : -1;
+            CORNER_BITS[f * 4 + k] = c[0] | (c[1] << 7) | (c[2] << 14);
+            t.side1[f * 4 + k] = nOff + du * strides[u];
+            t.side2[f * 4 + k] = nOff + dv * strides[v];
+            t.corner[f * 4 + k] = nOff + du * strides[u] + dv * strides[v];
+        });
     });
-});
+    return t;
+}
+const TABLES = faceTables(SIZE);
+const FACE_NEIGHBOR = TABLES.neighbor; // the water mesh: real voxels only
+// coarse voxels (2 x 2 x 2): the far chunks (columnTask.js)
+export const COARSE_SIZE = SIZE / 2;
+const COARSE_TABLES = faceTables(COARSE_SIZE);
 
 // One growable list of packed vertices per face direction, reused between chunks.
 const buckets = FACES.map(() => ({ data: new Uint32Array(1 << 16), len: 0 }));
@@ -79,7 +86,7 @@ function patches(wx, wy, cell, k) {
  * of blocks with grass or snow on all their faces, and of bare earth.
  * Depending on the original surface, a voxel keeps its material when the terrain around it is destroyed.
  */
-function material(heights, x, y, wx, wy, wz) {
+export function material(heights, x, y, wx, wy, wz) {
     const hi = (x + 1) * P + (y + 1);
     const depth = heights[hi] - 1 - wz;
     // lake beds and beaches
@@ -108,24 +115,28 @@ function material(heights, x, y, wx, wy, wz) {
  * @param origin world position of the chunk
  * @param light sky light (0 .. 15) of the padded voxels, or null (open sky everywhere: quick remesh after an explosion,
  * until the workers send the lit mesh)
+ * @param materials null for a chunk of real voxels; for a coarse chunk (COARSE_SIZE + 2 per side, positions in coarse
+ * voxels), the material of each padded voxel (heights unused)
  */
-export function buildMesh(padded, heights, origin, light = null) {
+export function buildMesh(padded, heights, origin, light = null, materials = null) {
     for (const b of buckets) b.len = 0;
     const [ox, oy, oz] = origin;
+    const t = materials ? COARSE_TABLES : TABLES, size = t.size, p = t.p, pp = t.pp;
+    const neighbor = t.neighbor, side1 = t.side1, side2 = t.side2, corner = t.corner;
 
-    for (let x = 0; x < SIZE; x++) {
-        for (let y = 0; y < SIZE; y++) {
-            let pi = (x + 1) * PP + (y + 1) * P;
-            for (let z = 0; z < SIZE; z++) {
+    for (let x = 0; x < size; x++) {
+        for (let y = 0; y < size; y++) {
+            let pi = (x + 1) * pp + (y + 1) * p;
+            for (let z = 0; z < size; z++) {
                 pi++;
                 if (padded[pi] === 0) continue;
 
                 let base = -1;
                 for (let f = 0; f < 6; f++) {
-                    if (padded[pi + FACE_NEIGHBOR[f]] !== 0) continue;
+                    if (padded[pi + neighbor[f]] !== 0) continue;
 
                     if (base < 0) {
-                        const mat = material(heights, x, y, ox + x, oy + y, oz + z);
+                        const mat = materials ? materials[pi] : material(heights, x, y, ox + x, oy + y, oz + z);
                         base = x | (y << 7) | (z << 14) | (mat << 26);
                     }
 
@@ -134,7 +145,7 @@ export function buildMesh(padded, heights, origin, light = null) {
                     const ao = aoScratch, sky = skyScratch;
                     for (let k = 0; k < 4; k++) {
                         const i = f * 4 + k;
-                        const j1 = pi + AO_SIDE1[i], j2 = pi + AO_SIDE2[i], jc = pi + AO_CORNER[i];
+                        const j1 = pi + side1[i], j2 = pi + side2[i], jc = pi + corner[i];
                         const s1 = padded[j1] !== 0 ? 1 : 0;
                         const s2 = padded[j2] !== 0 ? 1 : 0;
                         const co = padded[jc] !== 0 ? 1 : 0;
@@ -142,7 +153,7 @@ export function buildMesh(padded, heights, origin, light = null) {
                         if (light === null) {
                             sky[k] = 7;
                         } else {
-                            const jn = pi + FACE_NEIGHBOR[f];
+                            const jn = pi + neighbor[f];
                             let sum = light[jn], n = 1;
                             if (!s1) { sum += light[j1]; n++; }
                             if (!s2) { sum += light[j2]; n++; }

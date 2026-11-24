@@ -1,6 +1,6 @@
 import { CHUNK_SIZE, CZ_MAX, CZ_MIN, SEA_LEVEL, SEED, WORLD_BOTTOM } from './constants';
 import { createGenerator, P } from './generator';
-import { buildMesh, buildWaterMesh, coarseFromBricks, packBricks } from './mesher';
+import { buildMesh, buildWaterMesh, COARSE_SIZE, coarseFromBricks, material, packBricks } from './mesher';
 import { computeSkylight, LIGHT_MARGIN } from './skylight';
 import { placeTrees } from './treePlacement';
 import { faceConnectivity, uniformConnectivity } from './visibility';
@@ -15,6 +15,77 @@ const NX = CHUNK_SIZE + 2 * M, NY = NX;
 const NZ = (CZ_MAX - CZ_MIN + 1) * CHUNK_SIZE + 2; // from the voxel below the world to the voxel above it
 const Z0 = WORLD_BOTTOM - 1;
 let region = null, light = null;
+
+// coarse voxels of a chunk with one around (far mesh)
+const CP = COARSE_SIZE + 2;
+const coarsePadded = new Uint8Array(CP * CP * CP), coarseLight = new Uint8Array(CP * CP * CP), coarseMaterials = new Uint8Array(CP * CP * CP);
+
+// real voxels covered by coarse voxel c on one axis: 2 inside the chunk; in the padding, the layer touching the chunk
+function span(c) {
+    return c < 0 ? -1 : c >= COARSE_SIZE ? CHUNK_SIZE : 2 * c;
+}
+function spanEnd(c) {
+    return c < 0 ? -1 : c >= COARSE_SIZE ? CHUNK_SIZE : 2 * c + 1;
+}
+const coarseTop = new Int32Array(CP * CP * CP); // highest solid real voxel of each coarse one: region index, or -1
+const CPP = CP * CP;
+const COARSE_NEIGHBORS = [CPP, -CPP, CP, -CP, 1, -1];
+
+/**
+ * Coarse voxels (2 x 2 x 2 real ones) of chunk cz of the box, for the mesh of the far chunks. Solid if one of the 8 is:
+ * the coarse surface is never below the real one, so the shadow and occlusion rays traced from it start in the air. The
+ * padding is solid only if the whole layer of real voxels touching the chunk is: a face is made on the border wherever
+ * the neighbour, drawn coarse or not, could leave a gap. Light: the brightest of the air voxels; material (of the ones
+ * next to the air): the one of the highest solid voxel.
+ * @param heights heights of the chunk column (index (x + 1) * P + (y + 1)), for the materials
+ */
+function coarseChunk(cz, heights, origin) {
+    const zBase = cz * CHUNK_SIZE - Z0;
+    let ci = 0;
+    for (let cx = -1; cx <= COARSE_SIZE; cx++) {
+        const xa = span(cx), xb = spanEnd(cx), padX = cx < 0 || cx >= COARSE_SIZE;
+        for (let cy = -1; cy <= COARSE_SIZE; cy++) {
+            const ya = span(cy), yb = spanEnd(cy), padXY = padX || cy < 0 || cy >= COARSE_SIZE;
+            for (let c = -1; c <= COARSE_SIZE; c++, ci++) {
+                const za = span(c), zb = spanEnd(c), pad = padXY || c < 0 || c >= COARSE_SIZE;
+                let any = 0, all = 1, lit = 0, top = -1, topZ = -2;
+                for (let x = xa; x <= xb; x++) {
+                    for (let y = ya; y <= yb; y++) {
+                        let i = ((x + M) * NY + (y + M)) * NZ + zBase + za;
+                        for (let z = za; z <= zb; z++, i++) {
+                            if (region[i] !== 0) {
+                                any = 1;
+                                if (z > topZ) { topZ = z; top = i; }
+                            } else {
+                                all = 0;
+                                if (light[i] > lit) lit = light[i];
+                            }
+                        }
+                    }
+                }
+                coarsePadded[ci] = pad ? all : any;
+                coarseLight[ci] = lit;
+                coarseTop[ci] = pad ? -1 : top;
+            }
+        }
+    }
+    // materials of the coarse voxels that can show a face
+    for (let cx = 0; cx < COARSE_SIZE; cx++) {
+        for (let cy = 0; cy < COARSE_SIZE; cy++) {
+            let ci = ((cx + 1) * CP + (cy + 1)) * CP + 1;
+            for (let c = 0; c < COARSE_SIZE; c++, ci++) {
+                coarseMaterials[ci] = 0;
+                if (coarsePadded[ci] === 0) continue;
+                let exposed = false;
+                for (const o of COARSE_NEIGHBORS) if (coarsePadded[ci + o] === 0) { exposed = true; break; }
+                if (!exposed) continue;
+                // region index -> real voxel of the chunk
+                const i = coarseTop[ci], z = i % NZ - zBase, y = ((i / NZ) | 0) % NY - M, x = ((i / (NY * NZ)) | 0) - M;
+                coarseMaterials[ci] = material(heights, x, y, origin[0] + x, origin[1] + y, origin[2] + z);
+            }
+        }
+    }
+}
 
 /** surface heights of a large area, for the shadow rays that leave the loaded window (see world.js) */
 export function runHeightGridTask({ id, x0, y0, n, step }) {
@@ -56,7 +127,7 @@ function chunkData(cz, uniform, transfer) {
     } else {
         connectivity = uniformConnectivity(uniform);
     }
-    return { cz, uniform, bricks, coarse, connectivity, mesh: null, waterMesh: null };
+    return { cz, uniform, bricks, coarse, connectivity, mesh: null, coarseMesh: null, waterMesh: null };
 }
 
 /**
@@ -127,6 +198,10 @@ export function runColumnTask({ id, cx, cy, mesh, edits = [], version = 0 }) {
         if (uniform !== 0) {
             data.mesh = buildMesh(padded, heights, origin, paddedLight);
             transfer.push(data.mesh.vertices.buffer);
+            // the same chunk with voxels twice as large, drawn far away (world.js)
+            coarseChunk(cz, heights, origin);
+            data.coarseMesh = buildMesh(coarsePadded, null, origin, coarseLight, coarseMaterials);
+            transfer.push(data.coarseMesh.vertices.buffer);
         }
         if (uniform !== 1 && origin[2] < SEA_LEVEL) {
             data.waterMesh = buildWaterMesh(padded, heights, origin);

@@ -6,6 +6,7 @@ layout(location=0) in uint data;
 
 uniform mat4 viewProj;
 uniform vec3 chunkOrigin;
+uniform float chunkScale; // 2 for the coarse meshes of the far chunks (positions in voxels twice as large)
 
 out float vAO;
 out float vSkyLight; // 0 (no sky reaches it) .. 1 (open sky)
@@ -23,7 +24,7 @@ const vec3 NORMALS[6] = vec3[6](
 const float AO[4] = float[4](0.25, 0.5, 0.75, 1.0);
 
 void main() {
-    vec3 local = vec3(float(data & 127u), float((data >> 7) & 127u), float((data >> 14) & 127u));
+    vec3 local = vec3(float(data & 127u), float((data >> 7) & 127u), float((data >> 14) & 127u)) * chunkScale;
     int face = int((data >> 21) & 7u);
     int ao = int((data >> 24) & 3u);
     int material = int((data >> 26) & 7u);

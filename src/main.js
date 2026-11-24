@@ -315,10 +315,10 @@ function init() {
     const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vshader);
     const fullscreenVertexShader = compileShader(gl, gl.VERTEX_SHADER, skyVshader);
     const color = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, fshader),
-        ["viewProj", "chunkOrigin", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals", "reflectionPass", "seaLevel", "aoMask", ...TREE_SHADOW_UNIFORMS, ...CANOPY_UNIFORMS,
+        ["viewProj", "chunkOrigin", "chunkScale", "camPosition", "halfResShadows", "shadowMask", "maskScale", "halfDepth", "depthRange", "fogDensity", "voxelAlbedo", "voxelNormals", "reflectionPass", "seaLevel", "aoMask", ...TREE_SHADOW_UNIFORMS, ...CANOPY_UNIFORMS,
             ...SKY_UNIFORMS, ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS, ...ATMOSPHERE_UNIFORMS]);
     const gbuffer = createProgram(gl, vertexShader, compileShader(gl, gl.FRAGMENT_SHADER, gbufferFshader),
-        ["viewProj", "chunkOrigin"]);
+        ["viewProj", "chunkOrigin", "chunkScale"]);
     const shadow = createProgram(gl, fullscreenVertexShader, compileShader(gl, gl.FRAGMENT_SHADER, shadowFshader),
         ["invViewProj", "lightDir", "halfDepth", "halfFace", "historyMask", "prevViewProj", "frameIndex", "refreshAll", "historyAO", "aoHistoryValid", "camPosition",
             ...SHADOW_UNIFORMS, ...CLOUD_UNIFORMS]);
@@ -844,7 +844,7 @@ function init() {
             gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
             gl.useProgram(gbuffer.program);
             gl.uniformMatrix4fv(gbuffer.locations.viewProj, false, viewProjMatrix);
-            world.draw(visible, camPosition, gbuffer.locations.chunkOrigin);
+            world.draw(visible, camPosition, gbuffer.locations);
             gl.useProgram(treeGbuffer.program);
             gl.uniformMatrix4fv(treeGbuffer.locations.viewProj, false, viewProjMatrix);
             gl.uniform1f(treeGbuffer.locations.windTime, waterTime);
@@ -944,7 +944,7 @@ function init() {
             setShadowWindow(color);
             setTreeShadow(color);
             setCanopy(color);
-            return world.draw(chunks, eye, color.locations.chunkOrigin);
+            return world.draw(chunks, eye, color.locations);
         }
 
         // trees, shaded like the terrain; mirrored = in the reflection of the water
