@@ -5,7 +5,7 @@ precision highp float;
 layout(location=0) in uint data;
 layout(location=1) in vec4 instancePosition; // base (world) and yaw
 layout(location=2) in vec4 instanceData;     // scale, tint, sky light (0..1), sway phase
-layout(location=3) in uint extra;            // variant of the foliage, fringe and its corner (treeModels.js meshGrid)
+layout(location=3) in uint extra;            // variant, fringe and its corner, grain of the bark (treeModels.js meshGrid)
 
 uniform mat4 viewProj;
 uniform vec3 modelOrigin; // model voxels: center of the base
@@ -20,6 +20,7 @@ flat out vec3 vLocalNormal;
 out float vAO;
 flat out int vMaterial;
 flat out int vVariant;
+flat out vec2 vGrain; // bark: direction of the branch on the face plane (tree_surface.glsl treeUV)
 out vec3 vFringe; // fringe of the foliage: 1, then the position on the voxel face (0..1 on it); 0 for the voxel faces
 flat out float vTint;
 flat out float vSkyLight;
@@ -82,6 +83,9 @@ void main() {
     vAO = AO[(data >> 24) & 3u];
     vMaterial = material;
     vVariant = int(extra & 3u);
+    // angle in 32 steps over a half turn; unset: the furrows along the second axis of the face plane (up on the sides)
+    float grainAngle = float((extra >> 7) & 31u) * 3.14159265 / 32.0;
+    vGrain = (extra & 4096u) != 0u ? vec2(cos(grainAngle), sin(grainAngle)) : vec2(0.0, 1.0);
     vTint = instanceData.y;
     vSkyLight = instanceData.z;
     vYaw = instancePosition.w;

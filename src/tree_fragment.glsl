@@ -26,6 +26,7 @@ flat in vec3 vLocalNormal;
 in float vAO;
 flat in int vMaterial;
 flat in int vVariant;
+flat in vec2 vGrain;
 in vec3 vFringe;
 flat in float vTint;
 flat in float vSkyLight;
@@ -78,7 +79,7 @@ float moss(vec2 uv) {
 
 // color (linear) and normal (world) of the fragment, from the textures; per tree and per voxel variations
 void treeSurface(bool leaf, out vec3 albedo, out vec3 normal) {
-    vec3 texel = treeTexel(vMaterial, vVariant, vLocal, vLocalNormal, vTint * 7.0, vPosition, vFringe).rgb;
+    vec3 texel = treeTexel(vMaterial, vVariant, vGrain, vLocal, vLocalNormal, vTint * 7.0, vPosition, vFringe).rgb;
     albedo = texel;
     vec3 tn = vec3(0.0, 0.0, 1.0); // the pixel art foliage is flat
     if(leaf) {
@@ -88,8 +89,8 @@ void treeSurface(bool leaf, out vec3 albedo, out vec3 normal) {
     } else {
         // bark: a little per voxel, so the voxels still read, and the relief of the texture
         albedo *= 0.94 + 0.12 * hash(floor(vLocal - vLocalNormal * 0.5));
-        vec2 uv = treeUV(vLocal, vLocalNormal, vTint * 7.0);
-        tn = texture(voxelNormals, vec3(uv, float(BARK_LAYERS[vMaterial]))).xyz * 2.0 - 1.0;
+        vec2 uv = treeUV(vLocal, vLocalNormal, vGrain, vTint * 7.0);
+        tn = texture(voxelNormals, vec3(uv, float(barkLayer(vMaterial, vVariant)))).xyz * 2.0 - 1.0;
         // moss on the faces turned to the north, flattening the relief of the bark
         float m = moss(uv);
         if(m > 0.0) {
@@ -99,10 +100,9 @@ void treeSurface(bool leaf, out vec3 albedo, out vec3 normal) {
         }
         tn = normalize(mix(tn, vec3(0.0, 0.0, 1.0), m * 0.7));
     }
-    vec3 n = vLocalNormal;
-    vec3 t = abs(n.x) > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 b = abs(n.z) > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
-    vec3 local = normalize(t * tn.x + b * tn.y + n * tn.z);
+    vec3 tu, tv;
+    treeTangents(vLocalNormal, vGrain, tu, tv);
+    vec3 local = normalize(tu * tn.x + tv * tn.y + vLocalNormal * tn.z);
     float c = cos(vYaw), s = sin(vYaw);
     normal = vec3(c * local.x - s * local.y, s * local.x + c * local.y, local.z);
 }
