@@ -30,6 +30,7 @@ out vec4 fragColor;
 @import ./shadow;
 @import ./common;
 @import ./clouds;
+@import ./cloud_shadow;
 @import ./atmosphere;
 
 const vec3 ABSORPTION = vec3(0.45, 0.16, 0.12);   // per meter (lake water): red absorbed first, it turns blue-green
@@ -121,7 +122,7 @@ void main() {
         // sun glint, shadowed by the terrain and the clouds (rays only where it matters)
         float spec = pow(max(dot(r, toLight), 0.0), 700.0) * 90.0;
         if(spec > 0.002) {
-            spec *= cloudShadow(vPosition, toLight);
+            spec *= cloudShadowSoft(vPosition, toLight);
             if(spec > 0.05) spec *= castShadowRay(vPosition + vec3(0.0, 0.0, 0.05), toLight);
         }
 

@@ -1,6 +1,6 @@
 Simple voxel engine using WebGL.
 
-Using Ray-traced shadows.
+Using Ray-traced shadows, soft from one ray per pixel: the penumbra of the sun disk grows with the distance to the occluder (sharp at the contact, soft far from it).
 
 The world is 28 800 x 28 800 voxels (450 x 450 chunks of 64^3) and 256 high: mountains up to 120 above the ground,
 128 of underground with tunnels and caverns. The height map is shaped in 3D near the surface: ledges, recesses and
@@ -10,7 +10,7 @@ coarse mesh (voxels twice as large, about 7 times fewer faces). Chunks and trees
 their boxes are tested against the depth pre-pass with occlusion queries, the answers being used from the next frame.
 
 Day and night cycle with a physical sky (Rayleigh and Mie scattering), sun and moon shadows, voxel clouds drifting with
-the wind and casting shadows, light shafts (god rays) and valley mist. Realistic textures (512 x 512, albedo and normal map) generated on the GPU at startup.
+the wind and casting soft shadows (a blurred texture of the light they let through), light shafts (god rays) and valley mist. Realistic textures (512 x 512, albedo and normal map) generated on the GPU at startup.
 On the surface, patches of blocks with grass or snow on all their faces and of bare earth.
 Sky light propagated like in Minecraft (caves and overhangs are dark), and ray-traced ambient occlusion within 10 voxels.
 Trees: 6 species (oak, spruce, birch, bush, dead tree, blossom tree in groves in the valleys) in 13 variants, made of voxels 4 times smaller than the terrain,
