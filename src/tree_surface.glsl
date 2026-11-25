@@ -1,5 +1,6 @@
 // Textures of the trees (needs precision for sampler2DArray):
-// - bark and wood: high resolution textures of textures.js, mapped in meters on the faces
+// - bark and wood: high resolution textures of textures.js, mapped in meters on the faces, their furrows along the
+//   branches
 // - foliage: Minecraft-like pixel art (leafTextures.js), one texture per face of a leaf voxel, with transparent holes
 //   cut out at the finest level of detail (further, the foliage is full and the holes are dark green)
 
@@ -15,9 +16,11 @@ const float TREE_TILE = 1.0; // meters covered by one bark texture
 const float LEAF_TILE = 1.0; // meters covered by one foliage texture (leafTextures.js)
 const float FRINGE_GROW = 0.45; // how far the fringe grows beyond the voxel face (tree_vertex.glsl)
 
-// bark layer of each wood material (textures.js); first leaf layer of each foliage material and its number of
-// variants (leafTextures.js, treeModels.js): 1 oak, 3 needles, 5 birch, 6 bush, 7 blossom
+// bark layer of each wood material (textures.js), the spruces have their own (variant SPRUCE_BARK of the bark); first
+// leaf layer of each foliage material and its number of variants (leafTextures.js, treeModels.js): 1 oak, 3 needles,
+// 5 birch, 6 bush, 7 blossom
 const int BARK_LAYERS[8] = int[8](6, 0, 7, 0, 8, 0, 6, 0);
+const int SPRUCE_BARK = 1, SPRUCE_BARK_LAYER = 9;
 const int LEAF_BASE[8] = int[8](0, 0, 0, 3, 0, 5, 7, 9);
 const int LEAF_VARIANTS[8] = int[8](1, 3, 1, 2, 1, 2, 2, 3);
 
@@ -37,9 +40,24 @@ vec2 facePlane(vec3 local, vec3 localNormal) {
     return n.x > 0.5 ? local.yz : n.y > 0.5 ? local.xz : local.xy;
 }
 
-// bark texture coordinates, in meters
-vec2 treeUV(vec3 local, vec3 localNormal, float offset) {
-    return facePlane(local, localNormal) * voxelSize / TREE_TILE + offset;
+int barkLayer(int material, int variant) {
+    return material == 0 && variant == SPRUCE_BARK ? SPRUCE_BARK_LAYER : BARK_LAYERS[material];
+}
+
+// bark texture coordinates, in meters, turned so that v (the long furrows of the textures) runs along grain: the
+// direction of the branch on the face plane (tree_vertex.glsl). The tangents of the texture: treeTangents.
+vec2 treeUV(vec3 local, vec3 localNormal, vec2 grain, float offset) {
+    vec2 p = facePlane(local, localNormal) * voxelSize / TREE_TILE;
+    return vec2(p.x * grain.y - p.y * grain.x, dot(p, grain)) + offset;
+}
+
+// model space directions of the u and v of the texture on a face (treeUV)
+void treeTangents(vec3 localNormal, vec2 grain, out vec3 tu, out vec3 tv) {
+    vec3 n = abs(localNormal);
+    vec3 a = n.x > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0); // the axes of facePlane
+    vec3 b = n.z > 0.5 ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+    tu = a * grain.y - b * grain.x;
+    tv = a * grain.x + b * grain.y;
 }
 
 // foliage texel: one texture per LEAF_TILE of the faces (the same size at every level of detail), mirrored on the sides
@@ -117,7 +135,7 @@ vec4 leafTexel(int material, int variant, vec3 local, vec3 localNormal, vec3 wor
 }
 
 // texel of any tree material (discards the holes of the foliage when cutout)
-vec4 treeTexel(int material, int variant, vec3 local, vec3 localNormal, float offset, vec3 worldPos, vec3 fringe) {
+vec4 treeTexel(int material, int variant, vec2 grain, vec3 local, vec3 localNormal, float offset, vec3 worldPos, vec3 fringe) {
     if(isLeaf(material)) return leafTexel(material, variant, local, localNormal, worldPos, fringe);
-    return texture(voxelAlbedo, vec3(treeUV(local, localNormal, offset), float(BARK_LAYERS[material])));
+    return texture(voxelAlbedo, vec3(treeUV(local, localNormal, grain, offset), float(barkLayer(material, variant))));
 }

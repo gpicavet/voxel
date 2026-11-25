@@ -18,6 +18,8 @@ const LEAVES = new Set([OAK_LEAVES, NEEDLES, BIRCH_LEAVES, BUSH_LEAVES, BLOSSOM]
 // of leaves or spruce branch: lighter, darker... leafTextures.js), so that a tree is not of a single green.
 const materialOf = v => (v & 15) - 1;
 const variantOf = v => v >> 4;
+// variant of the BARK voxels of the spruces: their own bark (tree_surface.glsl)
+const SPRUCE_BARK = 1;
 
 // variants drawn from their own random numbers: the shapes of the trees stay those of the main random numbers
 let variantRandom = null;
@@ -40,11 +42,20 @@ class Grid {
         this.ny = ny;
         this.nz = nz;
         this.v = new Uint8Array(nx * ny * nz); // material + 1 | variant << 4, 0 = empty
+        // wood: direction of its branch (unit vector x 127), along which the furrows of the bark run (meshGrid)
+        this.dir = new Int8Array(nx * ny * nz * 3);
     }
-    set(x, y, z, material, variant = 0) {
+    set(x, y, z, material, variant = 0, dir = null) {
         x = Math.round(x); y = Math.round(y); z = Math.round(z);
         if (x < 0 || y < 0 || z < 0 || x >= this.nx || y >= this.ny || z >= this.nz) return;
-        this.v[(x * this.ny + y) * this.nz + z] = (material + 1) | (variant << 4);
+        const i = (x * this.ny + y) * this.nz + z;
+        this.v[i] = (material + 1) | (variant << 4);
+        if (dir) for (let k = 0; k < 3; k++) this.dir[3 * i + k] = Math.round(dir[k] * 127);
+    }
+    /** copy voxel j of another grid to voxel i */
+    copy(i, from, j) {
+        this.v[i] = from.v[j];
+        for (let k = 0; k < 3; k++) this.dir[3 * i + k] = from.dir[3 * j + k];
     }
     setIfEmpty(x, y, z, material, variant = 0) {
         x = Math.round(x); y = Math.round(y); z = Math.round(z);
@@ -63,9 +74,10 @@ function disc(grid, cx, cy, z, r, material) {
             if ((x - cx) ** 2 + (y - cy) ** 2 <= r * r) grid.set(x, y, z, material);
 }
 
-// branch: a line of voxels of radius r from a to b
-function branch(grid, a, b, r, material) {
+// branch: a line of voxels of radius r from a to b (variant: of the bark, the furrows of the bark along it)
+function branch(grid, a, b, r, material, variant = 0) {
     const length = Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+    const dir = normalize([b[0] - a[0], b[1] - a[1], b[2] - a[2]]);
     const steps = Math.ceil(length * 2);
     for (let i = 0; i <= steps; i++) {
         const t = i / steps;
@@ -73,7 +85,7 @@ function branch(grid, a, b, r, material) {
         for (let dx = -Math.ceil(r); dx <= Math.ceil(r); dx++)
             for (let dy = -Math.ceil(r); dy <= Math.ceil(r); dy++)
                 for (let dz = -Math.ceil(r); dz <= Math.ceil(r); dz++)
-                    if (dx * dx + dy * dy + dz * dz <= r * r + 0.3) grid.set(p[0] + dx, p[1] + dy, p[2] + dz, material);
+                    if (dx * dx + dy * dy + dz * dz <= r * r + 0.3) grid.set(p[0] + dx, p[1] + dy, p[2] + dz, material, variant, dir);
     }
 }
 
@@ -104,7 +116,7 @@ function direction(azimuth, elevation) {
  * A crooked branch: straight segments whose direction drifts slowly (bends, not noise), radius tapering from r0 to r1.
  * rise pulls it up (> 0) or lets it droop (< 0).
  */
-function crooked(grid, random, start, dir, length, r0, r1, { segments = 6, wobble = 0.25, rise = 0, material = BARK } = {}) {
+function crooked(grid, random, start, dir, length, r0, r1, { segments = 6, wobble = 0.25, rise = 0, material = BARK, variant = 0 } = {}) {
     let p = start.slice(), d = normalize(dir);
     let drift = [(random() - 0.5) * wobble, (random() - 0.5) * wobble, 0];
     const step = length / segments;
@@ -112,7 +124,7 @@ function crooked(grid, random, start, dir, length, r0, r1, { segments = 6, wobbl
     for (let i = 0; i < segments; i++) {
         const r = r0 + (r1 - r0) * (i / segments);
         const next = [p[0] + d[0] * step, p[1] + d[1] * step, p[2] + d[2] * step];
-        branch(grid, p, next, Math.max(r, 0.5), material);
+        branch(grid, p, next, Math.max(r, 0.5), material, variant);
         points.push(next);
         drift = [drift[0] * 0.6 + (random() - 0.5) * wobble, drift[1] * 0.6 + (random() - 0.5) * wobble, drift[2] * 0.6 + (random() - 0.5) * wobble * 0.5];
         d = normalize([d[0] + drift[0], d[1] + drift[1], d[2] + drift[2] + rise]);
@@ -282,7 +294,7 @@ function spruceBranch(g, random, start, azimuth, length, level) {
         const t = s / length;
         z -= droop * t * 1.4;
         const px = start[0] + dir[0] * s, py = start[1] + dir[1] * s;
-        if (t < 0.45) g.set(px, py, z, BARK); // woody twig near the trunk
+        if (t < 0.45) g.set(px, py, z, BARK, SPRUCE_BARK, normalize([dir[0], dir[1], -droop * t * 1.4])); // woody twig near the trunk
         const width = 0.6 + 1.9 * (1 - t);
         for (let w = -Math.ceil(width); w <= Math.ceil(width); w++) {
             if (Math.abs(w) > width + (random() - 0.5) * 0.6) continue;
@@ -301,7 +313,7 @@ function pine(random, variant) {
     const g = new Grid(...GRID);
     const height = variant === 0 ? 68 : 54;
     const trunk = crooked(g, random, [C, C, 0], [(random() - 0.5) * 0.1, (random() - 0.5) * 0.1, 1], height, 1.6, 0.5,
-        { segments: 8, wobble: 0.05, rise: 0.05, material: BARK });
+        { segments: 8, wobble: 0.05, rise: 0.05, material: BARK, variant: SPRUCE_BARK });
     const centerAt = z => {
         for (let i = 1; i < trunk.points.length; i++) {
             const a = trunk.points[i - 1], b = trunk.points[i];
@@ -351,7 +363,7 @@ function crop(model) {
     for (let x = 0; x < out.nx; x++)
         for (let y = 0; y < out.ny; y++)
             for (let z = 0; z < out.nz; z++)
-                out.v[(x * out.ny + y) * out.nz + z] = grid.v[((x + x0) * grid.ny + (y + y0)) * grid.nz + z];
+                out.copy((x * out.ny + y) * out.nz + z, grid, ((x + x0) * grid.ny + (y + y0)) * grid.nz + z);
     return { grid: out, base: [base[0] + 0.5 - x0, base[1] + 0.5 - y0] };
 }
 
@@ -368,7 +380,7 @@ function downsample(grid, f, leafMin, woodMin) {
         for (let y = 0; y < out.ny; y++) {
             for (let z = 0; z < out.nz; z++) {
                 counts.fill(0);
-                let leaves = 0, wood = 0, woodKind = 0;
+                let leaves = 0, wood = 0, woodIndex = 0;
                 for (let i = 0; i < f; i++) {
                     for (let j = 0; j < f; j++) {
                         for (let k = 0; k < f; k++) {
@@ -376,7 +388,7 @@ function downsample(grid, f, leafMin, woodMin) {
                             if (m === 0) continue;
                             if (WOOD.has(materialOf(m))) {
                                 wood++;
-                                woodKind = m;
+                                woodIndex = ((f * x + i) * grid.ny + f * y + j) * grid.nz + f * z + k;
                             } else {
                                 leaves++;
                                 counts[m]++;
@@ -384,17 +396,14 @@ function downsample(grid, f, leafMin, woodMin) {
                         }
                     }
                 }
-                let value = 0;
-                if (wood >= woodMin) {
-                    value = woodKind;
+                const o = (x * out.ny + y) * out.nz + z;
+                if (wood >= woodMin || (wood > 0 && leaves === 0)) {
+                    out.copy(o, grid, woodIndex); // wood (with its direction), or a branch alone in the air
                 } else if (leaves >= leafMin) {
                     let best = 0;
                     for (let m = 1; m < 256; m++) if (counts[m] > counts[best]) best = m;
-                    value = best;
-                } else if (wood > 0 && leaves === 0) {
-                    value = woodKind; // a branch alone in the air
+                    out.v[o] = best;
                 }
-                out.v[(x * out.ny + y) * out.nz + z] = value;
             }
         }
     }
@@ -476,11 +485,26 @@ function opennessField(grid, leafTransmittance) {
 }
 
 /**
+ * Grain of the bark on a face of wood voxel i (normal along axis): the direction of its branch on the face plane, the axes
+ * in the order of facePlane (tree_surface.glsl), as an angle in 32 steps over a half turn (bits 7 to 11) and bit 12 set;
+ * 0 when the branch runs across the face (end of a limb, top of a trunk): the default mapping.
+ */
+function grainOf(grid, i, axis) {
+    const d = grid.dir;
+    const [a, b] = axis === 0 ? [d[3 * i + 1], d[3 * i + 2]] : axis === 1 ? [d[3 * i], d[3 * i + 2]] : [d[3 * i], d[3 * i + 1]];
+    if (Math.hypot(a, b) < 0.35 * 127) return 0;
+    let angle = Math.atan2(b, a);
+    if (angle < 0) angle += Math.PI;
+    return (1 << 12) | ((Math.round(angle / Math.PI * 32) & 31) << 7);
+}
+
+/**
  * Faces of the voxels next to an empty voxel, with ambient occlusion per corner. Two words per vertex: the vertex format
  * of the terrain, x, y, z (7 bits each) | face (3 bits) | ambient occlusion (2 bits) | material (3 bits) | sky openness
  * (3 bits): the part of the sky seen through the tree itself (baked self occlusion: inside and under the crown, the trunk
- * under it); then the variant of the foliage (2 bits) | fringe (1 bit) | side of the corner along the two axes of the
- * face (1 bit each) | the fringe grows along each axis at this corner (1 bit each).
+ * under it); then the variant of the foliage or of the bark (2 bits) | fringe (1 bit) | side of the corner along the two
+ * axes of the face (1 bit each) | the fringe grows along each axis at this corner (1 bit each) | grain of the bark (6
+ * bits, grainOf).
  * At the finest level, the faces of leaves on the outside along an edge of the foliage (nothing beside them) get a
  * fringe: the same quad, pushed out and grown towards those edges by the vertex shader (tree_vertex.glsl), with sparse
  * leaves that thin out towards its border (tree_surface.glsl): the outline of the foliage is made of leaves, not of the
@@ -544,6 +568,7 @@ function meshGrid(grid, cutout, leafTransmittance) {
                         p[axis2] += side;
                         return grid.get(p[0], p[1], p[2]) === 0;
                     };
+                    const grain = WOOD.has(materialOf(m)) ? grainOf(grid, (x * ny + y) * nz + z, axis) : 0;
                     let fringe = cutout && LEAVES.has(materialOf(m)) && grid.get(x + fx, y + fy, z + fz) === 0;
                     const edges = fringe ? [beside(u, -1), beside(u, 1), beside(v, -1), beside(v, 1)] : null;
                     if (fringe && !edges.some(e => e)) fringe = false;
@@ -552,7 +577,7 @@ function meshGrid(grid, cutout, leafTransmittance) {
                             const k = (start + j) & 3, c = face.c[k];
                             const grow = quad === 1 ? (edges[c[u]] ? 32 : 0) | (edges[2 + c[v]] ? 64 : 0) : 0;
                             (quad === 1 ? fringes : vertices).push(((x + c[0]) | ((y + c[1]) << 7) | ((z + c[2]) << 14) | (f << 21) | (ao[k] << 24) | (materialOf(m) << 26) | (sky[k] << 29)) >>> 0,
-                                variantOf(m) | (quad << 2) | (c[u] << 3) | (c[v] << 4) | grow);
+                                variantOf(m) | (quad << 2) | (c[u] << 3) | (c[v] << 4) | grow | grain);
                         }
                     }
                 });

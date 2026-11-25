@@ -15,7 +15,7 @@ On the surface, patches of blocks with grass or snow on all their faces and of b
 Sky light propagated like in Minecraft (caves and overhangs are dark), and ray-traced ambient occlusion within 10 voxels.
 Trees: 6 species (oak, spruce, birch, bush, dead tree, blossom tree in groves in the valleys) in 13 variants, made of voxels 4 times smaller than the terrain,
 grown at startup in a worker (crooked trunks with roots, recursive crooked limbs, flat pads of foliage with hanging
-fringes, spruces with whorls of drooping branches and a bare spire) and drawn as instances (free position, rotation, size, tint), with 3 levels of detail, high resolution bark textures (moss on the faces turned to the north, thicker low on the trunk) and
+fringes, spruces with whorls of drooping branches and a bare spire) and drawn as instances (free position, rotation, size, tint), with 3 levels of detail, high resolution bark textures (oak: long furrows that part and join, spruce: thin plates; the furrows run along each limb; moss on the faces turned to the north, thicker low on the trunk) and
 Minecraft-like pixel art foliage (leaves of a few texels, one texture per meter of foliage, holes cut out up close; several tones per tree, one per pad of leaves; up close, a fringe of leaves breaking the outline of the voxels), leaves fluttering in the wind inside their texture (each leaf moving and turning with its own phase, gusts) and a slight
 sway of the whole tree, shadow maps for their shadows (and a larger one with the coarsest models for the far trees),
 ambient occlusion (baked in the models, darker inside the crowns and at the foot of the trunks even in the sun, and a canopy map darkening the ground under the trees and the forest around),

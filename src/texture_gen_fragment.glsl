@@ -5,7 +5,7 @@ precision highp int;
 // Generates one layer of the voxel textures (run once at startup, textures.js): realistic, tileable (every noise is
 // periodic over the texture), with a relief turned into a normal map. Layers: 0 earth, 1 rock, 2 grass, 3 snow, 4 sand,
 // 5 water ripples (only its normal map is used, by water_fragment.glsl), and for the trees: 6 oak bark, 7 birch bark,
-// 8 dead wood (the foliage is pixel art: leafTextures.js).
+// 8 dead wood, 9 spruce bark (the foliage is pixel art: leafTextures.js).
 
 uniform int layer;
 uniform float size; // texels per side
@@ -64,6 +64,43 @@ vec3 worley(vec2 uv, float period) {
         }
     }
     return vec3(f1, f2, id);
+}
+
+// Cellular noise with stretched cells (period cells along x and y, periodic): distance, in texture units, to the nearest
+// border between two cells (the borders of the cells as drawn, a straight line between each pair: cracks of the same
+// width whatever their direction), and an id of the cell. round (texture units) rounds the corners of the cells: the
+// borders are merged with a smooth minimum, so the cracks widen where they meet.
+vec2 cells(vec2 uv, vec2 period, float round) {
+    vec2 p = uv * period;
+    vec2 i = floor(p), f = fract(p);
+    vec2 o1 = vec2(0.0), c1 = vec2(0.0);
+    float best = 8.0;
+    for(int y = -1; y <= 1; y++) {
+        for(int x = -1; x <= 1; x++) {
+            vec2 cell = mod(i + vec2(x, y), period);
+            vec2 o = vec2(x, y) + hash2(cell) - f;
+            float d = dot(o, o);
+            if(d < best) {
+                best = d;
+                o1 = o;
+                c1 = cell;
+            }
+        }
+    }
+    float border = 8.0, sum = 0.0;
+    for(int y = -2; y <= 2; y++) {
+        for(int x = -2; x <= 2; x++) {
+            vec2 o = vec2(x, y) + hash2(mod(i + vec2(x, y), period)) - f;
+            vec2 n = o - o1;
+            if(dot(n, n) < 1e-6) continue;
+            // the border is the line half way between the two points in cell units; its distance in texture units
+            float d = dot(0.5 * (o1 + o), n) / length(n * period);
+            border = min(border, d);
+            sum += exp(-d / max(round, 1e-6));
+        }
+    }
+    if(round > 0.0) border = min(border, -round * log(sum));
+    return vec2(max(border, 0.0), hash(c1 + 7.3));
 }
 
 // relief (0 .. 1) and color of a material at uv
@@ -126,17 +163,61 @@ float material(vec2 uv, out vec3 albedo) {
         return height;
     }
     if(layer == 6) {
-        // oak bark: vertical plates separated by deep furrows, broken across from time to time
-        float warp = uv.x * 10.0 + (fbm(uv, vec2(3.0, 6.0), 4) - 0.5) * 3.0;
-        float plates = smoothstep(0.05, 0.45, abs(sin(warp * 3.14159265)));
-        float breaks = smoothstep(0.82, 0.92, vnoise(uv, vec2(10.0, 7.0)));
-        float grain = vnoise(uv, vec2(96.0, 24.0));
-        float height = plates * (1.0 - breaks * 0.6) * 0.75 + grain * 0.25;
-        // dark: well below the earth (layer 0)
-        albedo = mix(vec3(0.045, 0.034, 0.026), vec3(0.17, 0.135, 0.105), height);
-        albedo *= 0.85 + 0.3 * fbm(uv, vec2(5.0), 3);
-        float moss = smoothstep(0.6, 0.75, fbm(uv + 0.3, vec2(4.0, 8.0), 4)) * (1.0 - plates);
-        albedo = mix(albedo, vec3(0.10, 0.14, 0.045), moss * 0.6);
+        // oak bark: long ridges of rough gray bark split by deep dark furrows, that wander, part and join again (cells
+        // 5 times taller than wide), ragged edges, mottled, gray-green lichen on the ridges. The furrows run along v:
+        // along the branch (tree_surface.glsl)
+        vec2 w = uv + vec2((fbm(uv, vec2(2.0, 3.0), 3) - 0.5) * 0.10 + (fbm(uv + 0.5, vec2(6.0, 5.0), 3) - 0.5) * 0.035, 0.0);
+        vec2 c = cells(w, vec2(14.0, 3.0), 0.005);
+        // ragged furrows, wider in places
+        float edge = c.x + (fbm(uv, vec2(48.0, 20.0), 3) - 0.5) * 0.008 - (vnoise(uv, vec2(7.0, 3.0)) - 0.5) * 0.008;
+        float ridge = smoothstep(0.004, 0.04, edge); // 0 at the bottom of the furrows, 1 on top of the ridges
+        float streaks = fbm(uv, vec2(40.0, 6.0), 3); // fibers and flakes along the ridges
+        float rough = fbm(uv, vec2(96.0, 48.0), 2);
+        float height = ridge * (0.5 + 0.25 * streaks + 0.15 * rough + 0.1 * c.y);
+        // gray, darker and browner down the sides of the ridges, almost black at the bottom of the furrows
+        vec3 top = mix(vec3(0.17, 0.165, 0.145), vec3(0.30, 0.29, 0.265), smoothstep(0.3, 0.8, streaks * 0.6 + rough * 0.4));
+        albedo = mix(vec3(0.06, 0.048, 0.036), top, smoothstep(0.1, 0.9, ridge));
+        albedo = mix(albedo, vec3(0.01, 0.008, 0.006), 1.0 - smoothstep(0.0, 0.016, edge));
+        albedo *= 0.85 + 0.3 * c.y;
+        // mottled: darker and lighter patches across the ridges
+        albedo *= mix(0.5, 1.2, smoothstep(0.25, 0.75, fbm(uv + 0.11, vec2(12.0, 6.0), 4)));
+        // lichen: gray-green patches on the ridges, some yellow-green
+        float lichen = smoothstep(0.55, 0.7, fbm(uv + 0.3, vec2(6.0, 4.0), 4)) * smoothstep(0.4, 0.8, ridge);
+        albedo = mix(albedo, mix(vec3(0.15, 0.18, 0.10), vec3(0.21, 0.24, 0.08), vnoise(uv, vec2(20.0))) * (0.8 + 0.4 * rough), lichen * 0.7);
+        return height;
+    }
+    if(layer == 9) {
+        // spruce bark: thin rounded plates, mauve gray, a little taller than wide, separated by cracks red-brown at the
+        // bottom; some plates partly split again, dotted with small pits; green lichen, a little red-orange bark where
+        // plates came off
+        vec2 w = uv + (vec2(fbm(uv, vec2(4.0, 3.0), 3), fbm(uv + 0.7, vec2(3.0, 4.0), 3)) - 0.5) * 0.06
+            + (vec2(fbm(uv, vec2(10.0), 3), fbm(uv + 0.3, vec2(10.0), 3)) - 0.5) * 0.035;
+        vec2 big = cells(w, vec2(12.0, 8.0), 0.006);
+        float edge = big.x + (fbm(uv, vec2(24.0), 3) - 0.5) * 0.010;
+        vec2 small = cells(w + vec2(0.13, 0.41), vec2(22.0, 15.0), 0.0);
+        // partial cracks inside some plates: they fade out before crossing them
+        float split = (1.0 - smoothstep(0.0, 0.003, small.x)) * smoothstep(0.5, 0.7, vnoise(w, vec2(12.0, 9.0)))
+            * smoothstep(0.01, 0.03, edge) * step(0.55, big.y);
+        // plates: flat, slightly domed, the edges lifted a little (they curl)
+        float plate = smoothstep(0.0, 0.006, edge);
+        float rim = smoothstep(0.03, 0.01, edge) * plate;
+        vec3 pits = worley(uv, 56.0);
+        float pit = (1.0 - smoothstep(0.06, 0.13, pits.x)) * step(0.6, pits.z) * plate;
+        float surface = fbm(uv, vec2(24.0, 16.0), 3);
+        float height = plate * (0.7 + 0.15 * surface + 0.1 * big.y + 0.1 * rim) - split * 0.2 - pit * 0.1;
+        vec3 plateColor = mix(vec3(0.11, 0.09, 0.10), vec3(0.24, 0.21, 0.21), surface * 0.5 + big.y * 0.5);
+        plateColor *= 0.65 + 0.5 * fbm(uv + 0.37, vec2(30.0), 3); // mottled
+        plateColor *= 1.0 + 0.15 * rim;
+        // the gaps: red-brown, darker at the bottom
+        vec3 gap = mix(vec3(0.03, 0.012, 0.008), vec3(0.16, 0.06, 0.035), smoothstep(0.0, 0.005, edge));
+        albedo = mix(gap, plateColor, plate);
+        albedo *= (1.0 - split * 0.5) * (1.0 - pit * 0.4);
+        // lichen: green patches over several plates
+        float lichen = smoothstep(0.56, 0.7, fbm(uv + 0.2, vec2(5.0, 4.0), 4)) * plate;
+        albedo = mix(albedo, mix(vec3(0.12, 0.17, 0.05), vec3(0.19, 0.24, 0.07), vnoise(uv, vec2(30.0))), lichen * 0.7);
+        // fresh red-orange bark: small patches where a plate came off
+        float fresh = smoothstep(0.66, 0.72, vnoise(uv, vec2(20.0, 12.0))) * step(0.85, big.y) * plate;
+        albedo = mix(albedo, vec3(0.19, 0.065, 0.04), fresh * 0.7);
         return height;
     }
     if(layer == 7) {
